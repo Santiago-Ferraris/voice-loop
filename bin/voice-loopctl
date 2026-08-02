@@ -1,0 +1,17 @@
+#!/bin/sh
+# voice-loopctl — talk to the running daemon over its control socket.
+# No key is needed here, so the env file is deliberately not sourced.
+set -eu
+
+self=$(cd "$(dirname "$0")" && pwd -P)
+repo=$(dirname "$self")
+
+if [ -x "$repo/.venv/bin/python" ]; then
+  PY="$repo/.venv/bin/python"
+else
+  PY=$(command -v python3)
+  PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
+  export PYTHONPATH
+fi
+
+exec "$PY" -m voiceloop.ctl --repo-root "$repo" "$@"

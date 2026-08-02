@@ -1,5 +1,13 @@
 # Copy to config.local.yml and edit. config.local.yml is gitignored — it holds
 # your own project vocabulary, which is what makes transcription accurate.
+#
+# This file is also the source of defaults: every key here is applied first, and
+# config.local.yml is deep-merged on top, so you only need to list overrides.
+# API keys are never read from here — only from the daemon's environment.
+
+paths:
+  # Everything the daemon owns lives here: spool/, queue.db, daemon.sock, logs/.
+  state_dir: ~/.local/state/voice-loop
 
 speech_to_text:
   # deepgram | openai | whisper-cpp
@@ -30,13 +38,16 @@ summaries:
   provider: openai
   model: gpt-4o-mini
   max_words: 12
+  # Hard ceiling per attempt (one retry). On timeout or missing key the
+  # announcement falls back to a fixed phrase — the queue never waits on the LLM.
+  timeout_seconds: 5
 
 text_to_speech:
-  # macOS `say` — offline, zero latency
+  # macOS `say` — offline, zero latency. Use `system` to keep the system voice.
   voice: Paulina
   rate: 190
   # `say` reads English terms with a Spanish accent. Rewrite them phonetically
-  # so announcements stay intelligible.
+  # so announcements stay intelligible. Longest match wins, case-insensitive.
   phonetic:
     "pull request": "pul rikuest"
     "merge": "merch"
@@ -47,6 +58,9 @@ announce:
   milestone_chime: Glass
   blocking_chime: Ping
   mic_timeout_seconds: 8
+  # Claude's own Notification events (permission prompts, idle nudges). These
+  # are blocking too, so they speak. Set to false for chime-only.
+  notification_events: true
 
 delivery:
   auto_enter: true
@@ -58,3 +72,17 @@ delivery:
     - "\\bdelete\\b"
     - "force push"
     - "\\bprod\\b"
+
+integrations:
+  # Optional bridge for tooling that already tracks a per-terminal phase in a
+  # file (one file per tty, whose contents are the phase name). When a watched
+  # file changes to a phase listed under `milestones`, voice-loop plays the
+  # milestone chime — no speech. Off by default; nothing else reads these files.
+  milestone_file_watch:
+    enabled: false
+    dir: ~/.local/state/voice-loop/phases
+    pattern: "*.phase"
+    # phase value -> milestone label (the label is what `pendings` reports)
+    milestones:
+      pr: PR opened
+      ci: CI green

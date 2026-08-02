@@ -1,0 +1,6 @@
+{"type": "user", "isSidechain": false, "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": [{"type": "text", "text": "Async agent launched successfully. (This tool result is internal metadata.)\nagentId: aa11bb22cc33dd44e"}]}]}}
+{"type": "user", "isSidechain": false, "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": [{"type": "text", "text": "<task-notification>\n<task-id>aa11bb22cc33dd44e</task-id>\n<tool-use-id>toolu_9</tool-use-id>\n<status>completed</status>\n<summary>Agent finished.</summary>\n</task-notification>"}]}]}}
+{"type": "assistant", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "internal reasoning that must not be read out"}, {"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"file_path": "/tmp/a"}}]}}
+{"type": "assistant", "isSidechain": true, "message": {"role": "assistant", "content": [{"type": "text", "text": "Subagent chatter, not the main thread."}]}}
+{"type": "assistant", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "text", "text": "Both agents are done. Do you want me to open the pull request?"}]}}
+{"type": "ai-title", "aiTitle": "Some title", "sessionId": "s"}

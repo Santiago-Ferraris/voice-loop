@@ -1,0 +1,10 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "transcript_path": "/tmp/voice-loop-test/transcript.jsonl",
+  "cwd": "/tmp/voice-loop-test/project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "ExitPlanMode",
+  "tool_input": {
+    "plan": "## Migrar el índice a SQLite\n\n1. Crear la tabla\n2. Backfill\n"
+  }
+}

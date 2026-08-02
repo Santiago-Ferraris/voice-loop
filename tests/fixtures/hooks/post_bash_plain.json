@@ -1,0 +1,15 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "transcript_path": "/tmp/voice-loop-test/transcript.jsonl",
+  "cwd": "/tmp/voice-loop-test/project",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "pytest -q"
+  },
+  "tool_response": {
+    "stdout": "42 passed",
+    "stderr": "",
+    "interrupted": false
+  }
+}

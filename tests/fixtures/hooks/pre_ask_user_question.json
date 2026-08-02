@@ -1,0 +1,25 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "transcript_path": "/tmp/voice-loop-test/transcript.jsonl",
+  "cwd": "/tmp/voice-loop-test/project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "¿Qué base de datos uso para el índice?",
+        "header": "Índice",
+        "options": [
+          {
+            "label": "SQLite",
+            "description": "Un archivo local, cero servicios."
+          },
+          {
+            "label": "Postgres",
+            "description": "Ya está corriendo en staging."
+          }
+        ]
+      }
+    ]
+  }
+}
