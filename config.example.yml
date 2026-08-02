@@ -1,0 +1,60 @@
+# Copy to config.local.yml and edit. config.local.yml is gitignored — it holds
+# your own project vocabulary, which is what makes transcription accurate.
+
+speech_to_text:
+  # deepgram | openai | whisper-cpp
+  provider: deepgram
+
+  deepgram:
+    model: nova-3
+    language: multi
+    # Both of these matter. With smart_format on, spoken ordinals get rewritten
+    # ("primero" -> "1o") and land in the prompt that way.
+    smart_format: false
+    numerals: false
+
+  openai:
+    model: gpt-4o-transcribe
+
+# Terms the recognizer would otherwise invent. Deepgram sends these as `keyterm`
+# params; OpenAI folds them into the transcription prompt. Without them, domain
+# words come back mangled. Put YOUR services, tools and verbs here.
+keyterms:
+  - staging-api
+  - worker-queue
+  - integration-suite
+  - rate-limiter
+  - feature-flag
+
+summaries:
+  provider: openai
+  model: gpt-4o-mini
+  max_words: 12
+
+text_to_speech:
+  # macOS `say` — offline, zero latency
+  voice: Paulina
+  rate: 190
+  # `say` reads English terms with a Spanish accent. Rewrite them phonetically
+  # so announcements stay intelligible.
+  phonetic:
+    "pull request": "pul rikuest"
+    "merge": "merch"
+    "deploy": "diploi"
+
+announce:
+  # Blocking events speak and open the mic; milestones only chime.
+  milestone_chime: Glass
+  blocking_chime: Ping
+  mic_timeout_seconds: 8
+
+delivery:
+  auto_enter: true
+  # Read the transcript back for confirmation instead of sending it, when the
+  # recognizer was unsure or the phrase looks destructive.
+  confirm_below_confidence: 0.75
+  confirm_if_matches:
+    - "\\bdrop\\b"
+    - "\\bdelete\\b"
+    - "force push"
+    - "\\bprod\\b"

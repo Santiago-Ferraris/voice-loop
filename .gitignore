@@ -1,0 +1,35 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.oai
+.dg
+
+# Local config: personal vocabulary, service names, phonetic overrides
+config.local.yml
+config.local.yaml
+
+# Audio scratch
+*.mp3
+*.aiff
+*.wav
+*.m4a
+*.webm
+
+# Runtime state
+queue.db
+queue.db-*
+*.log
+run/
+state/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
