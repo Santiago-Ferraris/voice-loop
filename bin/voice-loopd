@@ -1,0 +1,28 @@
+#!/bin/sh
+# voice-loopd — launcher for the daemon.
+#
+# launchd does not inherit your shell, so the API key cannot come from .zshrc.
+# It is sourced here from a file outside the repo (chmod 600), which is the
+# only place voice-loop ever reads a key from. Nothing key-shaped is allowed in
+# the config files.
+set -eu
+
+self=$(cd "$(dirname "$0")" && pwd -P)
+repo=$(dirname "$self")
+
+ENV_FILE="${VOICE_LOOP_ENV_FILE:-$HOME/.config/voice-loop/env}"
+if [ -r "$ENV_FILE" ]; then
+  set -a
+  . "$ENV_FILE"
+  set +a
+fi
+
+if [ -x "$repo/.venv/bin/python" ]; then
+  PY="$repo/.venv/bin/python"
+else
+  PY=$(command -v python3)
+  PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
+  export PYTHONPATH
+fi
+
+exec "$PY" -m voiceloop.daemon --repo-root "$repo" "$@"

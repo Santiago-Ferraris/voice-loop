@@ -1,0 +1,5 @@
+{"type": "user", "isSidechain": false, "message": {"role": "user", "content": "Check both things."}}
+{"type": "user", "isSidechain": false, "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": [{"type": "text", "text": "Async agent launched successfully. (This tool result is internal metadata.)\nagentId: aa11bb22cc33dd44e"}]}]}}
+{"type": "user", "isSidechain": false, "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": [{"type": "text", "text": "Async agent launched successfully. (This tool result is internal metadata.)\nagentId: ff55ee66dd77cc88b"}]}]}}
+{"type": "user", "isSidechain": false, "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": [{"type": "text", "text": "<task-notification>\n<task-id>aa11bb22cc33dd44e</task-id>\n<tool-use-id>toolu_9</tool-use-id>\n<status>completed</status>\n<summary>Agent finished.</summary>\n</task-notification>"}]}]}}
+{"type": "assistant", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "text", "text": "One agent is still running."}]}}

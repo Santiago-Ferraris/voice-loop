@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-loop"
+version = "0.1.0"
+description = "Hands-free voice control for parallel Claude Code sessions in iTerm2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pyflakes>=3.1"]
+
+[project.scripts]
+voice-loopd = "voiceloop.daemon:main"
+voice-loopctl = "voiceloop.ctl:main"
+
+[tool.setuptools]
+packages = ["voiceloop"]
+
+[tool.setuptools.package-data]
+voiceloop = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:voiceloop.*"]

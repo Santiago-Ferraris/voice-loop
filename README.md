@@ -15,8 +15,8 @@ voice-loop closes that gap without a GUI:
 Nothing steals your focus. Requests are answered one at a time, in order, and anything you
 skip stays reachable — ask for your pendings whenever you want.
 
-> **Status: design complete, implementation in progress.** The routing spike is verified;
-> see [Current state](#current-state).
+> **Status: phase 1 shipped — it talks, it doesn't listen yet.** Steps 1 and 2 above work
+> today; the mic lands in phase 2. See [Current state](#current-state).
 
 ## Why not just use dictation?
 
@@ -39,12 +39,14 @@ Claude sessions (N windows)
       (LLM)         offline TTS   spanglish    write text      (on request)
 ```
 
-Hooks are deliberately dumb: they append an event and exit in milliseconds, so they never
-delay your prompt. Everything slow — summarizing, speaking, listening — happens in the daemon.
+Hooks are deliberately dumb: each one writes a single JSON file into a spool directory and
+exits in tens of milliseconds, so a dozen sessions firing at once never contend on anything and
+your prompt is never delayed. They don't even open the database. The daemon is the only process
+that owns state, and the only one that does anything slow — summarizing, speaking, listening.
 
 Windows identify themselves by Claude's own session name, so what you hear matches what you see
 in the prompt box and in `/resume`. A session that's still running an auto-generated name gets
-announced with a summary and a proposed name; say "dale" and it sticks.
+announced with a summary and a proposed name; say "dale" and it sticks *(phase 3)*.
 
 ## Design decisions
 
@@ -58,7 +60,7 @@ announced with a summary and a proposed name; say "dale" and it sticks.
 | Delivery | Submits automatically; reads back first when the recognizer was unsure or the phrase looks destructive |
 | Dictation | Passed through verbatim — Claude handles disfluent speech fine. Only control commands are intercepted |
 | Events | Blocking events speak; milestones (PR opened, CI green) only chime |
-| Speech in | Deepgram `nova-3` (`language=multi`) or OpenAI `gpt-4o-transcribe`, behind a swappable adapter |
+| Speech in | Deepgram `nova-3` (`language=multi`) or OpenAI `gpt-4o-transcribe`, behind a swappable adapter (`whisper-cpp` is *planned*, not implemented) |
 | Speech out | macOS `say` — offline, no latency, no cost |
 | Summaries | `gpt-4o-mini` |
 
@@ -80,10 +82,41 @@ the silence cutoff for free.
 ## Requirements
 
 - macOS (uses `say`, AppleScript and iTerm2's scripting interface)
+- Python 3.10+
 - iTerm2
 - Claude Code
-- [`skhd`](https://github.com/koekeishiya/skhd) for the global hotkeys
-- An API key for your chosen speech-to-text provider
+- An `OPENAI_API_KEY` for the summaries — optional; without one, announcements fall back to
+  a fixed phrase instead of a summary
+- *Phase 2:* [`skhd`](https://github.com/koekeishiya/skhd) for the global hotkeys, and an API
+  key for your speech-to-text provider
+
+## Install
+
+```sh
+git clone https://github.com/Santiago-Ferraris/voice-loop.git
+cd voice-loop
+./install.sh
+```
+
+That creates a virtualenv, installs a launchd agent (`com.voiceloop.daemon`), and merges the
+hooks into `~/.claude/settings.json` — backing it up first and touching nothing else. Re-running
+it is a no-op. `./uninstall.sh` reverses all of it.
+
+Then add your key and restart the daemon:
+
+```sh
+$EDITOR ~/.config/voice-loop/env     # OPENAI_API_KEY=sk-…
+bin/voice-loopctl restart
+```
+
+Hooks are read when a session starts, so **open a new Claude window** to see it work. Sessions
+that were already running keep their old hook set until you restart them.
+
+```sh
+bin/voice-loopctl status     # is it up, what's queued
+bin/voice-loopctl pendings   # everything still waiting on you
+bin/voice-loopctl pause      # silence without losing the queue
+```
 
 ## Configuration
 
@@ -91,9 +124,28 @@ the silence cutoff for free.
 cp config.example.yml config.local.yml
 ```
 
-`config.local.yml` is gitignored. It holds your project vocabulary — service names, tools, the
-verbs you actually say — which is the single biggest lever on transcription accuracy. API keys
-are read from the environment, never from the config file and never committed.
+`config.example.yml` holds the defaults and is the documentation; `config.local.yml` is
+gitignored and deep-merged on top, so it only needs the keys you override. It holds your project
+vocabulary — service names, tools, the verbs you actually say — which is the single biggest lever
+on transcription accuracy.
+
+**API keys never live in either file.** The daemon reads them from its environment, which
+`bin/voice-loopd` sources from `~/.config/voice-loop/env` (created empty, `chmod 600`, outside the
+repo) because launchd does not inherit your shell. A config file carrying a key-shaped entry is
+rejected at startup rather than silently ignored.
+
+Runtime state — the spool, the SQLite queue, the control socket and the logs — lives under
+`paths.state_dir` (`~/.local/state/voice-loop` by default).
+
+## How phase 1 behaves
+
+- A turn that ends while **background subagents are still running** is not announced. You have
+  nothing to answer yet, so the item waits — keeping its place in line — until they finish.
+- Background (`claude agents`) sessions never speak.
+- Answering a session, by voice or by typing, resolves everything it had queued.
+- Ignored announcements are never dropped: `voice-loopctl pendings` still lists them.
+- Milestones (a PR being created) only chime. If some other tool of yours already tracks a
+  per-terminal phase in a file, point `integrations.milestone_file_watch` at it — off by default.
 
 ## Current state
 
@@ -101,6 +153,6 @@ are read from the environment, never from the config file and never committed.
 - [x] Speech-to-text and summary models benchmarked on code-switched speech
 - [x] **Routing spike verified** — AppleScript `write text` delivers into Claude Code's
       fullscreen TUI as a real user turn, Enter included, without stealing focus
-- [ ] Phase 1 — hooks, queue, TTS, summaries *(it talks to you; doesn't listen yet)*
+- [x] Phase 1 — hooks, queue, TTS, summaries *(it talks to you; doesn't listen yet)*
 - [ ] Phase 2 — hotkeys, speech-to-text, delivery
 - [ ] Phase 3 — naming, pendings, busy mode, dictionaries

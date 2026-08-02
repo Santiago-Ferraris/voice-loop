@@ -1,0 +1,15 @@
+{
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "transcript_path": "/tmp/voice-loop-test/transcript.jsonl",
+  "cwd": "/tmp/voice-loop-test/project",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cd repo && gh pr create --fill --base main"
+  },
+  "tool_response": {
+    "stdout": "https://example.test/org/repo/pull/1",
+    "stderr": "",
+    "interrupted": false
+  }
+}
