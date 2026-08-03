@@ -391,16 +391,44 @@ class Store:
             (session_id, name, 1 if confirmed else 0, int(time.time())),
         )
 
+    def decline_alias(self, session_id: str) -> None:
+        """Remember that this window was offered a name and did not want one.
+
+        A row with an empty name and `confirmed = 0`: `get_alias` and `aliases`
+        both skip it, so it changes nothing anyone hears — it exists purely so
+        the offer is never made twice. Asking "¿la llamo…?" at every
+        announcement would be unbearable, and "no" has to mean no for longer
+        than one turn.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO aliases (session_id, name, confirmed, created_at)
+            VALUES (?, '', 0, ?)
+            ON CONFLICT(session_id) DO UPDATE SET name = '', confirmed = 0
+            """,
+            (session_id, int(time.time())),
+        )
+
+    def alias_asked(self, session_id: str) -> bool:
+        """Has this window already been offered a name — accepted or not?"""
+        if not session_id:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM aliases WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return row is not None
+
     def aliases(self) -> list[str]:
         """Every name you have given a window — vocabulary for the recognizer."""
         rows = self._conn.execute("SELECT name FROM aliases ORDER BY created_at").fetchall()
         return [row["name"] for row in rows if row["name"]]
 
     def get_alias(self, session_id: str) -> str | None:
+        """The name you gave this window, if you gave it one. See `decline_alias`."""
         row = self._conn.execute(
             "SELECT name FROM aliases WHERE session_id = ?", (session_id,)
         ).fetchone()
-        return row["name"] if row else None
+        return (row["name"] or None) if row else None
 
     # -- kv -----------------------------------------------------------------
 

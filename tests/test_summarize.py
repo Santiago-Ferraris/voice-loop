@@ -9,6 +9,7 @@ from voiceloop.summarize import (
     API_URL,
     FALLBACK_SUMMARY,
     Summarizer,
+    Summary,
     SummaryUnavailable,
     clean,
 )
@@ -174,6 +175,64 @@ def test_from_config_reads_model_and_timeout(config, monkeypatch):
 
 def test_from_config_without_a_key_is_unavailable(config):
     assert Summarizer.from_config(config).available is False
+
+
+# --- the summary and the name, in one call ---------------------------------
+
+
+def named(summary: str, slug: str) -> bytes:
+    return reply(json.dumps({"summary": summary, "slug": slug}))
+
+
+def test_one_request_answers_with_both_the_summary_and_a_name():
+    """The name and the summary come out of the same paragraph; one call, not two."""
+    transport = Recorder(named("pide aprobar la migración", "indice migracion"))
+
+    result = make(transport).summarize_and_name(TAIL)
+
+    assert result == Summary(text="pide aprobar la migración", slug="indice migracion")
+    assert len(transport.calls) == 1
+
+
+def test_the_naming_request_asks_for_json_and_says_what_a_slug_is():
+    transport = Recorder(named("pide aprobar", "indice migracion"))
+
+    make(transport).summarize_and_name(TAIL)
+
+    body = transport.calls[0]["body"]
+    assert body["response_format"] == {"type": "json_object"}
+    assert "slug" in body["messages"][0]["content"]
+
+
+def test_a_model_that_ignores_the_slug_rules_is_corrected():
+    transport = Recorder(named("pide aprobar", "Índice-De-Migración Del Worker Viejo"))
+
+    assert make(transport).summarize_and_name(TAIL).slug == "indice de migracion del"
+
+
+def test_a_response_that_is_not_json_falls_back_without_losing_the_announcement():
+    transport = Recorder(reply("pide aprobar la migración"))
+
+    result = make(transport).summarize_and_name(TAIL)
+
+    assert result == Summary(text=FALLBACK_SUMMARY, slug="")
+    assert len(transport.calls) == 2  # retried once, like every other failure
+
+
+def test_a_missing_slug_still_yields_the_summary():
+    """No name to offer is a normal outcome; no summary is not."""
+    transport = Recorder(reply(json.dumps({"summary": "pide aprobar la migración"})))
+
+    result = make(transport).summarize_and_name(TAIL)
+
+    assert result == Summary(text="pide aprobar la migración", slug="")
+
+
+def test_naming_without_a_key_never_calls_out():
+    transport = Recorder()
+
+    assert make(transport, api_key=None).summarize_and_name(TAIL) == Summary(FALLBACK_SUMMARY)
+    assert transport.calls == []
 
 
 def test_summary_unavailable_is_an_exception_type():

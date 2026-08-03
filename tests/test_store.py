@@ -361,6 +361,35 @@ def test_aliases_round_trip_and_update(store):
     assert store.get_alias("session-1") == "renamed"
 
 
+def test_a_declined_name_is_remembered_without_becoming_one(store):
+    """The offer must not be repeated, and the window must not gain a name."""
+    store.decline_alias("session-1")
+
+    assert store.alias_asked("session-1") is True
+    assert store.get_alias("session-1") is None
+    assert store.aliases() == []
+
+
+def test_a_window_nobody_asked_has_not_been_asked(store):
+    assert store.alias_asked("session-1") is False
+    assert store.alias_asked("") is False
+
+
+def test_declining_after_naming_takes_the_name_away(store):
+    store.set_alias("session-1", "the migration one", confirmed=True)
+
+    store.decline_alias("session-1")
+
+    assert store.get_alias("session-1") is None
+
+
+def test_only_names_you_kept_are_vocabulary(store):
+    store.set_alias("session-1", "el del índice", confirmed=True)
+    store.decline_alias("session-2")
+
+    assert store.aliases() == ["el del índice"]
+
+
 @pytest.mark.parametrize("value", [True, 3, "hola", {"a": [1, 2]}, None])
 def test_kv_round_trips_json_values(store, value):
     store.kv_set("k", value)

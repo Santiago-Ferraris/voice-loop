@@ -220,6 +220,12 @@ def describe_menu(payload: Mapping[str, Any]) -> str:
     return join_sentences(parts)
 
 
+def name_question(slug: str, phonetic: Mapping[str, Any] | None = None) -> str:
+    """The offer to christen a window Claude called `darwin-21`."""
+    spoken = speakable(slug, phonetic)
+    return f"¿La llamo {spoken}?" if spoken else ""
+
+
 def build(
     item,
     *,
@@ -230,6 +236,7 @@ def build(
     blocking_chime: str | None = None,
     milestone_chime: str | None = None,
     notification_events: bool = True,
+    naming_offer: str = "",
 ) -> Announcement:
     """Compose the full announcement for a queue item."""
     spoken_name = speakable(name, phonetic)
@@ -254,6 +261,10 @@ def build(
         sentence += "."
     tail = remaining_phrase(remaining)
     text = f"{sentence} {tail}." if tail else sentence
+    # Last, so it is the question the open microphone is answering.
+    offer = name_question(naming_offer, phonetic)
+    if offer:
+        text = join_sentences([text, offer])
 
     speak = True
     if item.type == TYPE_NOTIFICATION and not notification_events:
