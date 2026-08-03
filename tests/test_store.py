@@ -91,14 +91,106 @@ def test_coalescing_keeps_the_previous_transcript_when_the_new_one_is_blank(stor
     assert store.next_queued().transcript_path == "/tmp/session-1.jsonl"
 
 
-def test_an_announced_item_does_not_coalesce(store):
+def test_an_announced_item_is_superseded_not_duplicated(store):
+    """Observed in the wild: four `pending` rows for one window, four announces.
+
+    A session has one open state — "waiting, and this is the last thing it
+    said". Blocking again refreshes it; it does not queue a second copy.
+    """
+    first = stop("session-1", ts=1000)
+    store.ingest(first)
+    store.mark_announcing(first.id)
+    store.mark_pending(first.id)
+    second = stop("session-1", ts=1005, note="newer")
+
+    assert store.ingest(second) == INGEST_COALESCED
+
+    assert store.open_count() == 1
+    item = store.pendings()[0]
+    assert item.id == second.id
+    assert item.payload == {"note": "newer"}
+
+
+def test_a_superseded_item_is_not_announced_again(store):
+    """It stays `pending`: you already heard about that window."""
+    first = stop("session-1", ts=1000)
+    store.ingest(first)
+    store.mark_announcing(first.id)
+    store.mark_pending(first.id, now=4061)
+
+    store.ingest(stop("session-1", ts=1005))
+
+    item = store.pendings()[0]
+    assert item.state == STATE_PENDING
+    assert item.announced_at == 4061
+    assert store.next_queued() is None
+
+
+def test_superseding_keeps_the_original_place_in_line(store):
+    store.ingest(stop("first", ts=1000))
+    second = stop("second", ts=1001)
+    store.ingest(second)
+    store.mark_announcing(second.id)
+    store.mark_pending(second.id)
+
+    store.ingest(stop("second", ts=9999))
+
+    assert [item.ts for item in store.pendings()] == [1000, 1001]
+
+
+def test_superseding_an_announced_item_drops_the_stale_summary(store):
+    first = stop("session-1", ts=1000)
+    store.ingest(first)
+    store.mark_announcing(first.id)
+    store.mark_pending(first.id)
+    store.set_summary(first.id, "quiere que revises el PR")
+
+    store.ingest(stop("session-1", ts=1005))
+
+    assert store.pendings()[0].summary is None
+
+
+def test_a_stop_mid_announce_keeps_the_id_the_daemon_is_holding(store):
+    """Swapping the id under a running announce would strand the row."""
+    first = stop("session-1", ts=1000)
+    store.ingest(first)
+    store.mark_announcing(first.id)
+
+    store.ingest(stop("session-1", ts=1005, note="newer"))
+
+    assert store.get(first.id).payload == {"note": "newer"}
+    store.mark_pending(first.id)
+    assert store.pendings()[0].state == STATE_PENDING
+    assert store.open_count() == 1
+
+
+def test_ten_blocks_from_one_window_are_still_one_item(store):
+    for tick in range(10):
+        event = stop("session-1", ts=1000 + tick)
+        store.ingest(event)
+        store.mark_announcing(event.id)
+        store.mark_pending(event.id)
+
+    assert store.open_count() == 1
+
+
+def test_two_windows_never_supersede_each_other(store):
     first = stop("session-1", ts=1000)
     store.ingest(first)
     store.mark_announcing(first.id)
     store.mark_pending(first.id)
 
-    assert store.ingest(stop("session-1", ts=1005)) == INGEST_INSERTED
+    assert store.ingest(stop("session-2", ts=1005)) == INGEST_INSERTED
     assert store.open_count() == 2
+
+
+def test_a_resolved_item_does_not_absorb_the_next_stop(store):
+    first = stop("session-1", ts=1000)
+    store.ingest(first)
+    store.resolve(first.id, RESOLVED_BY_ACTIVITY)
+
+    assert store.ingest(stop("session-1", ts=1005)) == INGEST_INSERTED
+    assert store.open_count() == 1
 
 
 def test_a_menu_does_not_coalesce_into_a_stop(store):

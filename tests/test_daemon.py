@@ -179,6 +179,38 @@ def test_the_queue_is_announced_in_order_with_a_countdown(daemon, tmp_path):
     ]
 
 
+def test_a_window_that_blocks_again_is_not_announced_twice(daemon, tmp_path):
+    """The live failure: one window, four announces, four rows in `pendings`."""
+    write_roster(daemon.roster_path, sessionId="s1", name="darwin-96")
+    path = transcript(tmp_path, "s1")
+    daemon.store.ingest(stop_event("s1", ts=1000, transcript_path=path))
+    assert asyncio.run(daemon.announce_next()) is True
+
+    daemon.store.ingest(stop_event("s1", ts=1005, transcript_path=path))
+
+    assert asyncio.run(daemon.announce_next()) is False
+    assert len(daemon.speaker.texts) == 1
+    assert len(daemon.store.pendings()) == 1
+
+
+def test_the_refreshed_turn_is_what_replay_speaks(daemon, tmp_path):
+    """Superseding keeps the item quiet but must not leave it stale."""
+    write_roster(daemon.roster_path, sessionId="s1", name="darwin-96")
+    daemon.store.ingest(
+        stop_event("s1", ts=1000, transcript_path=transcript(tmp_path, "s1", tail="¿lo mergeo?"))
+    )
+    asyncio.run(daemon.announce_next())
+    daemon.summarizer.answer = "quiere que decidas la migración"
+
+    daemon.store.ingest(
+        stop_event("s1", ts=1005, transcript_path=transcript(tmp_path, "s1", tail="¿migro ya?"))
+    )
+    asyncio.run(daemon.dispatch("replay", {}))
+    asyncio.run(daemon.announce_next())
+
+    assert "quiere que decidas la migración" in daemon.speaker.texts[-1]
+
+
 def test_nothing_to_announce_returns_false(daemon):
     assert asyncio.run(daemon.announce_next()) is False
 
@@ -454,6 +486,123 @@ def test_pendings_lists_what_is_waiting(daemon, tmp_path):
     assert pendings[0]["name"] == "alpha"
     assert pendings[0]["state"] == STATE_PENDING
     assert pendings[0]["summary"] == "quiere que revises el diff"
+
+
+def test_a_queued_item_is_listed_by_name_not_by_session_id(daemon, tmp_path):
+    """`pendings` exists to tell you which window wants you. `5cbf3ac9` does not."""
+    write_roster(daemon.roster_path, sessionId="s1", name="darwin-96")
+    daemon.store.ingest(stop_event("s1", transcript_path=transcript(tmp_path, "s1")))
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert pendings[0]["state"] == STATE_QUEUED
+    assert pendings[0]["name"] == "darwin-96"
+
+
+def test_a_listed_name_follows_the_roster_as_it_changes(daemon, tmp_path):
+    write_roster(daemon.roster_path, sessionId="s1", name="darwin-96")
+    daemon.store.ingest(stop_event("s1"))
+    write_roster(daemon.roster_path, sessionId="s1", name="tcc-fix")
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert pendings[0]["name"] == "tcc-fix"
+
+
+def test_an_alias_still_wins_when_listing(daemon):
+    write_roster(daemon.roster_path, sessionId="s1", name="darwin-96")
+    daemon.store.ingest(stop_event("s1"))
+    daemon.store.set_alias("s1", "el de los hooks")
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert pendings[0]["name"] == "el de los hooks"
+
+
+def test_a_session_off_the_roster_falls_back_to_its_directory(daemon):
+    daemon.store.ingest(stop_event("s1", cwd="/Users/me/Documents/darwin/voice-loop"))
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert pendings[0]["name"] == "voice-loop"
+
+
+def test_a_milestone_is_listed_without_inventing_a_window(daemon):
+    asyncio.run(daemon.dispatch("milestone", {"label": "CI green"}))
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert pendings[0]["name"] == ""
+
+
+# --- skip -----------------------------------------------------------------
+
+
+def test_skip_drops_the_last_announcement(daemon, tmp_path):
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    event = stop_event("s1", transcript_path=transcript(tmp_path, "s1"))
+    daemon.store.ingest(event)
+    asyncio.run(daemon.announce_next())
+
+    result = asyncio.run(daemon.dispatch("skip", {}))
+
+    assert result["skipped"] == event.id
+    assert daemon.store.get(event.id).state == STATE_RESOLVED
+    assert daemon.store.get(event.id).resolved_by == "skip"
+    assert asyncio.run(daemon.dispatch("pendings", {})) == []
+
+
+def test_skip_accepts_an_explicit_id(daemon):
+    """The reason it exists: a window that died, listed and never leaving."""
+    first = stop_event("s1")
+    second = stop_event("s2")
+    daemon.store.ingest(first)
+    daemon.store.ingest(second)
+
+    asyncio.run(daemon.dispatch("skip", {"id": first.id}))
+
+    assert daemon.store.get(first.id).state == STATE_RESOLVED
+    assert daemon.store.get(second.id).state == STATE_QUEUED
+
+
+def test_skipping_does_not_disturb_the_rest_of_the_queue(daemon):
+    daemon.store.ingest(stop_event("s1", ts=1000))
+    target = stop_event("s2", ts=1001)
+    daemon.store.ingest(target)
+    daemon.store.ingest(stop_event("s3", ts=1002))
+
+    asyncio.run(daemon.dispatch("skip", {"id": target.id}))
+
+    assert [item["session_id"] for item in asyncio.run(daemon.dispatch("pendings", {}))] == ["s1", "s3"]
+
+
+def test_skip_with_nothing_to_skip_is_an_error(daemon):
+    with pytest.raises(ControlError, match="nothing to skip"):
+        asyncio.run(daemon.dispatch("skip", {}))
+
+
+def test_skipping_an_unknown_id_is_an_error(daemon):
+    with pytest.raises(ControlError, match="no such item"):
+        asyncio.run(daemon.dispatch("skip", {"id": "does-not-exist"}))
+
+
+def test_skipping_twice_is_an_error_not_a_silent_no_op(daemon):
+    event = stop_event("s1")
+    daemon.store.ingest(event)
+    asyncio.run(daemon.dispatch("skip", {"id": event.id}))
+
+    with pytest.raises(ControlError, match="already resolved"):
+        asyncio.run(daemon.dispatch("skip", {"id": event.id}))
+
+
+def test_a_skipped_session_can_come_back(daemon):
+    first = stop_event("s1", ts=1000)
+    daemon.store.ingest(first)
+    asyncio.run(daemon.dispatch("skip", {"id": first.id}))
+
+    daemon.store.ingest(stop_event("s1", ts=1005))
+
+    assert len(asyncio.run(daemon.dispatch("pendings", {}))) == 1
 
 
 def test_pause_and_resume_survive_a_restart(daemon, config, tmp_path):

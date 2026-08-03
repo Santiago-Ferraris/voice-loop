@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from . import __version__
 from .config import ConfigError, load as load_config
 from .control import ControlError, request
+from .runtime import staleness_warning
 
 COMMANDS = (
     "status",
@@ -23,6 +24,7 @@ COMMANDS = (
     "pause",
     "resume",
     "replay",
+    "skip",
     "milestone",
     "restart",
     "mic-toggle",
@@ -71,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in COMMANDS:
         command = sub.add_parser(name)
-        if name == "replay":
+        if name in ("replay", "skip"):
             command.add_argument("id", nargs="?", help="event id; defaults to the last one")
         if name == "milestone":
             command.add_argument("label", help="what to chime about")
@@ -81,6 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     options = parser.parse_args(argv)
+
+    # The daemon runs an installed copy of this clone. Say so before anything
+    # else when the two have drifted — otherwise the next hour goes into
+    # debugging a bug that is already fixed on disk.
+    drift = staleness_warning(options.repo_root)
+    if drift:
+        print(f"voice-loopctl: {drift}", file=sys.stderr)
 
     socket_path = options.socket
     if socket_path is None:
@@ -93,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     args: dict = {}
-    if options.cmd == "replay" and getattr(options, "id", None):
+    if options.cmd in ("replay", "skip") and getattr(options, "id", None):
         args["id"] = options.id
     if options.cmd == "milestone":
         args["label"] = options.label

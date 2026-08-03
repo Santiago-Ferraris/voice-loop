@@ -1,8 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Rendered by install.sh: __REPO__, __HOME__ and __STATE_DIR__ are substituted
-  and the result is written to ~/Library/LaunchAgents/.
+  Rendered by install.sh: __RUNTIME__, __HOME__ and __STATE_DIR__ are
+  substituted and the result is written to ~/Library/LaunchAgents/.
+
+  __RUNTIME__ is the installed copy under ~/.local/share/voice-loop, never the
+  git clone: macOS TCC keeps LaunchAgents out of ~/Documents, ~/Desktop and
+  ~/Downloads, and launchd cannot even execute a wrapper that lives in one of
+  them ("Operation not permitted", exit 126). The renderer refuses to write a
+  plist that names a protected path.
 -->
 <plist version="1.0">
 <dict>
@@ -11,11 +17,11 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>__REPO__/bin/voice-loopd</string>
+    <string>__RUNTIME__/bin/voice-loopd</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>__REPO__</string>
+  <string>__RUNTIME__</string>
 
   <key>RunAtLoad</key>
   <true/>

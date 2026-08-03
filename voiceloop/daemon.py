@@ -45,6 +45,7 @@ MILESTONE_INTERVAL = 1.0
 RESOLVED_BY_MILESTONE = "milestone"
 RESOLVED_BY_BACKGROUND = "background-session"
 RESOLVED_BY_GONE = "session-gone"
+RESOLVED_BY_SKIP = "skip"
 
 KV_PAUSED = "paused"
 
@@ -317,20 +318,27 @@ class Daemon:
         }
 
     def cmd_pendings(self, args: dict) -> list[dict]:
-        return [
-            {
-                "id": item.id,
-                "ts": item.ts,
-                "type": item.type,
-                "state": item.state,
-                "name": item.name or "",
-                "session_id": item.session_id,
-                "tty": item.tty,
-                "summary": item.summary or "",
-                "announced_at": item.announced_at,
-            }
-            for item in self.store.pendings()
-        ]
+        listed = []
+        for item in self.store.pendings():
+            # Resolved here, not only at announce time: an item still queued has
+            # never been through `_announce`, and listing it as `5cbf3ac9`
+            # breaks the one command whose job is telling you which window
+            # wants you. Milestones have no session and keep whatever they had.
+            name = self._name_for(item, self._session_for(item)) if item.session_id else item.name
+            listed.append(
+                {
+                    "id": item.id,
+                    "ts": item.ts,
+                    "type": item.type,
+                    "state": item.state,
+                    "name": name or "",
+                    "session_id": item.session_id,
+                    "tty": item.tty,
+                    "summary": item.summary or "",
+                    "announced_at": item.announced_at,
+                }
+            )
+        return listed
 
     def cmd_pause(self, args: dict) -> dict:
         self.paused = True
@@ -349,6 +357,22 @@ class Daemon:
             raise ControlError("nothing to replay")
         self.store.requeue(item.id)
         return {"replaying": item.id, "name": item.name or ""}
+
+    def cmd_skip(self, args: dict) -> dict:
+        """Drop one item off the pendings list.
+
+        Until now the only way out of `pendings` was an `activity` event from
+        that session, so an item whose window died — or that simply stopped
+        mattering — stayed there for ever.
+        """
+        event_id = args.get("id")
+        item = self.store.get(event_id) if event_id else self.store.last_announced()
+        if item is None:
+            raise ControlError(f"no such item: {event_id}" if event_id else "nothing to skip")
+        if not self.store.resolve(item.id, RESOLVED_BY_SKIP):
+            raise ControlError(f"already resolved: {item.id}")
+        log.info("skipped %s [%s]", item.id[:8], item.display_name)
+        return {"skipped": item.id, "name": item.name or ""}
 
     def cmd_milestone(self, args: dict) -> dict:
         label = str(args.get("label") or "").strip()

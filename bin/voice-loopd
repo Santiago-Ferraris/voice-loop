@@ -1,6 +1,13 @@
 #!/bin/sh
 # voice-loopd — launcher for the daemon.
 #
+# launchd runs the *installed* copy of this file, under
+# ~/.local/share/voice-loop — never the one in the clone: macOS TCC does not
+# let a LaunchAgent execute anything inside ~/Documents, ~/Desktop or
+# ~/Downloads. The two copies are byte-identical, so `$repo` below resolves to
+# the runtime there and to the clone here, and each finds its own interpreter
+# and its own config.
+#
 # launchd does not inherit your shell, so the API key cannot come from .zshrc.
 # It is sourced here from a file outside the repo (chmod 600), which is the
 # only place voice-loop ever reads a key from. Nothing key-shaped is allowed in
@@ -9,6 +16,7 @@ set -eu
 
 self=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(dirname "$self")
+runtime="${VOICE_LOOP_RUNTIME_DIR:-$HOME/.local/share/voice-loop}"
 
 ENV_FILE="${VOICE_LOOP_ENV_FILE:-$HOME/.config/voice-loop/env}"
 if [ -r "$ENV_FILE" ]; then
@@ -19,6 +27,9 @@ fi
 
 if [ -x "$repo/.venv/bin/python" ]; then
   PY="$repo/.venv/bin/python"
+elif [ -x "$runtime/.venv/bin/python" ]; then
+  # Started from a clone with no dev venv: borrow the installed one.
+  PY="$runtime/.venv/bin/python"
 else
   PY=$(command -v python3)
   PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"

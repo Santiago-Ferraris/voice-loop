@@ -14,13 +14,14 @@ that phase ships without a schema migration.
 
 Two rules the rest of the system leans on:
 
-* **Coalescing.** A fresh `stop` for a session that already has an unannounced
-  `queued` item folds into it, keeping the original FIFO position — so a
-  session that finishes twice while you are busy elsewhere doesn't announce
-  twice, and doesn't jump the line either.
+* **Coalescing.** A session has exactly one open item: "it is waiting, and this
+  is the last thing it said". A fresh `stop` supersedes whatever that session
+  already had open — queued *or* already announced — keeping the original FIFO
+  position. Otherwise a window you ignored announces itself again every time it
+  blocks, and `pendings` fills up with four copies of one window.
 * **Nothing is ever dropped.** Items leave the queue only by being resolved:
-  explicitly, or because the session saw real user activity. There is no
-  delete path.
+  explicitly, by `skip`, or because the session saw real user activity. There
+  is no delete path.
 """
 
 from __future__ import annotations
@@ -170,25 +171,9 @@ class Store:
             return INGEST_RESOLVED
 
         if event.type == TYPE_STOP:
-            target = self._coalescible_stop(event.session_id)
+            target = self._open_stop(event.session_id)
             if target is not None:
-                self._conn.execute(
-                    """
-                    UPDATE events
-                       SET id = ?, type = ?, tty = ?, cwd = ?, transcript_path = ?,
-                           payload = ?, summary = NULL
-                     WHERE id = ?
-                    """,
-                    (
-                        event.id,
-                        event.type,
-                        event.tty or target.tty,
-                        event.cwd or target.cwd,
-                        event.transcript_path or target.transcript_path,
-                        json.dumps(event.payload, ensure_ascii=False),
-                        target.id,
-                    ),
-                )
+                self._supersede(target, event)
                 return INGEST_COALESCED
 
         self._conn.execute(
@@ -215,19 +200,53 @@ class Store:
         row = self._conn.execute("SELECT 1 FROM events WHERE id = ?", (event_id,)).fetchone()
         return row is not None
 
-    def _coalescible_stop(self, session_id: str) -> Item | None:
+    def _open_stop(self, session_id: str) -> Item | None:
+        """The one open `stop` this session already has, announced or not."""
         if not session_id:
             return None
+        placeholders = ",".join("?" for _ in OPEN_STATES)
         row = self._conn.execute(
-            """
+            f"""
             SELECT * FROM events
-             WHERE session_id = ? AND type = ? AND state = ? AND announced_at IS NULL
+             WHERE session_id = ? AND type = ? AND state IN ({placeholders})
              ORDER BY ts, rowid
              LIMIT 1
             """,
-            (session_id, TYPE_STOP, STATE_QUEUED),
+            (session_id, TYPE_STOP, *OPEN_STATES),
         ).fetchone()
         return _row_to_item(row) if row else None
+
+    def _supersede(self, target: Item, event: Event) -> None:
+        """Fold a newer `stop` into the session's open item, in place.
+
+        `ts` is left alone — the item keeps its place in line, and `pendings`
+        keeps showing how long the window has actually been waiting. `state` is
+        left alone too: an item you have already been told about does not go
+        back in the queue to be spoken a second time, which is the whole point.
+        The summary goes, because it describes a turn that is no longer the
+        last one; `replay` regenerates it from the current transcript.
+
+        The id follows the newest event, so `replay <id>` matches what
+        `pendings` printed — except mid-announce, where the daemon is holding
+        the old id and swapping it would strand the row in `announcing`.
+        """
+        keep_id = target.state == STATE_ANNOUNCING
+        self._conn.execute(
+            """
+            UPDATE events
+               SET id = ?, tty = ?, cwd = ?, transcript_path = ?, payload = ?,
+                   summary = NULL
+             WHERE id = ?
+            """,
+            (
+                target.id if keep_id else event.id,
+                event.tty or target.tty,
+                event.cwd or target.cwd,
+                event.transcript_path or target.transcript_path,
+                json.dumps(event.payload, ensure_ascii=False),
+                target.id,
+            ),
+        )
 
     # -- queue reads --------------------------------------------------------
 

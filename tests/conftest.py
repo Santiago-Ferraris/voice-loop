@@ -22,6 +22,16 @@ def repo_root() -> Path:
     return REPO_ROOT
 
 
+@pytest.fixture(autouse=True)
+def isolated_runtime_dir(monkeypatch, tmp_path):
+    """Never let a test read the runtime actually installed on this machine.
+
+    Otherwise `voice-loopctl`'s drift warning would fire — or not — depending on
+    whether the developer running the suite has run install.sh today.
+    """
+    monkeypatch.setenv("VOICE_LOOP_RUNTIME_DIR", str(tmp_path / "not-installed"))
+
+
 @pytest.fixture
 def clean_env(monkeypatch):
     """No provider keys leak in from the developer's shell."""
