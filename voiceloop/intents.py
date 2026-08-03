@@ -33,6 +33,8 @@ KIND_REPEAT = "repeat"
 KIND_SKIP = "skip"
 KIND_SHOW = "show"
 KIND_SILENCE = "silence"
+KIND_PENDINGS = "pendings"
+KIND_STATUS = "status"
 
 NUMBERS: Mapping[str, int] = {
     "uno": 1, "una": 1, "un": 1, "primero": 1, "primera": 1, "primer": 1,
@@ -78,6 +80,24 @@ SHOW_PHRASES = frozenset({
     "llevame", "llevame ahi", "abrila", "abrilo", "enfocala", "enfocalo",
     "enfoca", "vamos ahi", "ir ahi", "traeme", "mostrame eso",
     "mostrame la ventana", "quiero verlo", "quiero verla",
+})
+
+# Asked *of voice-loop*, never of a window: what is in the queue, and how the
+# whole board looks. They work from any mode — including busy, where the hotkey
+# is the only way in — so they are classified like any other control phrase.
+PENDINGS_PHRASES = frozenset({
+    "pendientes", "los pendientes", "las pendientes", "dame los pendientes",
+    "damelos", "dame pendientes", "que tengo pendiente", "que tengo pendientes",
+    "que hay pendiente", "que hay pendientes", "que queda pendiente",
+    "que esta pendiente", "que me falta", "que me queda", "que tengo",
+    "lista de pendientes", "leeme los pendientes", "decime los pendientes",
+    "quien me espera", "que ventanas me esperan",
+})
+
+STATUS_PHRASES = frozenset({
+    "estado", "el estado", "estado general", "como venimos", "como vamos",
+    "como va todo", "como viene la mano", "que esta pasando", "que pasa",
+    "que hay", "situacion", "como estamos", "resumen", "panorama",
 })
 
 EXPLAIN_VERBS = (
@@ -236,6 +256,8 @@ def parse(
         (REPEAT_PHRASES, KIND_REPEAT),
         (SKIP_PHRASES, KIND_SKIP),
         (SHOW_PHRASES, KIND_SHOW),
+        (PENDINGS_PHRASES, KIND_PENDINGS),
+        (STATUS_PHRASES, KIND_STATUS),
     ):
         if folded in phrases or bare in phrases:
             return Intent(kind, text=raw)

@@ -77,6 +77,21 @@ class MilestoneWatcher:
         self._seen = self._scan()
         self._baselined = True
 
+    def current(self) -> dict[str, int]:
+        """How many watched files sit in each milestone phase right now.
+
+        `poll` reports transitions and forgets them; the spoken status needs the
+        standing picture — "two with CI green" — which is only in the files.
+        Empty when the bridge is off, and the caller says nothing rather than
+        inventing a zero.
+        """
+        counts: dict[str, int] = {}
+        for phase in self._scan().values():
+            label = self.milestones.get(phase)
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        return counts
+
     def poll(self) -> Iterator[Milestone]:
         """Milestones since the last poll. Empty until `baseline()` has run."""
         if not self.active:

@@ -28,6 +28,7 @@ KIND_INTERACTIVE = "interactive"
 KIND_BACKGROUND = "bg"
 
 STATUS_WAITING = "waiting"
+STATUS_BUSY = "busy"
 
 DEFAULT_ROSTER_DIR = "~/.claude/sessions"
 

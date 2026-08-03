@@ -87,6 +87,10 @@ MIC_CONSENT_SPOKEN = (
     "Corré voice loop control doctor en una terminal."
 )
 
+# How many windows one "dame los pendientes" chain may hop through before the
+# daemon stops following it. Not a limit on you — the hotkey starts a new chain.
+MAX_SWITCHES = 5
+
 # One reply cycle ends this way.
 REPLY_DELIVERED = "delivered"
 REPLY_PENDING = "pending"
@@ -165,6 +169,7 @@ class Daemon:
         self._mic_lock = asyncio.Lock()
         self._mic_stop: asyncio.Event | None = None
         self._mic_tasks: set[asyncio.Task] = set()
+        self._switch_to: str | None = None
 
     @staticmethod
     def _build_stt(config: Config):
@@ -369,7 +374,7 @@ class Daemon:
         filled = await asyncio.gather(*(self._summary_for(item) for item in stale))
         return {item.id: text for item, text in zip(stale, filled) if text}
 
-    async def _announce(self, item: Item, session) -> None:
+    async def _announce(self, item: Item, session, *, depth: int = 0) -> None:
         self.store.mark_announcing(item.id)
         name = self._name_for(item, session)
         self.store.set_name(item.id, name)
@@ -405,6 +410,7 @@ class Daemon:
         # window's own reply cycle rather than thrown away.
         overheard = await self._settle_name(item, slug) if slug else None
         await self.reply_cycle(item, announcement.text, first=overheard)
+        await self._follow_switch(depth)
 
     # -- naming windows -----------------------------------------------------
 
@@ -652,6 +658,17 @@ class Daemon:
             if intent.kind == intents.KIND_SHOW:
                 await asyncio.to_thread(self.delivery.focus, item.tty)
                 continue
+            if intent.kind == intents.KIND_STATUS:
+                await self.speak_status()
+                continue
+            if intent.kind == intents.KIND_PENDINGS:
+                chosen = await self.speak_pendings()
+                if chosen is not None and chosen.id != item.id:
+                    # Unwind first: this item's mic lock is in the way, and
+                    # leaving it half-answered is what `pending` is for.
+                    self._switch_to = chosen.id
+                    return REPLY_PENDING
+                continue
             if intent.kind == intents.KIND_EXPLAIN and menu is not None:
                 await self.speaker.speak(
                     announce_mod.speakable(menu.describe(intent.index), self.phonetic)
@@ -730,6 +747,84 @@ class Daemon:
             await asyncio.to_thread(self.delivery.send_menu_text, item.tty, index, text)
         else:
             await asyncio.to_thread(self.delivery.send_text, item.tty, payload)
+
+    # -- asking voice-loop itself -------------------------------------------
+
+    async def speak_status(self) -> str:
+        """How the whole board looks, in one breath.
+
+        Answerable from any mode, busy included: "what is going on" is the
+        question you ask precisely when you have not been listening.
+        """
+        try:
+            sessions = roster_mod.load(self.roster_dir, interactive_only=True)
+        except OSError:
+            sessions = {}
+        text = announce_mod.describe_status(
+            windows=len(sessions),
+            working=sum(1 for s in sessions.values() if s.status == roster_mod.STATUS_BUSY),
+            waiting=self.store.open_count(),
+            milestones=sorted(self.watcher.current().items()),
+            paused=self.paused,
+            busy=self.busy,
+        )
+        await self.speaker.speak(announce_mod.speakable(text, self.phonetic))
+        return text
+
+    async def speak_pendings(self) -> Item | None:
+        """Read the queue out in order, then take a pick — by number or by name.
+
+        The pick is what makes this more than a report: the window you choose is
+        re-announced and gets the microphone, exactly as if it had just blocked.
+        Summaries missing from superseded items are filled in here (issue #3) —
+        a list of names with nothing after them answers nothing.
+        """
+        items = self.store.pendings()
+        recomputed = await self.summarize_missing(items)
+        now = time.time()
+        names = [self._name_for(item, self._session_for(item)) or "" for item in items]
+        entries = [
+            (
+                names[index],
+                item.summary or recomputed.get(item.id, ""),
+                announce_mod.ago_phrase(now - item.ts),
+            )
+            for index, item in enumerate(items)
+        ]
+        await self.speaker.speak(
+            announce_mod.speakable(announce_mod.describe_pendings(entries), self.phonetic)
+        )
+        if not items:
+            return None
+
+        transcript = await self.listen()
+        if transcript is None:
+            return None
+        intent = intents.parse(transcript.text, names)
+        if intent.kind != intents.KIND_SELECT or not 1 <= (intent.index or 0) <= len(items):
+            return None
+        chosen = items[intent.index - 1]
+        log.info("picked %s [%s] off the pendings list", chosen.id[:8], names[intent.index - 1])
+        return chosen
+
+    async def _follow_switch(self, depth: int) -> None:
+        """Serve the window that was picked off the list mid-conversation.
+
+        The pick cannot be served where it is made: that code is holding the
+        microphone lock for the item being answered. So it is parked here and
+        acted on once that cycle has unwound — bounded, because a chain of
+        switches is still one hotkey press away from being restarted by hand.
+        """
+        target, self._switch_to = self._switch_to, None
+        if target is None:
+            return
+        if depth >= MAX_SWITCHES:
+            log.warning("stopping after %d window switches in one go", depth)
+            return
+        item = self.store.get(target)
+        if item is None:
+            return
+        await self._announce(item, self._session_for(item), depth=depth + 1)
 
     # -- control surface ---------------------------------------------------
 
@@ -815,14 +910,37 @@ class Daemon:
         task.add_done_callback(self._mic_tasks.discard)
 
     async def _hotkey_listen(self) -> None:
-        """A mic you opened yourself answers whatever spoke last."""
-        item = self.store.last_announced()
-        if item is None or not item.tty:
-            await self.speaker.chime(self.mic_open_chime)
-            await self.speaker.speak("No hay nada pendiente.")
-            return
+        """A mic you opened yourself answers whatever spoke last — or asks me.
+
+        The take comes first, before deciding what it was for: "estado" and
+        "dame los pendientes" are questions for voice-loop, and in busy mode
+        this hotkey is the only way to ask them. Anything else is handed to the
+        last window that spoke, so nothing has to be said twice.
+        """
         try:
-            await self.reply_cycle(item, item.summary or "")
+            item = self.store.last_announced()
+            async with self._mic_lock:
+                transcript = await self.listen()
+                if transcript is None:
+                    return
+                intent = intents.parse(transcript.text)
+                chosen = None
+                if intent.kind == intents.KIND_STATUS:
+                    await self.speak_status()
+                    return
+                if intent.kind == intents.KIND_PENDINGS:
+                    chosen = await self.speak_pendings()
+            if chosen is not None:
+                await self._announce(chosen, self._session_for(chosen))
+                await self._follow_switch(0)
+                return
+            if intent.kind == intents.KIND_PENDINGS:
+                return
+            if item is None or not item.tty:
+                await self.speaker.speak("No hay nada pendiente.")
+                return
+            await self.reply_cycle(item, item.summary or "", first=transcript)
+            await self._follow_switch(0)
         except Exception:  # noqa: BLE001 - a background task must not die silently
             log.exception("hotkey mic failed")
 
