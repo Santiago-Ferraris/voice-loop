@@ -115,6 +115,19 @@ $EDITOR ~/.config/voice-loop/env     # OPENAI_API_KEY=sk-…
 bin/voice-loopctl restart
 ```
 
+**Then grant the microphone — this is a step, not a footnote.** `install.sh` ends by running
+`doctor` from your terminal for exactly this reason: it records one second of audio, which is
+what makes macOS raise the consent dialog while you are still sitting there. Until it is
+answered, every mic open parks on an invisible prompt, the hotkey looks dead, and nothing in the
+log says why. If you skipped it (or installed over SSH), do it by hand:
+
+```sh
+bin/voice-loopctl doctor     # answer the dialog, then run it again
+```
+
+See [Permissions](#permissions) for what to do when the *daemon's* column keeps failing after
+your terminal's has gone green — they are two different grants.
+
 Hooks are read when a session starts, so **open a new Claude window** to see it work. Sessions
 that were already running keep their old hook set until you restart them.
 
@@ -158,6 +171,23 @@ LaunchAgent may never get the chance to — and then asks the daemon to run the 
 where it lives. Two columns; the difference between them is the bug. A denied Automation prompt
 shows up as AppleScript error `-1743`, and a denied microphone as an ffmpeg capture with no
 samples in it.
+
+**A capture that hangs is not a slow capture.** A one-second probe that times out after twenty
+is a process parked on a consent prompt nobody answered — `doctor` says so in those words. It is
+the normal state of a fresh install *before* the first grant, and it self-corrects the moment you
+say yes.
+
+**If your terminal's column is green and the daemon's is not**, that is the grant working exactly
+as macOS intends: permission belongs to the responsible process, and for a LaunchAgent that is
+launchd rather than iTerm2. Tick the runtime's interpreter
+(`~/.local/share/voice-loop/.venv/bin/python3`) in System Settings → Privacy & Security →
+Microphone, then `bin/voice-loopctl restart`. When the daemon hits this at runtime it says so out
+loud rather than only logging it — you are not looking at a terminal, which is the whole premise
+of the project.
+
+The key itself lives in `~/.config/voice-loop/env`, which the daemon's launcher sources and
+`voice-loopctl` does not. `doctor` reads that file directly, so a configured key is never
+reported as missing, and a missing one is reported by name and path.
 
 ### Why the daemon does not run from the clone
 

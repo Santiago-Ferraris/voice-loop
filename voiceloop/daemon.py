@@ -55,7 +55,7 @@ from . import (
     roster as roster_mod,
     spool,
 )
-from .audio import AudioUnavailable, Recorder
+from .audio import AudioUnavailable, MicConsentPending, Recorder
 from .config import Config, ConfigError, load as load_config
 from .control import ControlError, ControlServer, DaemonAlreadyRunning
 from .delivery import Delivery, GatePolicy
@@ -78,6 +78,13 @@ RESOLVED_BY_SKIP = "skip"
 
 KV_PAUSED = "paused"
 KV_BUSY = "busy"
+
+# Said out loud, not logged: a mic that never opens looks exactly like a daemon
+# that stopped caring, and the log is the last place anyone will look.
+MIC_CONSENT_SPOKEN = (
+    "No pude abrir el micrófono: falta el permiso de micrófono para el daemon. "
+    "Corré voice loop control doctor en una terminal."
+)
 
 # One reply cycle ends this way.
 REPLY_DELIVERED = "delivered"
@@ -397,6 +404,12 @@ class Daemon:
             recording = await self.recorder.record(
                 path, stop=stop, on_open=lambda: self.speaker.chime(self.mic_open_chime)
             )
+        except MicConsentPending as exc:
+            # The one mic failure with a fix only the user can perform — and
+            # they are not looking at a terminal, which is the whole premise.
+            log.error("microphone consent pending: %s — %s", exc, preflight.CONSENT_TIMEOUT)
+            await self.speaker.speak(MIC_CONSENT_SPOKEN)
+            return None
         except AudioUnavailable as exc:
             log.error("microphone unavailable: %s", exc)
             await self.speaker.speak("No pude abrir el micrófono.")

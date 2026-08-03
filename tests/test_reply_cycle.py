@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from voiceloop import iterm
-from voiceloop.audio import AudioUnavailable, Recording
+from voiceloop.audio import AudioUnavailable, MicConsentPending, Recording
 from voiceloop.daemon import REPLY_DELIVERED, REPLY_FAILED, REPLY_PENDING, Daemon
 from voiceloop.events import Event
 from voiceloop.milestones import MilestoneWatcher
@@ -421,6 +421,17 @@ def test_a_broken_microphone_says_so_and_leaves_the_item_alone(build):
     assert answer(daemon, item) == REPLY_FAILED
     assert daemon.store.get(item).state == STATE_PENDING
     assert any("micrófono" in said for said in daemon.speaker.spoken)
+
+
+def test_a_mic_waiting_on_consent_says_what_to_do_about_it(build):
+    """Issue #7: the user is not looking at a terminal — that is the premise."""
+    daemon = build([], recorder=StubRecorder(error=MicConsentPending("did not open :0")))
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_FAILED
+    said = " ".join(daemon.speaker.spoken)
+    assert "permiso de micrófono" in said
+    assert "doctor" in said
 
 
 def test_an_item_with_no_tty_never_opens_the_mic(build):

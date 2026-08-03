@@ -12,7 +12,13 @@ import asyncio
 import pytest
 
 from voiceloop import audio
-from voiceloop.audio import AudioUnavailable, Recorder, Recording, SilenceTracker
+from voiceloop.audio import (
+    AudioUnavailable,
+    MicConsentPending,
+    Recorder,
+    Recording,
+    SilenceTracker,
+)
 
 OPEN_LINE = "Output #0, wav, to 'reply.wav':"
 PROGRESS = "size=      12KiB time=00:00:00.50 bitrate= 197.2kbits/s speed=0.993x"
@@ -236,9 +242,18 @@ def test_the_capture_is_always_terminated(tmp_path):
 
 
 def test_a_device_that_never_opens_is_reported_not_awaited(tmp_path):
+    """Issue #7: opening takes a second; not opening at all is the consent prompt."""
     subject, _ = recorder([PROGRESS], open_timeout=0.2)
 
-    with pytest.raises(AudioUnavailable, match="did not open"):
+    with pytest.raises(MicConsentPending, match="did not open"):
+        run(subject, tmp_path / "r.wav")
+
+
+def test_a_device_that_never_opens_is_still_an_audio_failure(tmp_path):
+    """Callers that only care that the mic is unusable keep working."""
+    subject, _ = recorder([PROGRESS], open_timeout=0.2)
+
+    with pytest.raises(AudioUnavailable):
         run(subject, tmp_path / "r.wav")
 
 

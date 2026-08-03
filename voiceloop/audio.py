@@ -64,6 +64,20 @@ class AudioUnavailable(RuntimeError):
     """ffmpeg is missing, or the capture device could not be opened."""
 
 
+class MicConsentPending(AudioUnavailable):
+    """ffmpeg started and then never delivered a sample.
+
+    Opening avfoundation takes about a second. A process that has not managed
+    it in eight is not slow, it is parked on the macOS microphone consent
+    prompt — and under launchd that prompt may never be presented at all, since
+    the responsible process is the agent and not the terminal you granted.
+
+    Separate from its parent because it is the one audio failure with a fix the
+    user has to perform, so it is worth saying out loud instead of "no pude
+    abrir el micrófono".
+    """
+
+
 @dataclass(frozen=True)
 class Recording:
     path: Path
@@ -279,7 +293,7 @@ class Recorder:
         try:
             await asyncio.wait_for(opened.wait(), timeout=self.open_timeout)
         except asyncio.TimeoutError:
-            raise AudioUnavailable(
+            raise MicConsentPending(
                 f"{self.binary} did not open {self.device} within {self.open_timeout:g}s"
             ) from None
         if on_open is not None:
