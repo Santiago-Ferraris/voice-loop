@@ -47,6 +47,15 @@ def test_replay_forwards_an_optional_id(calls):
     assert calls[1][2] == {"id": "abc-123"}
 
 
+def test_skip_forwards_an_optional_id(calls):
+    run("skip")
+    run("skip", "abc-123")
+
+    assert [cmd for _, cmd, _ in calls] == ["skip", "skip"]
+    assert calls[0][2] == {}
+    assert calls[1][2] == {"id": "abc-123"}
+
+
 def test_an_unknown_command_is_rejected_by_the_parser(calls):
     with pytest.raises(SystemExit):
         run("teleport")
@@ -162,3 +171,60 @@ def test_json_mode_still_signals_failure(monkeypatch, capsys):
     monkeypatch.setattr(ctl, "request", lambda *a, **k: {"ok": False, "error": "nope"})
 
     assert run("--json", "status") == 1
+
+
+# --- the drift warning ----------------------------------------------------
+#
+# The daemon runs an installed copy of the clone (macOS TCC keeps LaunchAgents
+# out of ~/Documents). Silence about that is how you spend an hour on a bug you
+# already fixed.
+
+
+@pytest.fixture
+def installed(tmp_path, monkeypatch):
+    """A clone and the runtime that was installed from it."""
+    from voiceloop.runtime import write_manifest
+
+    clone = tmp_path / "clone"
+    (clone / "voiceloop").mkdir(parents=True)
+    (clone / "voiceloop" / "daemon.py").write_text("x = 1\n", encoding="utf-8")
+    runtime = tmp_path / "runtime"
+    write_manifest(runtime, clone)
+    monkeypatch.setenv("VOICE_LOOP_RUNTIME_DIR", str(runtime))
+    return clone
+
+
+def test_a_matching_runtime_says_nothing(calls, installed, capsys):
+    ctl.main(["--socket", "/tmp/vl.sock", "--repo-root", str(installed), "status"])
+
+    assert "install.sh" not in capsys.readouterr().err
+
+
+def test_an_out_of_date_runtime_is_called_out(calls, installed, capsys):
+    (installed / "voiceloop" / "daemon.py").write_text("x = 2  # the fix\n", encoding="utf-8")
+
+    ctl.main(["--socket", "/tmp/vl.sock", "--repo-root", str(installed), "status"])
+
+    err = capsys.readouterr().err
+    assert "out of date" in err
+    assert "install.sh" in err
+
+
+def test_the_warning_does_not_stop_the_command(calls, installed, capsys):
+    (installed / "voiceloop" / "daemon.py").write_text("x = 2\n", encoding="utf-8")
+
+    code = ctl.main(["--socket", "/tmp/vl.sock", "--repo-root", str(installed), "status"])
+
+    assert code == 0
+    assert [cmd for _, cmd, _ in calls] == ["status"]
+
+
+def test_the_warning_stays_off_stdout(installed, monkeypatch, capsys):
+    (installed / "voiceloop" / "daemon.py").write_text("x = 2\n", encoding="utf-8")
+    monkeypatch.setattr(ctl, "request", lambda *a, **k: {"ok": True, "data": {"queued": 2}})
+
+    ctl.main(["--socket", "/tmp/vl.sock", "--repo-root", str(installed), "--json", "status"])
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"ok": True, "data": {"queued": 2}}
+    assert "out of date" in captured.err

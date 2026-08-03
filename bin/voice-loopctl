@@ -1,13 +1,21 @@
 #!/bin/sh
 # voice-loopctl — talk to the running daemon over its control socket.
 # No key is needed here, so the env file is deliberately not sourced.
+#
+# This is the copy you type, from the clone. It reaches the same daemon as the
+# installed copy under ~/.local/share/voice-loop, because both resolve the
+# socket from the same config, and it tells you when the two have drifted.
 set -eu
 
 self=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(dirname "$self")
+runtime="${VOICE_LOOP_RUNTIME_DIR:-$HOME/.local/share/voice-loop}"
 
 if [ -x "$repo/.venv/bin/python" ]; then
   PY="$repo/.venv/bin/python"
+elif [ -x "$runtime/.venv/bin/python" ]; then
+  # Run from a clone with no dev venv: borrow the installed one.
+  PY="$runtime/.venv/bin/python"
 else
   PY=$(command -v python3)
   PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"

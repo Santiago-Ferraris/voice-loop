@@ -98,9 +98,11 @@ cd voice-loop
 ./install.sh
 ```
 
-That creates a virtualenv, installs a launchd agent (`com.voiceloop.daemon`), and merges the
-hooks into `~/.claude/settings.json` — backing it up first and touching nothing else. Re-running
-it is a no-op. `./uninstall.sh` reverses all of it.
+That installs the **runtime** into `~/.local/share/voice-loop` (a virtualenv plus a copy of the
+wrappers and your config), registers a launchd agent (`com.voiceloop.daemon`) pointing at it,
+waits until the daemon actually answers on its control socket, and merges the hooks into
+`~/.claude/settings.json` — backing it up first and touching nothing else. `./uninstall.sh`
+reverses all of it, runtime included.
 
 Then add your key and restart the daemon:
 
@@ -115,8 +117,41 @@ that were already running keep their old hook set until you restart them.
 ```sh
 bin/voice-loopctl status     # is it up, what's queued
 bin/voice-loopctl pendings   # everything still waiting on you
+bin/voice-loopctl skip       # drop the last announcement off the list
 bin/voice-loopctl pause      # silence without losing the queue
 ```
+
+### Why the daemon does not run from the clone
+
+macOS TCC does not let a LaunchAgent touch `~/Documents`, `~/Desktop` or `~/Downloads` — it
+cannot even *execute* a file there. A clone in one of them gives you a launchd agent that dies
+instantly with `Operation not permitted` and exit 126, with a perfectly valid plist:
+
+```
+$ launchctl list | grep voiceloop
+-	126	com.voiceloop.daemon
+```
+
+So `install.sh` copies everything launchd touches out to `~/.local/share/voice-loop` and points
+the plist there; the renderer refuses outright to write a plist naming a protected path. The
+clone stays where you want it and is what you develop in.
+
+The price is two copies, so **re-run `./install.sh` after every `git pull`** — that one command
+is what updates the runtime. Until you do, `voice-loopctl` prints a warning from the clone
+saying the daemon is running older code, because the alternative is an hour spent debugging a
+bug you already fixed.
+
+### Checking it really is launchd running it
+
+```sh
+launchctl list | grep voiceloop          # a pid in the first column, not "-"
+launchctl kickstart -k gui/$(id -u)/com.voiceloop.daemon
+bin/voice-loopctl status                 # answers again after the restart
+```
+
+A `-` in the first column means nothing is running; the second column is the last exit status
+(126 is the TCC failure above). If the daemon does not come up, `install.sh` fails and prints
+the tail of `~/.local/state/voice-loop/logs/stderr.log` rather than claiming success.
 
 ## Configuration
 
@@ -135,7 +170,15 @@ repo) because launchd does not inherit your shell. A config file carrying a key-
 rejected at startup rather than silently ignored.
 
 Runtime state — the spool, the SQLite queue, the control socket and the logs — lives under
-`paths.state_dir` (`~/.local/state/voice-loop` by default).
+`paths.state_dir` (`~/.local/state/voice-loop` by default). The installed program itself lives
+under `~/.local/share/voice-loop`; `config.local.yml` is copied there by `install.sh`, so
+editing it is another reason to re-run the installer.
+
+| Variable | What it moves |
+|---|---|
+| `VOICE_LOOP_RUNTIME_DIR` | where the runtime is installed |
+| `VOICE_LOOP_ENV_FILE` | where the API keys are read from |
+| `VOICE_LOOP_PIP_INDEX_URL` | the package index `install.sh` uses (defaults to PyPI, ignoring your pip config — a stale token on a private index is not voice-loop's problem to inherit) |
 
 ## How phase 1 behaves
 
@@ -143,9 +186,29 @@ Runtime state — the spool, the SQLite queue, the control socket and the logs �
   nothing to answer yet, so the item waits — keeping its place in line — until they finish.
 - Background (`claude agents`) sessions never speak.
 - Answering a session, by voice or by typing, resolves everything it had queued.
-- Ignored announcements are never dropped: `voice-loopctl pendings` still lists them.
+- **One open item per window.** A session that blocks again supersedes what it already had
+  waiting instead of queueing a second copy — you hear each window once, and `pendings` never
+  fills up with four rows for the same one. The item keeps its place in line and its "waiting
+  since" time; only the content is refreshed.
+- Ignored announcements are never dropped: `voice-loopctl pendings` still lists them, by window
+  name, whether or not they have been announced yet. `voice-loopctl skip [id]` is the way out
+  for an item that stopped mattering — without it, only real activity in that session clears it.
 - Milestones (a PR being created) only chime. If some other tool of yours already tracks a
   per-terminal phase in a file, point `integrations.milestone_file_watch` at it — off by default.
+
+## Developing
+
+`install.sh` builds the runtime, not a dev environment. For the test suite:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/pytest -q
+```
+
+`bin/voice-loopctl` prefers that venv when it exists and falls back to the installed runtime,
+so it works from the clone either way — and it is the same daemon on the other end of the
+socket. After changing anything the daemon runs, `./install.sh` again.
 
 ## Current state
 
