@@ -10,19 +10,52 @@ paths:
   state_dir: ~/.local/state/voice-loop
 
 speech_to_text:
-  # deepgram | openai | whisper-cpp
+  # deepgram | openai | mock. `whisper-cpp` and `deepgram_ws` (streaming, with
+  # server-side endpointing instead of the local silence cutoff) are accepted
+  # names but not implemented — they fail loudly rather than falling back.
   provider: deepgram
+  # Per-request ceiling for the transcription call.
+  timeout_seconds: 20
 
   deepgram:
     model: nova-3
     language: multi
     # Both of these matter. With smart_format on, spoken ordinals get rewritten
-    # ("primero" -> "1o") and land in the prompt that way.
+    # ("primero" -> "1o") and land in the prompt that way. They are not
+    # settings the adapter reads — they are always sent as false, and there is
+    # a test to keep it that way. Listed here as documentation.
     smart_format: false
     numerals: false
 
   openai:
     model: gpt-4o-transcribe
+    language: es
+
+  # Only used by `provider: mock`, for trying the loop out without an API key.
+  mock:
+    default: "dale, mandale"
+
+microphone:
+  enabled: true
+  # avfoundation input. ":0" is the default audio device; use ":1", ":2"… or
+  # `ffmpeg -f avfoundation -list_devices true -i ""` to see the list.
+  device: ":0"
+  ffmpeg: ffmpeg
+  # Hard cap on one take. The silence cutoff normally ends it long before.
+  max_seconds: 60
+  # avfoundation takes about a second to hand over the first sample; the "speak
+  # now" chime waits for it. Give up if it never arrives.
+  open_timeout_seconds: 8
+  # Keep the WAVs in <state_dir>/mic instead of deleting them. Debugging only.
+  keep_recordings: false
+  silence:
+    enabled: true
+    # Anything quieter than this counts as silence…
+    noise_db: -35
+    # …and this much of it, after you have started talking, closes the mic.
+    min_seconds: 1.2
+    # Silence reported before this point is you not having started yet.
+    min_speech_seconds: 0.6
 
 # Terms the recognizer would otherwise invent. Deepgram sends these as `keyterm`
 # params; OpenAI folds them into the transcription prompt. Without them, domain
@@ -57,6 +90,13 @@ announce:
   # Blocking events speak and open the mic; milestones only chime.
   milestone_chime: Glass
   blocking_chime: Ping
+  # Played when the mic is actually capturing, and again when it closes.
+  mic_open_chime: Tink
+  mic_close_chime: Pop
+  # Played when the busy-mode hotkey flips, in either direction.
+  busy_chime: Submarine
+  # How long the mic waits for you to start talking. Say nothing and the item
+  # stays pending; the queue moves on.
   mic_timeout_seconds: 8
   # Claude's own Notification events (permission prompts, idle nudges). These
   # are blocking too, so they speak. Set to false for chime-only.
@@ -72,6 +112,15 @@ delivery:
     - "\\bdelete\\b"
     - "force push"
     - "\\bprod\\b"
+  # Takes of the mic per question before the item goes back to pending. Repeat,
+  # "mostrame" and a read-back each cost one.
+  max_mic_rounds: 3
+  plan_menu:
+    # A plan menu's rows come from Claude, not from the hook payload, so this
+    # one index cannot be derived. Verified on Claude Code 2.1.220: 1 approve
+    # with auto mode, 2 approve reviewing each edit, 3 refine elsewhere,
+    # 4 "Tell Claude what to change" — the row spoken feedback is typed into.
+    feedback_index: 4
 
 integrations:
   # Optional bridge for tooling that already tracks a per-terminal phase in a

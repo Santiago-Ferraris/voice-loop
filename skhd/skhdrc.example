@@ -1,0 +1,16 @@
+# voice-loop hotkeys, for https://github.com/koekeishiya/skhd
+#
+# Two, and only two — the loop is meant to run without a menu bar icon or a
+# window to click. `install-hotkeys.sh` writes exactly these two lines into
+# ~/.config/skhd/skhdrc between markers, so it can update or remove them later
+# without touching the rest of your file.
+#
+# Open the mic. Toggles: press once to talk, press again to send. It also
+# closes a mic that opened by itself after an announcement, so the same key
+# always means "I am done talking".
+ctrl + alt + cmd - m : ~/.local/share/voice-loop/bin/voice-loopctl mic-toggle
+
+# Busy mode. Announcements chime instead of speaking, and stop opening the mic
+# on their own. The key above keeps working — being heads-down is not the same
+# as being unable to answer.
+ctrl + alt + cmd - b : ~/.local/share/voice-loop/bin/voice-loopctl busy-toggle

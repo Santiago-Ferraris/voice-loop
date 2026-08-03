@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS_FILENAME = "config.example.yml"
 LOCAL_FILENAMES = ("config.local.yml", "config.local.yaml")
 
-STT_PROVIDERS = frozenset({"deepgram", "openai", "whisper-cpp"})
+STT_PROVIDERS = frozenset({"deepgram", "deepgram_ws", "openai", "whisper-cpp", "mock"})
 SUMMARY_PROVIDERS = frozenset({"openai", "none"})
 
 # Keys that must never appear in a config file — they belong in the environment.
@@ -170,6 +170,22 @@ def _validate(data: Mapping[str, Any]) -> None:
     timeout = summaries.get("timeout_seconds")
     if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
         raise ConfigError("summaries.timeout_seconds: expected a positive number")
+
+    threshold = (data.get("delivery") or {}).get("confirm_below_confidence")
+    if threshold is not None and (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not 0 <= threshold <= 1
+    ):
+        raise ConfigError("delivery.confirm_below_confidence: expected a number between 0 and 1")
+
+    microphone = data.get("microphone") or {}
+    for key in ("max_seconds", "open_timeout_seconds"):
+        value = microphone.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0
+        ):
+            raise ConfigError(f"microphone.{key}: expected a positive number")
 
 
 def load(repo_root: Path | str | None = None, local_path: Path | str | None = None) -> Config:

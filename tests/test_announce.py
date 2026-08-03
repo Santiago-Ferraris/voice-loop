@@ -172,7 +172,15 @@ def test_a_plan_is_announced_by_its_first_heading():
 
     result = announce.build(item("menu", tool_input={"plan": plan}), name="indice")
 
-    assert result.text == "indice: pide aprobar un plan: Migrar el índice."
+    assert result.text.startswith("indice: pide aprobar un plan: Migrar el índice.")
+
+
+def test_a_plan_reads_out_the_options_it_can_be_answered_with():
+    """The plan menu's rows are Claude's, not the payload's — say them anyway."""
+    result = announce.build(item("menu", tool_input={"plan": "## Migrar"}), name="x")
+
+    assert "Opciones: uno: aprobar y seguir en auto" in result.text
+    assert "dos: aprobar revisando cada edición" in result.text
 
 
 @pytest.mark.parametrize(

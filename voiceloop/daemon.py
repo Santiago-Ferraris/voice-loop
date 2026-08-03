@@ -10,8 +10,21 @@ Three cooperating loops:
   place — until they finish.
 * **milestones** (optional) polls external phase files for chime-only events.
 
-Everything slow runs off the loop: transcript parsing and the summary call go
-through `to_thread`, and speech is serialized behind the speaker's own lock.
+Everything slow runs off the loop: transcript parsing, the summary call, the
+transcription call and every AppleScript go through `to_thread`, and speech is
+serialized behind the speaker's own lock.
+
+The announce loop does not end at the announcement. Speaking an item opens the
+microphone on it and stays there until the item is answered, skipped, or heard
+nothing — so the queue is strictly one conversation at a time, which is the
+only way fifteen windows can talk to one pair of ears. Everything that can end
+a reply cycle puts the item back in `pendings`; nothing is ever dropped for
+having been ignored.
+
+Two modes sit on top. **Paused** stops announcing entirely. **Busy** keeps the
+queue moving but chimes instead of speaking, and does not open the mic — the
+hotkey still does, because "I am heads-down" and "I cannot answer" are
+different things.
 """
 
 from __future__ import annotations
@@ -19,21 +32,36 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
+import inspect
 import logging
 import logging.handlers
 import os
 import signal
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from . import __version__, announce as announce_mod, roster as roster_mod, spool
+from . import (
+    __version__,
+    announce as announce_mod,
+    delivery as delivery_mod,
+    intents,
+    iterm,
+    preflight,
+    roster as roster_mod,
+    spool,
+)
+from .audio import AudioUnavailable, Recorder
 from .config import Config, ConfigError, load as load_config
 from .control import ControlError, ControlServer, DaemonAlreadyRunning
-from .events import TYPE_MILESTONE, TYPE_STOP, Event
+from .delivery import Delivery, GatePolicy
+from .events import TYPE_MENU, TYPE_MILESTONE, TYPE_STOP, Event
 from .milestones import MilestoneWatcher
 from .store import Item, Store
+from .stt import SttError, SttNotImplemented, Transcript, create as create_stt
 from .summarize import Summarizer
 from .transcript import pending_subagents, tail_text
 from .tts import Speaker
@@ -48,11 +76,12 @@ RESOLVED_BY_GONE = "session-gone"
 RESOLVED_BY_SKIP = "skip"
 
 KV_PAUSED = "paused"
+KV_BUSY = "busy"
 
-NOT_IMPLEMENTED = {
-    "mic-toggle": "phase 2",
-    "busy-toggle": "phase 3",
-}
+# One reply cycle ends this way.
+REPLY_DELIVERED = "delivered"
+REPLY_PENDING = "pending"
+REPLY_FAILED = "failed"
 
 log = logging.getLogger("voiceloop")
 
@@ -82,6 +111,9 @@ class Daemon:
         summarizer: Summarizer | None = None,
         watcher: MilestoneWatcher | None = None,
         roster_dir: Path | str | None = None,
+        recorder: Recorder | None = None,
+        stt: Any = None,
+        delivery: Delivery | None = None,
     ):
         self.config = config
         self.state_dir = config.state_dir
@@ -94,17 +126,45 @@ class Daemon:
         self.watcher = watcher or MilestoneWatcher.from_config(config)
         self.roster_dir = roster_dir
 
+        self.recorder = recorder or Recorder.from_config(config)
+        self.delivery = delivery or Delivery()
+        self.gate = GatePolicy.from_config(config)
+        self.stt = stt if stt is not None else self._build_stt(config)
+
         self.phonetic = config.get("text_to_speech.phonetic") or {}
         self.blocking_chime = config.get("announce.blocking_chime")
         self.milestone_chime = config.get("announce.milestone_chime")
+        self.mic_open_chime = config.get("announce.mic_open_chime")
+        self.mic_close_chime = config.get("announce.mic_close_chime")
+        self.busy_chime = config.get("announce.busy_chime")
         self.notification_events = bool(config.get("announce.notification_events", True))
+
+        self.mic_enabled = bool(config.get("microphone.enabled", True))
+        self.keep_recordings = bool(config.get("microphone.keep_recordings", False))
+        self.mic_rounds = max(1, int(config.get("delivery.max_mic_rounds", 3)))
+        self.plan_feedback_index = int(
+            config.get("delivery.plan_menu.feedback_index", delivery_mod.PLAN_FEEDBACK)
+        )
 
         self.started_at = time.time()
         self.paused = bool(self.store.kv_get(KV_PAUSED, False))
+        self.busy = bool(self.store.kv_get(KV_BUSY, False))
         self._stop = asyncio.Event()
         self._restart = False
         self._gate_cache: dict[str, tuple[tuple[int, int], int]] = {}
         self._server: ControlServer | None = None
+        self._mic_lock = asyncio.Lock()
+        self._mic_stop: asyncio.Event | None = None
+        self._mic_tasks: set[asyncio.Task] = set()
+
+    @staticmethod
+    def _build_stt(config: Config):
+        """A provider that is planned but not written must not silently degrade."""
+        try:
+            return create_stt(config)
+        except SttNotImplemented as exc:
+            log.error("speech-to-text disabled: %s", exc)
+            return None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -124,9 +184,9 @@ class Daemon:
         try:
             await self._stop.wait()
         finally:
-            for task in tasks:
+            for task in (*tasks, *self._mic_tasks):
                 task.cancel()
-            for task in tasks:
+            for task in (*tasks, *self._mic_tasks):
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             await self._server.close()
@@ -284,24 +344,253 @@ class Daemon:
             milestone_chime=self.milestone_chime,
             notification_events=self.notification_events,
         )
+        if self.busy:
+            # Busy mode: you still get the chime, you just do not get talked at.
+            announcement = dataclasses.replace(announcement, speak=False)
         log.info("announce %s [%s] %s", item.type, name, announcement.text)
         await self.speaker.announce(announcement)
 
         if item.type == TYPE_MILESTONE:
             # Chime only — there is nothing for the user to answer.
             self.store.resolve(item.id, RESOLVED_BY_MILESTONE)
+            return
+
+        self.store.mark_pending(item.id)
+        if self.busy or announcement.silent:
+            return
+        await self.reply_cycle(item, announcement.text)
+
+    # -- listening ---------------------------------------------------------
+
+    def can_listen(self) -> bool:
+        return bool(self.mic_enabled and self.stt is not None)
+
+    def keyterms(self) -> list[str]:
+        """Config vocabulary plus the names of the windows that exist right now.
+
+        A session name only transcribes if the recognizer has been told it
+        exists, and the names change every time you open a window — so they are
+        collected per request rather than baked into the engine.
+        """
+        configured = self.config.get("keyterms") or []
+        terms = [str(term) for term in configured] if isinstance(configured, (list, tuple)) else []
+        try:
+            sessions = roster_mod.load(self.roster_dir)
+        except OSError:
+            sessions = {}
+        for session in sessions.values():
+            if session.name:
+                terms.append(session.name)
+        terms.extend(self.store.aliases())
+        return terms
+
+    async def listen(self) -> Transcript | None:
+        """One take: chime, record, transcribe. `None` means the mic itself failed."""
+        if not self.can_listen():
+            return None
+        mic_dir = self.state_dir / "mic"
+        path = mic_dir / f"{uuid.uuid4().hex}.wav"
+        stop = asyncio.Event()
+        self._mic_stop = stop
+        try:
+            recording = await self.recorder.record(
+                path, stop=stop, on_open=lambda: self.speaker.chime(self.mic_open_chime)
+            )
+        except AudioUnavailable as exc:
+            log.error("microphone unavailable: %s", exc)
+            await self.speaker.speak("No pude abrir el micrófono.")
+            return None
+        finally:
+            self._mic_stop = None
+        await self.speaker.chime(self.mic_close_chime)
+
+        if not recording.usable:
+            log.info("mic heard nothing (%s, %.1fs)", recording.reason, recording.seconds)
+            self._discard(path)
+            return Transcript(text="", provider=getattr(self.stt, "name", ""))
+        try:
+            transcript = await asyncio.to_thread(self.stt.transcribe, path, self.keyterms())
+        except SttError as exc:
+            log.error("transcription failed: %s", exc)
+            await self.speaker.speak("No pude transcribir lo que dijiste.")
+            return None
+        finally:
+            self._discard(path)
+        log.info("heard %r (confidence=%s)", transcript.text, transcript.confidence)
+        return transcript
+
+    def _discard(self, path: Path) -> None:
+        if self.keep_recordings:
+            return
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+    # -- answering ----------------------------------------------------------
+
+    def menus_for(self, item: Item) -> list:
+        if item.type != TYPE_MENU:
+            return []
+        return delivery_mod.menus_from_payload(
+            item.payload, plan_feedback=self.plan_feedback_index
+        )
+
+    async def reply_cycle(self, item: Item, announced: str = "") -> str:
+        """Hold the mic on one item until it is answered, skipped, or silent."""
+        if not self.can_listen() or not item.tty:
+            return REPLY_PENDING
+        async with self._mic_lock:
+            self.store.mark_awaiting_reply(item.id)
+            try:
+                outcome = await self._converse(item, announced)
+            except iterm.SessionGone as exc:
+                log.warning("delivery aborted: %s", exc)
+                await self.speaker.speak("Esa ventana ya no está.")
+                outcome = REPLY_FAILED
+            except Exception:  # noqa: BLE001 - a bad reply must not kill the loop
+                log.exception("reply cycle failed")
+                await self.speaker.speak("Hubo un error entregando la respuesta.")
+                outcome = REPLY_FAILED
+            if outcome == REPLY_DELIVERED:
+                self.store.mark_delivered(item.id)
+            else:
+                # Back in line, reachable from `pendings`, never dropped.
+                self.store.mark_pending(item.id)
+            return outcome
+
+    async def _converse(self, item: Item, announced: str) -> str:
+        menus = self.menus_for(item)
+        for position, menu in enumerate(menus or [None]):
+            if position:
+                # The payload had more than one question; Claude shows the next
+                # one the moment the previous is answered.
+                await self.speaker.speak(
+                    announce_mod.speakable(
+                        announce_mod.describe_question(
+                            menu.prompt,
+                            menu.labels,
+                            multi_select=menu.multi_select,
+                            position=menu.position,
+                            total=menu.total,
+                        ),
+                        self.phonetic,
+                    )
+                )
+            outcome = await self._answer_one(item, menu, announced)
+            if outcome != REPLY_DELIVERED:
+                # A menu with a question left unanswered is still blocking that
+                # window, so the item stays pending however much of it we got.
+                return outcome
+        return REPLY_DELIVERED
+
+    async def _answer_one(self, item: Item, menu, announced: str) -> str:
+        pending_action = None
+        for _ in range(self.mic_rounds):
+            transcript = await self.listen()
+            if transcript is None:
+                return REPLY_FAILED
+            intent = intents.parse(
+                transcript.text,
+                menu.labels if menu else (),
+                multi=bool(menu and menu.multi_select),
+            )
+
+            if intent.kind in (intents.KIND_SILENCE, intents.KIND_SKIP):
+                return REPLY_PENDING
+            if intent.kind == intents.KIND_REPEAT:
+                await self.speaker.speak(announced or "No tengo nada que repetir.")
+                continue
+            if intent.kind == intents.KIND_SHOW:
+                await asyncio.to_thread(self.delivery.focus, item.tty)
+                continue
+            if intent.kind == intents.KIND_EXPLAIN and menu is not None:
+                await self.speaker.speak(
+                    announce_mod.speakable(menu.describe(intent.index), self.phonetic)
+                )
+                continue
+
+            if pending_action is not None:
+                if intent.kind == intents.KIND_CONFIRM:
+                    await self._perform(item, pending_action)
+                    return REPLY_DELIVERED
+                if intent.kind == intents.KIND_CANCEL:
+                    await self.speaker.speak("Listo, no mando nada.")
+                    return REPLY_PENDING
+                pending_action = None  # a new utterance replaces the old one
+
+            action, gate = self._plan_action(item, menu, intent, transcript)
+            if action is None:
+                await self.speaker.speak(gate.reason)
+                continue
+            if gate.required:
+                pending_action = action
+                await self.speaker.speak(
+                    announce_mod.speakable(
+                        f"{gate.reason}. Dijiste: {self._readback(action, menu)}. ¿Lo mando?",
+                        self.phonetic,
+                    )
+                )
+                continue
+            await self._perform(item, action)
+            return REPLY_DELIVERED
+        return REPLY_PENDING
+
+    def _plan_action(self, item: Item, menu, intent, transcript):
+        """(action, gate). A `None` action means say `gate.reason` and listen again."""
+        if intent.kind == intents.KIND_SELECT:
+            gate = self.gate.check_choice(transcript.confidence)
+            if menu is not None and menu.multi_select:
+                return ("choices", tuple(intent.indexes)), gate
+            return ("choice", intent.index), gate
+
+        if intent.kind == intents.KIND_CANCEL and menu is not None:
+            return None, delivery_mod.Gate(False, "Lo dejo pendiente.")
+        if intent.kind == intents.KIND_CONFIRM and menu is not None:
+            # "dale" does not name an option, and picking one for you is how a
+            # menu answers itself wrong.
+            return None, delivery_mod.Gate(False, "¿Cuál opción?")
+
+        text = intent.text
+        gate = self.gate.check(text, transcript.confidence)
+        if menu is not None:
+            return ("menu_text", (menu.free_text_index, text)), gate
+        return ("text", text), gate
+
+    def _readback(self, action, menu) -> str:
+        kind, payload = action
+        if kind == "choice":
+            label = menu.labels[payload - 1] if menu and payload <= len(menu.labels) else ""
+            return f"opción {announce_mod.number_word(payload)}{': ' + label if label else ''}"
+        if kind == "choices":
+            return ", ".join(
+                f"opción {announce_mod.number_word(index)}" for index in payload
+            )
+        if kind == "menu_text":
+            return payload[1]
+        return str(payload)
+
+    async def _perform(self, item: Item, action) -> None:
+        kind, payload = action
+        log.info("deliver %s to %s [%s]", kind, item.tty, item.name or item.session_id[:8])
+        if kind == "choice":
+            await asyncio.to_thread(self.delivery.send_choice, item.tty, payload)
+        elif kind == "choices":
+            await asyncio.to_thread(self.delivery.send_choices, item.tty, payload)
+        elif kind == "menu_text":
+            index, text = payload
+            await asyncio.to_thread(self.delivery.send_menu_text, item.tty, index, text)
         else:
-            self.store.mark_pending(item.id)
+            await asyncio.to_thread(self.delivery.send_text, item.tty, payload)
 
     # -- control surface ---------------------------------------------------
 
     async def dispatch(self, cmd: str, args: dict) -> Any:
-        if cmd in NOT_IMPLEMENTED:
-            raise ControlError(f"not implemented: {cmd} lands in {NOT_IMPLEMENTED[cmd]}")
         handler = getattr(self, f"cmd_{cmd.replace('-', '_')}", None)
         if handler is None:
             raise ControlError(f"unknown command: {cmd}")
-        return handler(args)
+        result = handler(args)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     def cmd_status(self, args: dict) -> dict:
         return {
@@ -309,13 +598,23 @@ class Daemon:
             "pid": os.getpid(),
             "uptime_seconds": round(time.time() - self.started_at, 1),
             "paused": self.paused,
+            "busy": self.busy,
             "queued": self.store.queued_count(),
             "open": self.store.open_count(),
             "state_dir": str(self.state_dir),
             "summaries": "openai" if self.summarizer.available else "fallback",
             "voice": self.speaker.voice,
             "milestone_watch": self.watcher.active,
+            "speech_to_text": self._stt_status(),
+            "mic": "listening" if self._mic_stop is not None else "idle",
         }
+
+    def _stt_status(self) -> str:
+        if self.stt is None:
+            return "unavailable"
+        if not self.mic_enabled:
+            return f"{self.stt.name} (mic off)"
+        return self.stt.name if self.stt.available else f"{self.stt.name} (no key)"
 
     def cmd_pendings(self, args: dict) -> list[dict]:
         listed = []
@@ -339,6 +638,64 @@ class Daemon:
                 }
             )
         return listed
+
+    async def cmd_mic_toggle(self, args: dict) -> dict:
+        """The hotkey. Closes an open mic; otherwise opens one on the last item.
+
+        Returns immediately either way — the hotkey must not sit there holding
+        the socket for the length of a sentence.
+        """
+        if self._mic_stop is not None:
+            self._mic_stop.set()
+            return {"mic": "closing"}
+        if not self.can_listen():
+            raise ControlError(
+                "microphone unavailable: " + self._stt_status()
+                if self.stt is not None
+                else "microphone unavailable: no speech-to-text provider"
+            )
+        self._spawn(self._hotkey_listen())
+        return {"mic": "opening"}
+
+    def _spawn(self, coroutine) -> None:
+        task = asyncio.get_running_loop().create_task(coroutine)
+        self._mic_tasks.add(task)
+        task.add_done_callback(self._mic_tasks.discard)
+
+    async def _hotkey_listen(self) -> None:
+        """A mic you opened yourself answers whatever spoke last."""
+        item = self.store.last_announced()
+        if item is None or not item.tty:
+            await self.speaker.chime(self.mic_open_chime)
+            await self.speaker.speak("No hay nada pendiente.")
+            return
+        try:
+            await self.reply_cycle(item, item.summary or "")
+        except Exception:  # noqa: BLE001 - a background task must not die silently
+            log.exception("hotkey mic failed")
+
+    async def cmd_busy_toggle(self, args: dict) -> dict:
+        """Chime instead of speak. The mic hotkey keeps working — by design."""
+        self.busy = not self.busy
+        self.store.kv_set(KV_BUSY, self.busy)
+        log.info("busy mode %s", "on" if self.busy else "off")
+        await self.speaker.chime(self.busy_chime)
+        return {"busy": self.busy}
+
+    async def cmd_selfcheck(self, args: dict) -> list[dict]:
+        """What the daemon can actually do from where launchd put it.
+
+        Microphone and Automation permissions are granted per responsible
+        process, so "it works in my terminal" says nothing about the agent.
+        This is the answer from inside.
+        """
+        checks = await asyncio.to_thread(
+            preflight.run_all,
+            binary=self.recorder.binary,
+            device=self.recorder.device,
+            engine=self.stt,
+        )
+        return [check.as_dict() for check in checks]
 
     def cmd_pause(self, args: dict) -> dict:
         self.paused = True

@@ -13,24 +13,10 @@ from voiceloop.milestones import MilestoneWatcher
 from voiceloop.store import STATE_PENDING, STATE_QUEUED, STATE_RESOLVED, Store
 from voiceloop.summarize import FALLBACK_SUMMARY, Summarizer
 
-from conftest import write_roster
+from conftest import FakeSpeaker, write_roster
 
 LAUNCH = "Async agent launched successfully.\nagentId: aa11bb22"
 DONE = "<task-notification>\n<task-id>aa11bb22</task-id>\n</task-notification>"
-
-
-class FakeSpeaker:
-    voice = "system"
-
-    def __init__(self):
-        self.said: list = []
-
-    async def announce(self, announcement):
-        self.said.append(announcement)
-
-    @property
-    def texts(self) -> list[str]:
-        return [item.text for item in self.said if not item.silent]
 
 
 class FakeSummarizer(Summarizer):
@@ -670,10 +656,16 @@ def test_an_unknown_command_is_refused(daemon):
         asyncio.run(daemon.dispatch("teleport", {}))
 
 
-@pytest.mark.parametrize("cmd", ["mic-toggle", "busy-toggle"])
-def test_the_phase_two_commands_are_reserved_not_unknown(daemon, cmd):
-    with pytest.raises(ControlError, match="not implemented"):
-        asyncio.run(daemon.dispatch(cmd, {}))
+def test_busy_toggle_is_a_real_command_now(daemon):
+    assert asyncio.run(daemon.dispatch("busy-toggle", {})) == {"busy": True}
+    assert asyncio.run(daemon.dispatch("busy-toggle", {})) == {"busy": False}
+
+
+def test_mic_toggle_says_why_when_there_is_no_recognizer(daemon):
+    daemon.stt = None
+
+    with pytest.raises(ControlError, match="microphone unavailable"):
+        asyncio.run(daemon.dispatch("mic-toggle", {}))
 
 
 def test_private_attributes_are_not_reachable_as_commands(daemon):
@@ -693,3 +685,28 @@ def test_restart_stops_the_loop(daemon):
     assert result == {"restarting": True}
     assert daemon._stop.is_set()
     assert daemon._restart is True
+
+
+# --- the permission self-check --------------------------------------------
+
+
+def test_selfcheck_reports_what_the_daemon_can_do_from_where_it_runs(daemon, monkeypatch):
+    """launchd is a different responsible process, so its answer is the one that counts."""
+    from voiceloop import preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "run_all",
+        lambda **kwargs: [preflight.Check("microphone", preflight.FAILED, "denied")],
+    )
+
+    assert asyncio.run(daemon.dispatch("selfcheck", {})) == [
+        {"name": "microphone", "status": "failed", "detail": "denied"}
+    ]
+
+
+def test_a_planned_recognizer_disables_speech_instead_of_falling_back(config):
+    """Silently using a different engine is how you debug the wrong accuracy."""
+    config.data["speech_to_text"]["provider"] = "whisper-cpp"
+
+    assert Daemon._build_stt(config) is None

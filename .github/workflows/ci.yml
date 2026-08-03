@@ -37,6 +37,7 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          for f in hooks/vl-hook.sh bin/voice-loopd bin/voice-loopctl install.sh uninstall.sh; do
+          for f in hooks/vl-hook.sh bin/voice-loopd bin/voice-loopctl install.sh uninstall.sh \
+                   skhd/install-hotkeys.sh; do
             sh -n "$f"
           done

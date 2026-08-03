@@ -6,11 +6,17 @@ sessions from ever waiting on a writer lock.
 
 Lifecycle of an item:
 
-    queued -> announcing -> pending -> resolved
+    queued -> announcing -> pending -> awaiting_reply -> delivered -> resolved
 
-`awaiting_reply` and `delivered` are declared but unused in phase 1: phase 2
-inserts them between `pending` and `resolved`, and declaring them now means
-that phase ships without a schema migration.
+The last three are the voice reply. `awaiting_reply` means the mic is open on
+this item; `delivered` means the answer went into the window and we are waiting
+for the session to confirm it landed. Neither is terminal, and neither resolves
+anything: the item is closed by the `activity` event that the injected turn
+itself triggers. If the answer never made it, the item is still open and still
+in `pendings` — which is the whole point of not resolving it ourselves.
+
+An item that hears nothing goes straight back to `pending` and the queue moves
+on.
 
 Two rules the rest of the system leans on:
 
@@ -39,7 +45,6 @@ STATE_QUEUED = "queued"
 STATE_ANNOUNCING = "announcing"
 STATE_PENDING = "pending"
 STATE_RESOLVED = "resolved"
-# Phase 2 — declared so the schema does not have to change later.
 STATE_AWAITING_REPLY = "awaiting_reply"
 STATE_DELIVERED = "delivered"
 
@@ -321,6 +326,20 @@ class Store:
             (STATE_PENDING, stamp, event_id),
         )
 
+    def mark_awaiting_reply(self, event_id: str) -> None:
+        """The mic is open on this item. Never touches an item already resolved."""
+        self._conn.execute(
+            "UPDATE events SET state = ? WHERE id = ? AND state != ?",
+            (STATE_AWAITING_REPLY, event_id, STATE_RESOLVED),
+        )
+
+    def mark_delivered(self, event_id: str) -> None:
+        """The answer went in. The `activity` it triggers is what resolves it."""
+        self._conn.execute(
+            "UPDATE events SET state = ? WHERE id = ? AND state != ?",
+            (STATE_DELIVERED, event_id, STATE_RESOLVED),
+        )
+
     def requeue(self, event_id: str) -> None:
         """Put an item back at its original FIFO position (announce failed, or `replay`)."""
         self._conn.execute(
@@ -371,6 +390,11 @@ class Store:
             """,
             (session_id, name, 1 if confirmed else 0, int(time.time())),
         )
+
+    def aliases(self) -> list[str]:
+        """Every name you have given a window — vocabulary for the recognizer."""
+        rows = self._conn.execute("SELECT name FROM aliases ORDER BY created_at").fetchall()
+        return [row["name"] for row in rows if row["name"]]
 
     def get_alias(self, session_id: str) -> str | None:
         row = self._conn.execute(
