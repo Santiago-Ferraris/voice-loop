@@ -18,8 +18,12 @@ dev = ["pytest>=7.4", "pyflakes>=3.1"]
 voice-loopd = "voiceloop.daemon:main"
 voice-loopctl = "voiceloop.ctl:main"
 
-[tool.setuptools]
-packages = ["voiceloop"]
+# Discovery, not a hand-kept list: a literal `packages = ["voiceloop"]` silently
+# omits every subpackage, and the omission is invisible from the clone — imports
+# resolve there either way, so the whole suite stays green while the *installed*
+# runtime crashes on startup. That is exactly how `voiceloop.stt` shipped broken.
+[tool.setuptools.packages.find]
+include = ["voiceloop*"]
 
 [tool.setuptools.package-data]
 voiceloop = []
