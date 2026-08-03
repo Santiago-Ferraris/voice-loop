@@ -103,6 +103,10 @@ def _load_yaml(path: Path) -> dict:
 class Config:
     data: dict = field(default_factory=dict)
     source_paths: tuple[Path, ...] = ()
+    # Where `api_key` looks, when it must not be the process environment.
+    # `doctor` sets this to the env file the daemon would have sourced; nothing
+    # else does, so the default stays "the environment and nowhere else".
+    env: Mapping[str, str] | None = None
 
     def get(self, dotted: str, default: Any = None) -> Any:
         node: Any = self.data
@@ -141,7 +145,7 @@ class Config:
         var = ENV_VAR_BY_SERVICE.get(service)
         if var is None:
             return None
-        source = os.environ if env is None else env
+        source = env if env is not None else (self.env if self.env is not None else os.environ)
         value = (source.get(var) or "").strip()
         return value or None
 

@@ -12,6 +12,7 @@ all, which a LaunchAgent may never manage on its own.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from datetime import datetime, timezone
@@ -67,7 +68,7 @@ def _format_checks(title: str, checks: list) -> str:
 
 def run_doctor(options) -> int:
     """Local checks first (they trigger the consent dialogs), then the daemon's."""
-    from . import preflight
+    from . import envfile, preflight
     from .stt import SttNotImplemented, create as create_stt
 
     try:
@@ -75,6 +76,13 @@ def run_doctor(options) -> int:
     except ConfigError as exc:
         print(f"voice-loopctl: {exc}", file=sys.stderr)
         return 2
+
+    # The wrapper does not source the env file — no other subcommand needs a
+    # key. This one does: checking whether speech-to-text works is its job, and
+    # answering "key missing" about a key that is right there is a false
+    # negative in the one command you run when things are broken.
+    env_file = envfile.read()
+    config = dataclasses.replace(config, env=envfile.overlay(env_file))
 
     try:
         engine = create_stt(config)
@@ -86,6 +94,7 @@ def run_doctor(options) -> int:
         binary=str(config.get("microphone.ffmpeg", "ffmpeg")),
         device=str(config.get("microphone.device", ":0")),
         engine=engine,
+        env_file=env_file,
     )
     print(_format_checks("here (your terminal):", [check.as_dict() for check in local]))
 

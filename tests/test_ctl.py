@@ -320,6 +320,33 @@ def test_doctor_probes_the_configured_device(selfcheck, local_checks):
     assert local_checks[0]["binary"] == "ffmpeg"
 
 
+def test_doctor_reads_the_env_file_the_wrapper_does_not_source(
+    selfcheck, local_checks, monkeypatch, tmp_path
+):
+    """Issue #6: the key is in the file; only `doctor` needs to see it."""
+    env_path = tmp_path / "env"
+    env_path.write_text("DEEPGRAM_API_KEY=dg-from-the-file\n", encoding="utf-8")
+    monkeypatch.setenv("VOICE_LOOP_ENV_FILE", str(env_path))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "")
+
+    run("doctor")
+
+    assert local_checks[0]["engine"].available is True
+    assert local_checks[0]["env_file"].path == env_path
+
+
+def test_doctor_without_an_env_file_reports_the_path_it_looked_at(
+    selfcheck, local_checks, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("VOICE_LOOP_ENV_FILE", str(tmp_path / "nope"))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "")
+
+    run("doctor")
+
+    assert local_checks[0]["engine"].available is False
+    assert local_checks[0]["env_file"].exists is False
+
+
 def test_status_shows_busy_mode_and_the_recognizer(monkeypatch, capsys):
     monkeypatch.setattr(
         ctl,

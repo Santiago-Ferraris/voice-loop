@@ -48,6 +48,7 @@ from . import (
     __version__,
     announce as announce_mod,
     delivery as delivery_mod,
+    envfile,
     intents,
     iterm,
     preflight,
@@ -694,6 +695,7 @@ class Daemon:
             binary=self.recorder.binary,
             device=self.recorder.device,
             engine=self.stt,
+            env_file=envfile.read(),
         )
         return [check.as_dict() for check in checks]
 
