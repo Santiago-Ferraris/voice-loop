@@ -30,8 +30,8 @@ from .config import ENV_VAR_BY_SERVICE
 
 PROBE_SECONDS = 1.0
 
-# What a hung capture actually means, said once and reused by the daemon's own
-# spoken warning.
+# What a hung capture actually means. Written once here, and quoted into the
+# log by the daemon when the same thing happens to it at runtime.
 CONSENT_TIMEOUT = (
     "capture timed out — waiting on the macOS microphone consent prompt. "
     "Answer it, or tick this process in System Settings → Privacy & Security "
