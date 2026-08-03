@@ -931,8 +931,8 @@ class Daemon:
                 if intent.kind == intents.KIND_PENDINGS:
                     chosen = await self.speak_pendings()
             if chosen is not None:
+                # `_announce` follows any further switch from here itself.
                 await self._announce(chosen, self._session_for(chosen))
-                await self._follow_switch(0)
                 return
             if intent.kind == intents.KIND_PENDINGS:
                 return
