@@ -474,6 +474,66 @@ def test_pendings_lists_what_is_waiting(daemon, tmp_path):
     assert pendings[0]["summary"] == "quiere que revises el diff"
 
 
+def test_a_superseded_item_gets_its_summary_back_when_you_ask_for_it(daemon, tmp_path):
+    """Issue #3: ten of ten pendings had no summary, so the list said nothing.
+
+    Superseding drops the summary on purpose — it described a turn that is no
+    longer the last one — and the item deliberately does not go back in the
+    queue, so the announce path never recomputes it. Reading is the only moment
+    left that can.
+    """
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    first = stop_event("s1", transcript_path=transcript(tmp_path, "s1"))
+    daemon.store.ingest(first)
+    asyncio.run(daemon.announce_next())
+    daemon.summarizer.answer = "quiere que apruebes el plan nuevo"
+    newer = transcript(tmp_path, "s1-newer", tail="Cambió todo. ¿Apruebo el plan?")
+    daemon.store.ingest(stop_event("s1", transcript_path=newer))
+
+    assert daemon.store.pendings()[0].summary is None
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert pendings[0]["summary"] == "quiere que apruebes el plan nuevo"
+    # …and it is written back, so asking twice costs one call.
+    assert daemon.store.pendings()[0].summary == "quiere que apruebes el plan nuevo"
+    assert daemon.summarizer.seen[-1] == "Cambió todo. ¿Apruebo el plan?"
+
+
+def test_a_summary_that_is_already_there_is_not_recomputed(daemon, tmp_path):
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    daemon.store.ingest(stop_event("s1", transcript_path=transcript(tmp_path, "s1")))
+    asyncio.run(daemon.announce_next())
+
+    asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert len(daemon.summarizer.seen) == 1
+
+
+def test_every_stale_summary_is_recomputed_at_once(daemon, tmp_path):
+    """Ten items at five seconds each, one after the other, is not a list."""
+    for name in ("a", "b", "c"):
+        write_roster(daemon.roster_path, sessionId=name, name=f"win-{name}")
+        daemon.store.ingest(stop_event(name, transcript_path=transcript(tmp_path, name)))
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert [entry["summary"] for entry in pendings] == ["quiere que revises el diff"] * 3
+
+
+def test_a_summariser_that_is_down_degrades_to_the_template(daemon, tmp_path):
+    """And leaves the row empty, so the next read tries again instead of lying."""
+    daemon.summarizer = Summarizer(api_key=None)
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    item = stop_event("s1", transcript_path=transcript(tmp_path, "s1"))
+    daemon.store.ingest(item)
+
+    pendings = asyncio.run(daemon.dispatch("pendings", {}))
+
+    assert pendings[0]["summary"] == FALLBACK_SUMMARY
+    assert daemon.store.get(item.id).summary is None
+
+
 def test_a_queued_item_is_listed_by_name_not_by_session_id(daemon, tmp_path):
     """`pendings` exists to tell you which window wants you. `5cbf3ac9` does not."""
     write_roster(daemon.roster_path, sessionId="s1", name="darwin-96")

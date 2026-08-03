@@ -42,7 +42,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import (
     __version__,
@@ -63,7 +63,7 @@ from .events import TYPE_MENU, TYPE_MILESTONE, TYPE_STOP, Event
 from .milestones import MilestoneWatcher
 from .store import Item, Store
 from .stt import SttError, SttNotImplemented, Transcript, create as create_stt
-from .summarize import Summarizer
+from .summarize import FALLBACK_SUMMARY, Summarizer
 from .transcript import pending_subagents, tail_text
 from .tts import Speaker
 
@@ -333,8 +333,40 @@ class Daemon:
             return item.summary
         tail = await asyncio.to_thread(tail_text, item.transcript_path)
         summary = await asyncio.to_thread(self.summarizer.summarize, tail)
-        self.store.set_summary(item.id, summary)
+        if summary != FALLBACK_SUMMARY:
+            # The fallback is not a summary, it is the absence of one. Storing
+            # it would make "terminó y te espera" permanent for an item whose
+            # only problem was that the key was missing for five seconds.
+            self.store.set_summary(item.id, summary)
         return summary
+
+    async def summarize_missing(self, items: Sequence[Item]) -> dict[str, str]:
+        """Fill in the summaries that were dropped when a `stop` was superseded.
+
+        Issue #3: superseding clears the summary — it described a turn that is
+        no longer the last one — and nothing recomputed it, so `pendings` ended
+        up with ten items and not one word about any of them. The command whose
+        entire job is telling you which window wants you said nothing.
+
+        Recomputed **on read**, deliberately: the announce path stays free of
+        extra latency, and nothing is spent summarising items you never ask
+        about. The alternative — recompute in the background on every supersede
+        — pays OpenAI for turns that get superseded again thirty seconds later,
+        which is what got it rejected in PR #2 to begin with.
+
+        Concurrently, because ten stale items at five seconds each is not a
+        list, it is a hang.
+        """
+        stale = [
+            item
+            for item in items
+            if item.type == TYPE_STOP and not item.summary and item.transcript_path
+        ]
+        if not stale:
+            return {}
+        log.info("recomputing %d missing summar%s", len(stale), "y" if len(stale) == 1 else "ies")
+        filled = await asyncio.gather(*(self._summary_for(item) for item in stale))
+        return {item.id: text for item, text in zip(stale, filled) if text}
 
     async def _announce(self, item: Item, session) -> None:
         self.store.mark_announcing(item.id)
@@ -630,9 +662,11 @@ class Daemon:
             return f"{self.stt.name} (mic off)"
         return self.stt.name if self.stt.available else f"{self.stt.name} (no key)"
 
-    def cmd_pendings(self, args: dict) -> list[dict]:
+    async def cmd_pendings(self, args: dict) -> list[dict]:
+        items = self.store.pendings()
+        recomputed = await self.summarize_missing(items)
         listed = []
-        for item in self.store.pendings():
+        for item in items:
             # Resolved here, not only at announce time: an item still queued has
             # never been through `_announce`, and listing it as `5cbf3ac9`
             # breaks the one command whose job is telling you which window
@@ -647,7 +681,7 @@ class Daemon:
                     "name": name or "",
                     "session_id": item.session_id,
                     "tty": item.tty,
-                    "summary": item.summary or "",
+                    "summary": item.summary or recomputed.get(item.id, ""),
                     "announced_at": item.announced_at,
                 }
             )
