@@ -18,6 +18,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
+from .naming import slugify
+
 API_URL = "https://api.openai.com/v1/chat/completions"
 
 FALLBACK_SUMMARY = "terminó y te espera"
@@ -30,6 +32,18 @@ SYSTEM_PROMPT = (
     "la pregunta. No agregues preámbulo."
 )
 
+# The same request, asked for one field more. A window's name and the summary of
+# what it is waiting for come from the same paragraph, and the second call would
+# read exactly the same input to answer a smaller question.
+NAMING_PROMPT = (
+    SYSTEM_PROMPT
+    + " Respondés un objeto JSON con dos claves. `summary`: ese resumen. `slug`: un "
+    "nombre corto para esta ventana, de dos a cuatro palabras en español, todo en "
+    "minúsculas, sin acentos, sin guiones y sin puntuación. El slug describe en qué "
+    "trabaja la ventana, no lo que pregunta ahora, y tiene que poder decirse en voz "
+    "alta: nada de rutas, siglas sueltas ni nombres de archivo."
+)
+
 Transport = Callable[[str, dict, bytes, float], bytes]
 
 _WHITESPACE = re.compile(r"\s+")
@@ -37,6 +51,14 @@ _WHITESPACE = re.compile(r"\s+")
 
 class SummaryUnavailable(Exception):
     """The provider could not be reached or answered with something unusable."""
+
+
+@dataclass(frozen=True)
+class Summary:
+    """What one call came back with. `slug` is empty unless a name was asked for."""
+
+    text: str
+    slug: str = ""
 
 
 def _urllib_transport(url: str, headers: dict, body: bytes, timeout: float) -> bytes:
@@ -81,49 +103,80 @@ class Summarizer:
     def available(self) -> bool:
         return bool(self.enabled and self.api_key)
 
-    def build_body(self, text: str) -> bytes:
-        return json.dumps(
-            {
-                "model": self.model,
-                "max_tokens": 120,
-                "temperature": 0.2,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT.format(max_words=self.max_words),
-                    },
-                    {"role": "user", "content": text},
-                ],
-            }
-        ).encode("utf-8")
+    def build_body(self, text: str, *, naming: bool = False) -> bytes:
+        prompt = NAMING_PROMPT if naming else SYSTEM_PROMPT
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": 200 if naming else 120,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": prompt.format(max_words=self.max_words)},
+                {"role": "user", "content": text},
+            ],
+        }
+        if naming:
+            payload["response_format"] = {"type": "json_object"}
+        return json.dumps(payload).encode("utf-8")
 
-    def _call(self, text: str) -> str:
+    def _content(self, text: str, *, naming: bool = False) -> str:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        raw = self.transport(API_URL, headers, self.build_body(text), self.timeout)
+        raw = self.transport(API_URL, headers, self.build_body(text, naming=naming), self.timeout)
         try:
             data = json.loads(raw)
             content = data["choices"][0]["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise SummaryUnavailable(f"unexpected response: {exc}") from exc
-        summary = clean(content if isinstance(content, str) else "", self.max_words)
+        return content if isinstance(content, str) else ""
+
+    def _call(self, text: str) -> str:
+        summary = clean(self._content(text), self.max_words)
         if not summary:
             raise SummaryUnavailable("empty summary")
         return summary
 
-    def summarize(self, text: str) -> str:
-        """Best-effort summary. Returns `FALLBACK_SUMMARY` instead of raising."""
-        if not self.available or not (text or "").strip():
-            return FALLBACK_SUMMARY
+    def _call_named(self, text: str) -> Summary:
+        """The summary and a proposed window name, from one request."""
+        try:
+            fields = json.loads(self._content(text, naming=True))
+        except ValueError as exc:
+            raise SummaryUnavailable(f"not JSON: {exc}") from exc
+        if not isinstance(fields, dict):
+            raise SummaryUnavailable("expected a JSON object")
+        summary = clean(str(fields.get("summary") or ""), self.max_words)
+        if not summary:
+            raise SummaryUnavailable("empty summary")
+        # A bad name is not worth a retry — the summary is the part the
+        # announcement cannot do without, and no slug just means no offer.
+        return Summary(text=summary, slug=slugify(str(fields.get("slug") or "")))
+
+    def _attempt(self, call, fallback):
         last: Exception | None = None
         for _ in range(max(1, self.attempts)):
             try:
-                return self._call(text)
+                return call()
             except (SummaryUnavailable, urllib.error.URLError, OSError, TimeoutError) as exc:
                 last = exc
             except Exception as exc:  # noqa: BLE001 - never break the queue
                 last = exc
         del last
-        return FALLBACK_SUMMARY
+        return fallback
+
+    def summarize(self, text: str) -> str:
+        """Best-effort summary. Returns `FALLBACK_SUMMARY` instead of raising."""
+        if not self.available or not (text or "").strip():
+            return FALLBACK_SUMMARY
+        return self._attempt(lambda: self._call(text), FALLBACK_SUMMARY)
+
+    def summarize_and_name(self, text: str) -> Summary:
+        """Best-effort summary *and* a name to offer. Never raises, never blocks.
+
+        A degraded call gives up the name and keeps the announcement: a window
+        that is waiting for you must be announced whatever the provider is
+        doing, and an offer to name it is the first thing worth losing.
+        """
+        if not self.available or not (text or "").strip():
+            return Summary(text=FALLBACK_SUMMARY)
+        return self._attempt(lambda: self._call_named(text), Summary(text=FALLBACK_SUMMARY))

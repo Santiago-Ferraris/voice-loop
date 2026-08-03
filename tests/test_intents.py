@@ -17,7 +17,9 @@ from voiceloop.intents import (
     KIND_EXPLAIN,
     KIND_REPEAT,
     KIND_SELECT,
+    KIND_PENDINGS,
     KIND_SHOW,
+    KIND_STATUS,
     KIND_SILENCE,
     KIND_SKIP,
     KIND_TEXT,
@@ -226,3 +228,28 @@ def test_option_keys_map_labels_and_distinctive_first_words():
     assert keys["sqlite"] == 1
     assert keys["postgres quince"] == 2
     assert keys["postgres"] == 2
+
+
+# --- questions for voice-loop, not for a window -----------------------------
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["dame los pendientes", "qué tengo pendiente", "qué me falta", "pendientes",
+     "Dame los pendientes, por favor", "quién me espera"],
+)
+def test_asking_for_the_queue(said):
+    assert parse(said).kind == KIND_PENDINGS
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["estado", "cómo venimos", "qué está pasando", "cómo vamos", "Estado."],
+)
+def test_asking_how_things_are_going(said):
+    assert parse(said).kind == KIND_STATUS
+
+
+def test_a_sentence_that_merely_mentions_pendings_is_still_dictation():
+    """Control phrases are whole utterances; everything else is for the window."""
+    assert parse("dejá los pendientes para mañana").kind == KIND_TEXT

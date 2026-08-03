@@ -6,6 +6,8 @@
 #   3. create the env file for your API key (only if it does not exist)
 #   4. render the launchd agent, load it, and prove the daemon came up
 #   5. merge the hooks into ~/.claude/settings.json (backed up, idempotent)
+#   6. run `doctor` once, from your terminal, so macOS asks for microphone and
+#      Automation while you are sitting here to say yes
 #
 # Why the runtime is a copy and not the clone: macOS TCC keeps LaunchAgents out
 # of ~/Documents, ~/Desktop and ~/Downloads. A clone in one of them cannot be
@@ -24,6 +26,7 @@
 #   --no-venv      skip the virtualenv (copy the package, use the system python3)
 #   --no-launchd   write the plist but do not load it (nothing is verified)
 #   --no-hooks     skip editing ~/.claude/settings.json
+#   --no-doctor    skip the permission probe at the end
 #
 # Environment:
 #   VOICE_LOOP_RUNTIME_DIR      where the runtime goes
@@ -36,12 +39,14 @@ REPO=$(cd "$(dirname "$0")" && pwd -P)
 DO_VENV=1
 DO_LAUNCHD=1
 DO_HOOKS=1
+DO_DOCTOR=1
 for arg in "$@"; do
   case "$arg" in
     --no-venv) DO_VENV=0 ;;
     --no-launchd) DO_LAUNCHD=0 ;;
     --no-hooks) DO_HOOKS=0 ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    --no-doctor) DO_DOCTOR=0 ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown option $arg" >&2; exit 2 ;;
   esac
 done
@@ -220,6 +225,27 @@ else
   echo "hooks: skipped"
 fi
 
+# --- 6. permissions -------------------------------------------------------
+#
+# macOS grants microphone and Automation access to the *responsible* process,
+# and for a LaunchAgent that is launchd — which inherits nothing from the
+# terminal you already granted, and may never manage to raise a consent dialog
+# at all. Until the grant exists, every mic open parks on an invisible prompt
+# and the hotkey looks dead.
+#
+# So the prompts are raised here, while you are sitting in front of the
+# machine: `doctor` records one second of audio and talks to iTerm2, which is
+# what makes macOS ask. Only from a terminal — with no tty there is nobody to
+# answer, and the probe would just hang for its timeout.
+
+if [ "$DO_DOCTOR" -eq 1 ] && [ -t 0 ]; then
+  echo
+  echo "doctor: probing permissions — say yes to any macOS dialog that appears"
+  "$RUNTIME/bin/voice-loopctl" doctor || true
+else
+  echo "doctor: not run — do it once from a terminal: $REPO/bin/voice-loopctl doctor"
+fi
+
 cat <<EOF
 
 voice-loop installed.
@@ -228,6 +254,10 @@ voice-loop installed.
   2. $REPO/bin/voice-loopctl restart
   3. open a NEW Claude session — running ones do not pick up new hooks
   4. $REPO/bin/voice-loopctl status
+  5. $REPO/bin/voice-loopctl doctor — and answer the microphone dialog.
+     Until you do, every mic open waits on a prompt nobody sees, and the
+     hotkey looks dead. If the daemon's column still fails afterwards, tick
+     its python in System Settings → Privacy & Security → Microphone.
 
 The daemon runs from $RUNTIME, a copy of this clone.
 Re-run ./install.sh after every git pull; until you do, voice-loopctl says so.

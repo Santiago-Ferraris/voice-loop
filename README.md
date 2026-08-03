@@ -15,9 +15,10 @@ voice-loop closes that gap without a GUI:
 Nothing steals your focus. Requests are answered one at a time, in order, and anything you
 skip stays reachable — ask for your pendings whenever you want.
 
-> **Status: phase 2 shipped — the loop is closed.** All five steps above work. What is left is
-> polish: naming unnamed windows by voice, asking for your pendings out loud, and the phonetic
-> dictionary. See [Current state](#current-state).
+> **Status: phase 3 shipped — the loop is closed and it knows its own queue.** All five steps
+> above work; windows name themselves out loud, and "dame los pendientes" / "estado" answer from
+> any mode. What is left is Deepgram streaming instead of the local silence cutoff. See
+> [Current state](#current-state).
 
 ## Why not just use dictation?
 
@@ -46,8 +47,9 @@ your prompt is never delayed. They don't even open the database. The daemon is t
 that owns state, and the only one that does anything slow — summarizing, speaking, listening.
 
 Windows identify themselves by Claude's own session name, so what you hear matches what you see
-in the prompt box and in `/resume`. A session that's still running an auto-generated name gets
-announced with a summary and a proposed name; say "dale" and it sticks *(phase 3)*.
+in the prompt box and in `/resume`. A session still running an auto-generated name (`darwin-21`)
+is announced with a summary and a proposed name; say "dale" and it sticks. See
+[Naming windows out loud](#naming-windows-out-loud).
 
 ## Design decisions
 
@@ -64,7 +66,8 @@ announced with a summary and a proposed name; say "dale" and it sticks *(phase 3
 | Speech in | Deepgram `nova-3` (`language=multi`) or OpenAI `gpt-4o-transcribe`, behind a swappable adapter (`whisper-cpp` and Deepgram streaming are *planned*, not implemented) |
 | Menus | Answer by number or keyword; "explicame la dos" reads the option's description. Multi-select takes "uno y tres" |
 | Speech out | macOS `say` — offline, no latency, no cost |
-| Summaries | `gpt-4o-mini` |
+| Summaries | `gpt-4o-mini`. The proposed name for an unnamed window rides the same request — one call, two fields |
+| Names | Offered once per window, never twice. Confirmed names are what you hear *and* vocabulary for the recognizer |
 
 ### Getting spanglish right
 
@@ -115,6 +118,19 @@ $EDITOR ~/.config/voice-loop/env     # OPENAI_API_KEY=sk-…
 bin/voice-loopctl restart
 ```
 
+**Then grant the microphone — this is a step, not a footnote.** `install.sh` ends by running
+`doctor` from your terminal for exactly this reason: it records one second of audio, which is
+what makes macOS raise the consent dialog while you are still sitting there. Until it is
+answered, every mic open parks on an invisible prompt, the hotkey looks dead, and nothing in the
+log says why. If you skipped it (or installed over SSH), do it by hand:
+
+```sh
+bin/voice-loopctl doctor     # answer the dialog, then run it again
+```
+
+See [Permissions](#permissions) for what to do when the *daemon's* column keeps failing after
+your terminal's has gone green — they are two different grants.
+
 Hooks are read when a session starts, so **open a new Claude window** to see it work. Sessions
 that were already running keep their old hook set until you restart them.
 
@@ -158,6 +174,23 @@ LaunchAgent may never get the chance to — and then asks the daemon to run the 
 where it lives. Two columns; the difference between them is the bug. A denied Automation prompt
 shows up as AppleScript error `-1743`, and a denied microphone as an ffmpeg capture with no
 samples in it.
+
+**A capture that hangs is not a slow capture.** A one-second probe that times out after twenty
+is a process parked on a consent prompt nobody answered — `doctor` says so in those words. It is
+the normal state of a fresh install *before* the first grant, and it self-corrects the moment you
+say yes.
+
+**If your terminal's column is green and the daemon's is not**, that is the grant working exactly
+as macOS intends: permission belongs to the responsible process, and for a LaunchAgent that is
+launchd rather than iTerm2. Tick the runtime's interpreter
+(`~/.local/share/voice-loop/.venv/bin/python3`) in System Settings → Privacy & Security →
+Microphone, then `bin/voice-loopctl restart`. When the daemon hits this at runtime it says so out
+loud rather than only logging it — you are not looking at a terminal, which is the whole premise
+of the project.
+
+The key itself lives in `~/.config/voice-loop/env`, which the daemon's launcher sources and
+`voice-loopctl` does not. `doctor` reads that file directly, so a configured key is never
+reported as missing, and a missing one is reported by name and path.
 
 ### Why the daemon does not run from the clone
 
@@ -234,10 +267,44 @@ the key again. Say nothing and the item simply stays in `pendings` — the queue
 | "mostrame" | Focuses that tab. Nothing else ever moves your focus |
 | "salteá" / "después" | Leaves it pending and moves on |
 | "dale" / "no" | Confirms or cancels a read-back. Anywhere else it is just a word, and gets typed |
+| "dame los pendientes" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
+| "estado" / "cómo venimos" | Windows open, how many are working, how many are waiting on you |
 
 **Read-backs.** A transcript the recognizer was unsure about, or one matching
 `delivery.confirm_if_matches`, is read back to you before it is sent. Say "dale" to send it, "no"
 to drop it, or just say something else — that replaces it.
+
+**The queue, out loud.** "dame los pendientes" works from anywhere, busy mode included, where the
+hotkey is the only microphone you get. It reads the list in the order things arrived and then
+waits for a pick — "la dos", or the window's name. The window you pick is re-announced and gets
+the mic exactly as if it had just blocked; the one you were on stays pending, reachable, and in
+its place in line. Any item whose summary was dropped by a supersede is summarised as the list is
+read, so no entry is ever just a name.
+
+## Naming windows out loud
+
+Claude names an unnamed window after its directory and two hex characters — `darwin-21`,
+`darwin-ae`. Spoken, three of those in one repo are three identical noises. So the first time
+such a window announces itself you hear:
+
+> *"Ventana nueva en darwin platform: terminó los tests del event processor. ¿La llamo tests
+> event processor?"*
+
+- **"dale"** keeps that name. **A short phrase** — "índice de migración" — keeps yours instead.
+- **Anything longer** was meant for the window, not for the question: it goes straight through to
+  that window as your answer, rather than becoming a window called "mergealo cuando pasen los
+  tests". Silence goes through too, which ends the turn instead of opening a second mic on
+  somebody who is not there.
+- **"no" or silence is remembered.** You are not asked about that window again — being asked at
+  every announcement is worse than `darwin-21`.
+
+A window you named yourself, in Claude's prompt box, is never second-guessed. Names you confirm
+become what the announcement says *and* vocabulary for the recognizer, so saying the name of a
+window transcribes as the name and not as three unrelated words.
+
+The proposal costs nothing extra: it is one more field on the `gpt-4o-mini` request that was
+already summarising that turn — two readings of the same paragraph, one call. If the model is
+down you lose the offer and keep the announcement.
 
 ## How delivery works
 
@@ -278,6 +345,10 @@ announcement and your answer must not have keystrokes delivered to whatever inhe
 - Ignored announcements are never dropped: `voice-loopctl pendings` still lists them, by window
   name, whether or not they have been announced yet. `voice-loopctl skip [id]` is the way out
   for an item that stopped mattering — without it, only real activity in that session clears it.
+- A superseded item loses its summary on purpose — it described a turn that is no longer the last
+  one — and gets a fresh one **when the list is read**, by `pendings` or out loud. Not in the
+  background: nothing is spent summarising turns you never ask about, and the announce path stays
+  free of the latency.
 - Milestones (a PR being created) only chime. If some other tool of yours already tracks a
   per-terminal phase in a file, point `integrations.milestone_file_watch` at it — off by default.
 
@@ -303,5 +374,6 @@ socket. After changing anything the daemon runs, `./install.sh` again.
       fullscreen TUI as a real user turn, Enter included, without stealing focus
 - [x] Phase 1 — hooks, queue, TTS, summaries *(it talks to you)*
 - [x] Phase 2 — hotkeys, speech-to-text, delivery *(it listens, and answers the right window)*
-- [ ] Phase 3 — naming unnamed windows by voice, asking for pendings out loud, phonetic
-      dictionary, Deepgram streaming instead of the local silence cutoff
+- [x] Phase 3 — naming unnamed windows by voice, the queue and the board read out loud, lazy
+      re-summarising of superseded items, the microphone grant made an install step
+- [ ] Next — Deepgram streaming with server-side endpointing, instead of the local silence cutoff

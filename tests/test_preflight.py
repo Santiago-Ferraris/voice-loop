@@ -107,6 +107,22 @@ def test_the_configured_device_is_the_one_probed(monkeypatch):
     assert seen[0][seen[0].index("-i") + 1] == ":2"
 
 
+def test_a_capture_that_hangs_names_the_consent_prompt(monkeypatch):
+    """Issue #7: a one-second capture that takes twenty is not slow, it is blocked."""
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/bin/ffmpeg")
+
+    def run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 21.0))
+
+    monkeypatch.setattr(preflight.subprocess, "run", run)
+
+    check = preflight.check_microphone()
+
+    assert check.status == FAILED
+    assert "consent" in check.detail
+    assert "Privacy & Security" in check.detail
+
+
 def test_an_ffmpeg_that_cannot_even_start_is_a_failed_check(monkeypatch):
     monkeypatch.setattr(preflight.shutil, "which", lambda name: "/bin/ffmpeg")
 
@@ -149,6 +165,31 @@ def test_a_recognizer_without_a_key_is_a_failed_check():
 
 def test_no_recognizer_at_all_is_a_failed_check():
     assert preflight.check_stt(None).status == FAILED
+
+
+def test_a_missing_key_names_the_file_it_is_missing_from(tmp_path):
+    """Issue #6: "missing from the environment" sent people to fix the wrong thing."""
+    from voiceloop import envfile
+    from voiceloop.stt.deepgram import DeepgramStt
+
+    check = preflight.check_stt(
+        DeepgramStt(api_key=None), env_file=envfile.read(tmp_path / "nope")
+    )
+
+    assert check.status == FAILED
+    assert f"no env file at {tmp_path / 'nope'}" in check.detail
+
+
+def test_a_key_absent_from_a_file_that_exists_says_so(tmp_path):
+    from voiceloop import envfile
+    from voiceloop.stt.deepgram import DeepgramStt
+
+    path = tmp_path / "env"
+    path.write_text("OPENAI_API_KEY=sk-1\n", encoding="utf-8")
+
+    check = preflight.check_stt(DeepgramStt(api_key=None), env_file=envfile.read(path))
+
+    assert f"DEEPGRAM_API_KEY is not in {path}" in check.detail
 
 
 def test_a_configured_recognizer_passes():

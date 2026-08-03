@@ -71,6 +71,9 @@ summaries:
   provider: openai
   model: gpt-4o-mini
   max_words: 12
+  # The same request also proposes a name for a window Claude left called
+  # `darwin-21` ("¿la llamo tests event processor?"). One call, two fields —
+  # with provider: none you lose the offer and keep the announcement.
   # Hard ceiling per attempt (one retry). On timeout or missing key the
   # announcement falls back to a fixed phrase — the queue never waits on the LLM.
   timeout_seconds: 5

@@ -311,3 +311,100 @@ def test_a_trailing_period_in_the_summary_is_not_doubled():
     result = announce.build(item(), name="x", summary="listo.", remaining=2)
 
     assert result.text == "x: listo. Quedan 2."
+
+
+# --- the queue, read out loud ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "seconds, expected",
+    [
+        (0, "recién"),
+        (59, "recién"),
+        (60, "hace un minuto"),
+        (600, "hace diez minutos"),
+        (1500, "hace 25 minutos"),
+        (3600, "hace una hora"),
+        (7200, "hace dos horas"),
+        (86400, "hace un día"),
+        (172800, "hace dos días"),
+        (-5, "recién"),
+    ],
+)
+def test_how_long_a_window_has_been_waiting(seconds, expected):
+    assert announce.ago_phrase(seconds) == expected
+
+
+def test_the_pendings_list_is_numbered_because_the_number_is_the_answer():
+    text = announce.describe_pendings(
+        [("alpha", "espera tu aprobación", "hace diez minutos"), ("beta", "", "recién")]
+    )
+
+    assert text == (
+        "Tenés dos pendientes. uno: alpha, espera tu aprobación, hace diez minutos. "
+        "dos: beta, recién"
+    )
+
+
+def test_an_empty_pendings_list_is_one_sentence():
+    assert announce.describe_pendings([]) == "No tenés nada pendiente."
+
+
+def test_a_long_pendings_list_is_capped_with_a_tail():
+    entries = [(f"win-{i}", "", "recién") for i in range(8)]
+
+    text = announce.describe_pendings(entries, limit=5)
+
+    assert "Tenés ocho pendientes" in text
+    assert "win-5" not in text
+    assert text.endswith("Y tres más")
+
+
+def test_status_reads_open_working_and_waiting():
+    text = announce.describe_status(windows=3, working=2, waiting=1)
+
+    assert text == "Hay tres ventanas abiertas. dos trabajando. una te espera"
+
+
+def test_status_with_nothing_open_still_says_something():
+    text = announce.describe_status(windows=0, working=0, waiting=0)
+
+    assert text == "No hay ventanas abiertas. ninguna trabajando. ninguna te espera"
+
+
+def test_status_adds_milestones_and_the_mode():
+    text = announce.describe_status(
+        windows=1, working=0, waiting=1, milestones=[("CI green", 2)], paused=True
+    )
+
+    assert "dos con CI green" in text
+    assert text.endswith("Estoy en pausa")
+
+
+def test_pause_wins_over_busy_because_nothing_is_being_announced():
+    text = announce.describe_status(windows=0, working=0, waiting=0, paused=True, busy=True)
+
+    assert "modo ocupado" not in text
+
+
+# --- the naming offer ------------------------------------------------------
+
+
+def test_the_naming_offer_is_the_last_thing_asked():
+    result = announce.build(
+        item(), name="darwin-21", summary="terminó los tests", naming_offer="tests worker"
+    )
+
+    assert result.text == "darwin 21: terminó los tests. ¿La llamo tests worker?"
+
+
+def test_no_offer_leaves_the_announcement_exactly_as_it_was():
+    assert announce.build(item(), name="x", summary="listo", naming_offer="").text == "x: listo."
+
+
+def test_the_offered_name_goes_through_the_phonetic_dictionary():
+    result = announce.build(
+        item(), name="x", summary="listo", naming_offer="merge worker", phonetic=PHONETIC
+    )
+
+    assert result.text.endswith("¿La llamo merch worker?")

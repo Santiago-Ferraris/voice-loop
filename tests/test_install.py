@@ -204,6 +204,22 @@ def test_an_existing_env_file_is_never_overwritten(home):
     assert "left untouched" in result.stdout
 
 
+def test_the_microphone_grant_is_a_numbered_step_not_a_footnote(home):
+    """Issue #7: the mitigation existed and was written down nowhere."""
+    result = install(home)
+
+    assert "voice-loopctl doctor" in result.stdout
+    assert "microphone dialog" in result.stdout
+    assert "Privacy & Security" in result.stdout
+
+
+def test_the_probe_is_skipped_when_there_is_nobody_to_answer_the_dialog(home):
+    """No tty means no human: probing would hang on a prompt nobody sees."""
+    result = install(home)
+
+    assert "doctor: not run" in result.stdout
+
+
 def test_an_existing_env_file_survives_repeated_installs(home):
     env_file = home / ".config" / "voice-loop" / "env"
     env_file.parent.mkdir(parents=True)

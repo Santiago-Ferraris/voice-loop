@@ -28,8 +28,13 @@ def isolated_runtime_dir(monkeypatch, tmp_path):
 
     Otherwise `voice-loopctl`'s drift warning would fire — or not — depending on
     whether the developer running the suite has run install.sh today.
+
+    Same for the env file: `doctor` reads it now, so a developer with a real
+    DEEPGRAM_API_KEY on disk would silently pass a test that asserts the key is
+    missing — and it would fail on anyone else's machine.
     """
     monkeypatch.setenv("VOICE_LOOP_RUNTIME_DIR", str(tmp_path / "not-installed"))
+    monkeypatch.setenv("VOICE_LOOP_ENV_FILE", str(tmp_path / "no-env-file"))
 
 
 @pytest.fixture

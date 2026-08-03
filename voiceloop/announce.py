@@ -220,6 +220,91 @@ def describe_menu(payload: Mapping[str, Any]) -> str:
     return join_sentences(parts)
 
 
+def ago_phrase(seconds: float) -> str:
+    """How long a window has been waiting, rounded to something worth hearing."""
+    minutes = int(max(0.0, seconds) // 60)
+    if minutes < 1:
+        return "recién"
+    if minutes == 1:
+        return "hace un minuto"
+    if minutes < 60:
+        return f"hace {number_word(minutes)} minutos"
+    hours = minutes // 60
+    if hours == 1:
+        return "hace una hora"
+    if hours < 24:
+        return f"hace {number_word(hours)} horas"
+    days = hours // 24
+    return "hace un día" if days == 1 else f"hace {number_word(days)} días"
+
+
+def describe_pendings(entries: Sequence[tuple[str, str, str]], *, limit: int = 5) -> str:
+    """The queue, read out loud and numbered — because the number is the answer.
+
+    `entries` are (name, summary, how long it has been waiting). Capped: past
+    five you have stopped counting anyway, and the tail is one more sentence
+    rather than a minute of enumeration.
+    """
+    if not entries:
+        return "No tenés nada pendiente."
+    total = len(entries)
+    head = "Tenés un pendiente" if total == 1 else f"Tenés {number_word(total)} pendientes"
+    parts = [head]
+    for index, entry in enumerate(entries[:limit], start=1):
+        name, summary, ago = entry
+        clause = f"{number_word(index)}: {name or 'una sesión'}"
+        if summary:
+            clause += f", {summary}"
+        if ago:
+            clause += f", {ago}"
+        parts.append(clause)
+    extra = total - limit
+    if extra > 0:
+        parts.append("Y uno más" if extra == 1 else f"Y {number_word(extra)} más")
+    return join_sentences(parts)
+
+
+def _count_phrase(count: int, singular: str, plural: str, none: str) -> str:
+    if count <= 0:
+        return none
+    if count == 1:
+        return singular
+    return plural.format(count=number_word(count))
+
+
+def describe_status(
+    *,
+    windows: int,
+    working: int,
+    waiting: int,
+    milestones: Sequence[tuple[str, int]] = (),
+    paused: bool = False,
+    busy: bool = False,
+) -> str:
+    """Where everything stands, in one breath: open, working, waiting on you."""
+    parts = [
+        _count_phrase(windows, "Hay una ventana abierta", "Hay {count} ventanas abiertas",
+                      "No hay ventanas abiertas"),
+        _count_phrase(working, "una trabajando", "{count} trabajando", "ninguna trabajando"),
+        _count_phrase(waiting, "una te espera", "{count} te esperan", "ninguna te espera"),
+    ]
+    for label, count in milestones:
+        parts.append(
+            f"una con {label}" if count == 1 else f"{number_word(count)} con {label}"
+        )
+    if paused:
+        parts.append("Estoy en pausa")
+    elif busy:
+        parts.append("Estoy en modo ocupado")
+    return join_sentences(parts)
+
+
+def name_question(slug: str, phonetic: Mapping[str, Any] | None = None) -> str:
+    """The offer to christen a window Claude called `darwin-21`."""
+    spoken = speakable(slug, phonetic)
+    return f"¿La llamo {spoken}?" if spoken else ""
+
+
 def build(
     item,
     *,
@@ -230,6 +315,7 @@ def build(
     blocking_chime: str | None = None,
     milestone_chime: str | None = None,
     notification_events: bool = True,
+    naming_offer: str = "",
 ) -> Announcement:
     """Compose the full announcement for a queue item."""
     spoken_name = speakable(name, phonetic)
@@ -254,6 +340,10 @@ def build(
         sentence += "."
     tail = remaining_phrase(remaining)
     text = f"{sentence} {tail}." if tail else sentence
+    # Last, so it is the question the open microphone is answering.
+    offer = name_question(naming_offer, phonetic)
+    if offer:
+        text = join_sentences([text, offer])
 
     speak = True
     if item.type == TYPE_NOTIFICATION and not notification_events:

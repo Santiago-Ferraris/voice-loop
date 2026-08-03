@@ -26,8 +26,17 @@ from pathlib import Path
 
 from . import iterm
 from .audio import MIN_USABLE_BYTES, ffmpeg_argv
+from .config import ENV_VAR_BY_SERVICE
 
 PROBE_SECONDS = 1.0
+
+# What a hung capture actually means. Written once here, and quoted into the
+# log by the daemon when the same thing happens to it at runtime.
+CONSENT_TIMEOUT = (
+    "capture timed out — waiting on the macOS microphone consent prompt. "
+    "Answer it, or tick this process in System Settings → Privacy & Security "
+    "→ Microphone, then run doctor again"
+)
 
 OK = "ok"
 FAILED = "failed"
@@ -70,6 +79,11 @@ def check_microphone(
             completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
                 argv, capture_output=True, text=True, timeout=seconds + 20, check=False
             )
+        except subprocess.TimeoutExpired:
+            # A one-second capture cannot take twenty. It is not slow, it is
+            # parked on the consent prompt — and reporting that as a bare
+            # timeout is indistinguishable from a broken ffmpeg.
+            return Check("microphone", FAILED, CONSENT_TIMEOUT)
         except (OSError, subprocess.SubprocessError) as exc:
             return Check("microphone", FAILED, str(exc))
         size = target.stat().st_size if target.exists() else 0
@@ -85,18 +99,31 @@ def check_iterm(runner=None) -> Check:
     return Check("iterm automation", OK if ok else FAILED, detail)
 
 
-def check_stt(engine) -> Check:
+def check_stt(engine, *, env_file=None) -> Check:
+    """A missing key names the file it is missing from, or there is no check.
+
+    "API key missing from the environment" is true and useless: the key lives in
+    `~/.config/voice-loop/env`, `voice-loopctl` does not source it, and the
+    daemon does — so the same sentence meant three different things depending on
+    which column you read it in. With the file parsed (see `envfile`), the three
+    states are told apart by name.
+    """
     if engine is None:
         return Check("speech-to-text", FAILED, "no provider — see speech_to_text.provider")
     if not engine.available:
+        var = ENV_VAR_BY_SERVICE.get(engine.name)
+        if env_file is not None and var:
+            return Check("speech-to-text", FAILED, f"{engine.name}: {env_file.why_missing(var)}")
         return Check("speech-to-text", FAILED, f"{engine.name}: API key missing from the environment")
     return Check("speech-to-text", OK, engine.name)
 
 
-def run_all(*, binary: str = "ffmpeg", device: str = ":0", engine=None, runner=None) -> list[Check]:
+def run_all(
+    *, binary: str = "ffmpeg", device: str = ":0", engine=None, runner=None, env_file=None
+) -> list[Check]:
     return [
         check_ffmpeg(binary),
         check_microphone(binary=binary, device=device),
         check_iterm(runner),
-        check_stt(engine),
+        check_stt(engine, env_file=env_file),
     ]
