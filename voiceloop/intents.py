@@ -1,0 +1,261 @@
+"""What you said, classified — as little as possible.
+
+The rule from the design is that dictation is **literal**: Claude reads
+disfluent speech better than any parser here would, so the only job of this
+module is to catch the handful of phrases that mean something to voice-loop
+itself and let everything else through untouched. When in doubt, it is text.
+
+That cuts both ways, and the ambiguity is deliberate. "dale" is a control word
+while a read-back is waiting for confirmation, and a perfectly good answer to a
+session that just asked "¿lo mergeo?". So `parse` only *classifies*; the daemon
+decides whether the classification applies in the state it is in. A `confirm`
+with nothing to confirm is delivered as the word "dale".
+
+Menu answers are the one place a number means something. They are recognized
+only when a menu is actually open, only when the whole utterance is that
+number (with the usual "la", "opción", "por favor" around it), and only when
+the number is one the payload offers — "dos cosas: arreglá el índice" is text.
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass
+from typing import Mapping, Sequence
+
+KIND_TEXT = "text"
+KIND_SELECT = "select"
+KIND_EXPLAIN = "explain"
+KIND_CONFIRM = "confirm"
+KIND_CANCEL = "cancel"
+KIND_REPEAT = "repeat"
+KIND_SKIP = "skip"
+KIND_SHOW = "show"
+KIND_SILENCE = "silence"
+
+NUMBERS: Mapping[str, int] = {
+    "uno": 1, "una": 1, "un": 1, "primero": 1, "primera": 1, "primer": 1,
+    "dos": 2, "segundo": 2, "segunda": 2,
+    "tres": 3, "tercero": 3, "tercera": 3, "tercer": 3,
+    "cuatro": 4, "cuarto": 4, "cuarta": 4,
+    "cinco": 5, "quinto": 5, "quinta": 5,
+    "seis": 6, "sexto": 6, "sexta": 6,
+    "siete": 7, "septimo": 7, "septima": 7,
+    "ocho": 8, "octavo": 8, "octava": 8,
+    "nueve": 9, "noveno": 9, "novena": 9,
+    "diez": 10, "decimo": 10, "decima": 10,
+}
+
+CONFIRM_PHRASES = frozenset({
+    "si", "si si", "sisi", "dale", "dale si", "si dale", "ok", "oka", "okey", "okay",
+    "correcto", "confirmo", "confirma", "confirmalo", "confirmado", "exacto",
+    "adelante", "mandale", "mandalo", "mandala", "hacelo", "hacela", "de una",
+    "obvio", "perfecto", "listo", "vamos", "afirmativo", "claro", "claro que si",
+    "sip", "yes", "va",
+})
+
+CANCEL_PHRASES = frozenset({
+    "no", "no no", "nop", "cancela", "cancelalo", "cancelala", "cancelar",
+    "olvidalo", "olvidate", "nada", "negativo", "mejor no", "no gracias",
+    "para", "pare", "abortar", "aborta", "stop",
+})
+
+REPEAT_PHRASES = frozenset({
+    "repeti", "repetilo", "repetila", "repetime", "repetimelo", "repetir",
+    "de nuevo", "otra vez", "como era", "que dijiste", "que era",
+    "no escuche", "no te escuche", "volve a decirlo",
+})
+
+SKIP_PHRASES = frozenset({
+    "saltea", "saltealo", "salteala", "saltear", "salta", "saltalo",
+    "siguiente", "el siguiente", "proximo", "el proximo", "despues",
+    "mas tarde", "ahora no", "paso", "dejalo", "next", "skip",
+})
+
+SHOW_PHRASES = frozenset({
+    "mostrame", "mostramelo", "mostramela", "mostralo", "mostrala", "mostrar",
+    "llevame", "llevame ahi", "abrila", "abrilo", "enfocala", "enfocalo",
+    "enfoca", "vamos ahi", "ir ahi", "traeme", "mostrame eso",
+    "mostrame la ventana", "quiero verlo", "quiero verla",
+})
+
+EXPLAIN_VERBS = (
+    "explicame", "explicamela", "explicamelo", "explica", "explicar",
+    "contame", "detallame", "ampliame", "que es", "de que se trata",
+)
+
+# Dropped from the edges before looking for a number or an option keyword.
+LEADING_FILLER = frozenset({
+    "la", "el", "lo", "las", "los", "opcion", "opciones", "numero", "respuesta",
+    "elijo", "elegi", "elegimos", "quiero", "dame", "poneme", "andale", "esa", "ese",
+})
+TRAILING_FILLER = frozenset({"por", "favor", "porfa", "gracias", "nomas", "dale", "obvio"})
+
+# A distinctive first word is enough to pick an option ("postgres" for
+# "Postgres — ya corre en staging"). Short words are not distinctive.
+MIN_KEYWORD_CHARS = 4
+
+_NON_WORD = re.compile(r"[^0-9a-z\s]+")
+_WHITESPACE = re.compile(r"\s+")
+# "uno y tres", "uno, dos" — the only way to name several options at once.
+_SEPARATOR = re.compile(r"\s*[,;]\s*|\s+[yY]\s+")
+
+
+@dataclass(frozen=True)
+class Intent:
+    kind: str
+    index: int | None = None
+    text: str = ""
+    indexes: tuple[int, ...] = ()
+
+    @property
+    def is_control(self) -> bool:
+        return self.kind not in (KIND_TEXT, KIND_SILENCE)
+
+
+def _selection(indexes: Sequence[int], text: str) -> Intent:
+    ordered = tuple(sorted(dict.fromkeys(indexes)))
+    return Intent(KIND_SELECT, index=ordered[0], text=text, indexes=ordered)
+
+
+def fold(text: str) -> str:
+    """Lowercase, unaccented, punctuation-free — the form every set is written in."""
+    decomposed = unicodedata.normalize("NFD", text or "")
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return _WHITESPACE.sub(" ", _NON_WORD.sub(" ", stripped.lower())).strip()
+
+
+def _strip_filler(tokens: Sequence[str]) -> list[str]:
+    out = list(tokens)
+    while out and out[0] in LEADING_FILLER:
+        out.pop(0)
+    while out and out[-1] in TRAILING_FILLER:
+        out.pop()
+    return out
+
+
+def as_number(token: str) -> int | None:
+    if token in NUMBERS:
+        return NUMBERS[token]
+    if token.isdigit():
+        value = int(token)
+        return value if value > 0 else None
+    return None
+
+
+def option_keys(labels: Sequence[str]) -> dict[str, int]:
+    """Folded label -> index, plus a distinctive first word when it is unique."""
+    keys: dict[str, int] = {}
+    collisions: set[str] = set()
+
+    def offer(key: str, index: int) -> None:
+        if not key or key in collisions:
+            return
+        if key in keys and keys[key] != index:
+            del keys[key]
+            collisions.add(key)
+            return
+        keys[key] = index
+
+    for index, label in enumerate(labels, start=1):
+        folded = fold(str(label))
+        if not folded:
+            continue
+        offer(folded, index)
+        first = folded.split(" ")[0]
+        if len(first) >= MIN_KEYWORD_CHARS:
+            offer(first, index)
+    return keys
+
+
+def _phrase(tokens: Sequence[str]) -> str:
+    return " ".join(tokens)
+
+
+def _explain_index(folded: str, option_count: int) -> int | None:
+    for verb in EXPLAIN_VERBS:
+        if not folded.startswith(verb + " "):
+            continue
+        rest = _strip_filler(folded[len(verb) :].split())
+        if len(rest) != 1:
+            continue
+        index = as_number(rest[0])
+        if index is not None and 1 <= index <= option_count:
+            return index
+    return None
+
+
+def _resolve_one(phrase: str, labels: Sequence[str], keys: Mapping[str, int]) -> int | None:
+    core = _strip_filler(phrase.split())
+    if len(core) == 1:
+        number = as_number(core[0])
+        if number is not None and 1 <= number <= len(labels):
+            return number
+    return keys.get(_phrase(core))
+
+
+def _multi_selection(raw: str, labels: Sequence[str], keys: Mapping[str, int]) -> list[int]:
+    """'uno y tres' -> [1, 3]. Every part has to resolve, or none of it counts.
+
+    Split before folding: folding is what turns the comma in "uno, dos" into a
+    space, and by then the two answers look like one phrase.
+    """
+    pieces = [fold(part) for part in _SEPARATOR.split(raw)]
+    parts = [part for part in pieces if part]
+    if len(parts) < 2:
+        return []
+    found: list[int] = []
+    for part in parts:
+        index = _resolve_one(part, labels, keys)
+        if index is None:
+            return []
+        found.append(index)
+    return found
+
+
+def parse(
+    text: str,
+    options: Sequence[str] = (),
+    *,
+    heard: bool = True,
+    multi: bool = False,
+) -> Intent:
+    """Classify one utterance. `options` are the labels the payload offers."""
+    raw = (text or "").strip()
+    folded = fold(raw)
+    if not heard or not folded:
+        return Intent(KIND_SILENCE, text=raw)
+
+    # Control phrases are matched whole, with the politeness trimmed off.
+    tokens = folded.split()
+    bare = _phrase([token for token in tokens if token not in ("por", "favor", "porfa")])
+    for phrases, kind in (
+        (CONFIRM_PHRASES, KIND_CONFIRM),
+        (CANCEL_PHRASES, KIND_CANCEL),
+        (REPEAT_PHRASES, KIND_REPEAT),
+        (SKIP_PHRASES, KIND_SKIP),
+        (SHOW_PHRASES, KIND_SHOW),
+    ):
+        if folded in phrases or bare in phrases:
+            return Intent(kind, text=raw)
+
+    labels = [str(option) for option in options]
+    if labels:
+        index = _explain_index(folded, len(labels))
+        if index is not None:
+            return Intent(KIND_EXPLAIN, index=index, text=raw)
+
+        keys = option_keys(labels)
+        single = _resolve_one(folded, labels, keys)
+        if single is not None:
+            return _selection([single], raw)
+        if multi:
+            # Only a multi-select menu can take "uno y tres"; anywhere else that
+            # is a sentence, and sentences go through untouched. Tried second so
+            # an option actually labelled "Rojo y Verde" still wins as itself.
+            several = _multi_selection(raw, labels, keys)
+            if several:
+                return _selection(several, raw)
+
+    return Intent(KIND_TEXT, text=raw)

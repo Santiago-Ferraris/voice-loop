@@ -5,6 +5,8 @@ import pytest
 from voiceloop import config as config_mod
 from voiceloop.config import ConfigError
 
+from conftest import REPO_ROOT
+
 
 def write(path, text):
     path.write_text(text, encoding="utf-8")
@@ -200,3 +202,42 @@ def test_shipped_example_config_is_valid_and_complete(repo_root, clean_env):
     assert config.get("summaries.timeout_seconds") == 5
     assert config.get("integrations.milestone_file_watch.enabled") is False
     assert config.api_key("openai") is None
+
+
+# --- phase 2 keys ----------------------------------------------------------
+
+
+def test_the_streaming_and_mock_providers_are_accepted_names(tmp_path, clean_env):
+    for provider in ("deepgram_ws", "mock"):
+        local = tmp_path / f"{provider}.yml"
+        local.write_text(f"speech_to_text:\n  provider: {provider}\n", encoding="utf-8")
+
+        loaded = config_mod.load(repo_root=REPO_ROOT, local_path=local)
+
+        assert loaded.get("speech_to_text.provider") == provider
+
+
+def test_a_confidence_threshold_outside_zero_to_one_is_rejected(tmp_path, clean_env):
+    local = tmp_path / "c.yml"
+    local.write_text("delivery:\n  confirm_below_confidence: 42\n", encoding="utf-8")
+
+    with pytest.raises(config_mod.ConfigError, match="between 0 and 1"):
+        config_mod.load(repo_root=REPO_ROOT, local_path=local)
+
+
+@pytest.mark.parametrize("key", ["max_seconds", "open_timeout_seconds"])
+def test_a_non_positive_microphone_duration_is_rejected(tmp_path, clean_env, key):
+    local = tmp_path / "m.yml"
+    local.write_text(f"microphone:\n  {key}: 0\n", encoding="utf-8")
+
+    with pytest.raises(config_mod.ConfigError, match=f"microphone.{key}"):
+        config_mod.load(repo_root=REPO_ROOT, local_path=local)
+
+
+def test_the_shipped_defaults_cover_every_phase_two_key(config):
+    assert config.get("microphone.device") == ":0"
+    assert config.get("microphone.silence.enabled") is True
+    assert config.get("announce.mic_open_chime")
+    assert config.get("announce.mic_close_chime")
+    assert config.get("delivery.max_mic_rounds") == 3
+    assert config.get("delivery.plan_menu.feedback_index") == 4

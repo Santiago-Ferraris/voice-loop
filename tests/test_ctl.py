@@ -24,13 +24,14 @@ def run(*argv, socket="/tmp/vl.sock") -> int:
 
 
 def test_every_frozen_command_is_accepted(calls):
-    for command in ctl.COMMANDS:
+    forwarded = [cmd for cmd in ctl.COMMANDS if cmd not in ctl.LOCAL_COMMANDS]
+    for command in forwarded:
         argv = [command]
         if command == "milestone":
             argv.append("CI green")
         assert run(*argv) == 0
 
-    assert [cmd for _, cmd, _ in calls] == list(ctl.COMMANDS)
+    assert [cmd for _, cmd, _ in calls] == forwarded
 
 
 def test_the_milestone_label_is_forwarded(calls):
@@ -228,3 +229,110 @@ def test_the_warning_stays_off_stdout(installed, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {"ok": True, "data": {"queued": 2}}
     assert "out of date" in captured.err
+
+
+# --- doctor ----------------------------------------------------------------
+
+
+@pytest.fixture
+def local_checks(monkeypatch):
+    """The two OS probes, stubbed. Running them for real records audio."""
+    from voiceloop import preflight
+
+    recorded: list[dict] = []
+
+    def run_all(**kwargs):
+        recorded.append(kwargs)
+        return [preflight.Check("microphone", preflight.OK, ":0")]
+
+    monkeypatch.setattr(preflight, "run_all", run_all)
+    return recorded
+
+
+@pytest.fixture
+def selfcheck(monkeypatch):
+    """A daemon that answers `selfcheck`, and records that it was asked."""
+    asked: list[str] = []
+
+    def respond(socket_path, cmd, args=None, **kwargs):
+        asked.append(cmd)
+        return {
+            "ok": True,
+            "data": [{"name": "iterm automation", "status": "ok", "detail": "2 windows"}],
+        }
+
+    monkeypatch.setattr(ctl, "request", respond)
+    return asked
+
+
+def test_doctor_checks_here_and_asks_the_daemon_too(selfcheck, local_checks, capsys):
+    """Two columns: the permissions are granted per process, not per machine."""
+    assert run("doctor") == 0
+
+    assert selfcheck == ["selfcheck"]
+    out = capsys.readouterr().out
+    assert "here (your terminal):" in out
+    assert "there (the daemon):" in out
+    assert "2 windows" in out
+
+
+def test_doctor_reports_a_daemon_that_is_not_running(monkeypatch, local_checks, capsys):
+    def refuse(*args, **kwargs):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(ctl, "request", refuse)
+
+    assert run("doctor") == 1
+    assert "unreachable" in capsys.readouterr().out
+
+
+def test_doctor_fails_when_a_local_check_fails(selfcheck, monkeypatch, capsys):
+    from voiceloop import preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "run_all",
+        lambda **kwargs: [preflight.Check("microphone", preflight.FAILED, "denied")],
+    )
+
+    assert run("doctor") == 1
+    assert "denied" in capsys.readouterr().out
+
+
+def test_doctor_fails_when_the_daemon_reports_a_problem(monkeypatch, local_checks, capsys):
+    monkeypatch.setattr(
+        ctl,
+        "request",
+        lambda *a, **k: {
+            "ok": True,
+            "data": [{"name": "iterm automation", "status": "failed", "detail": "-1743"}],
+        },
+    )
+
+    assert run("doctor") == 1
+    assert "-1743" in capsys.readouterr().out
+
+
+def test_doctor_probes_the_configured_device(selfcheck, local_checks):
+    run("doctor")
+
+    assert local_checks[0]["device"] == ":0"
+    assert local_checks[0]["binary"] == "ffmpeg"
+
+
+def test_status_shows_busy_mode_and_the_recognizer(monkeypatch, capsys):
+    monkeypatch.setattr(
+        ctl,
+        "request",
+        lambda *a, **k: {
+            "ok": True,
+            "data": {"busy": True, "speech_to_text": "deepgram", "mic": "listening"},
+        },
+    )
+
+    run("status")
+
+    out = capsys.readouterr().out
+    assert "busy:       True" in out
+    assert "speech in:  deepgram" in out
+    assert "mic:        listening" in out

@@ -73,3 +73,136 @@ def test_run_script_raises_on_failure():
 def test_looking_a_session_up_never_moves_focus():
     assert "select" not in iterm.FIND_SESSION
     assert "activate" not in iterm.FIND_SESSION
+
+
+# --- delivery mechanics ----------------------------------------------------
+
+
+def test_a_keystroke_crosses_the_boundary_as_decimal_code_points():
+    """Only digits and commas reach argv — never a raw control byte."""
+    assert iterm.encode_keystroke(iterm.ARROW_DOWN) == "27,91,66"
+    assert iterm.encode_keystroke(iterm.ENTER) == "13"
+    assert iterm.encode_keystroke(iterm.SPACE) == "32"
+    assert iterm.encode_keystroke(iterm.ARROW_RIGHT) == "27,91,67"
+
+
+def test_keys_argv_puts_the_tty_first_and_one_argument_per_keystroke():
+    argv = iterm.keys_argv("/dev/ttys012", [iterm.ARROW_DOWN, iterm.ARROW_DOWN, iterm.ENTER])
+
+    assert argv == ["/dev/ttys012", "27,91,66", "27,91,66", "13"]
+
+
+def test_every_script_reads_its_arguments_from_argv():
+    for script in (iterm.FIND_SESSION, iterm.WRITE_TEXT, iterm.SEND_KEYS, iterm.FOCUS_SESSION):
+        assert "on run argv" in script
+        assert "%s" not in script and "{" not in script
+
+
+def test_the_keystroke_script_rebuilds_the_bytes_itself():
+    """`character id` inside AppleScript, so argv stays printable."""
+    assert "character id" in iterm.SEND_KEYS
+    assert "\x1b" not in iterm.SEND_KEYS
+
+
+def test_an_empty_keystroke_is_a_bug_not_a_no_op():
+    try:
+        iterm.encode_keystroke("")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")
+
+
+def test_free_text_is_typed_without_a_newline_then_submitted_separately():
+    """`write text`'s own newline does not submit a long prompt. A CR does."""
+    runner = FakeOsascript("sent")
+
+    iterm.write_text("/dev/ttys012", "hola", runner=runner)
+
+    assert runner.calls == [
+        ["osascript", "-", "/dev/ttys012", "hola"],
+        ["osascript", "-", "/dev/ttys012", "13"],
+    ]
+    assert "newline no" in iterm.WRITE_TEXT
+
+
+def test_text_without_a_newline_sends_no_enter():
+    runner = FakeOsascript("sent")
+
+    iterm.write_text("/dev/ttys012", "hola", newline=False, runner=runner)
+
+    assert runner.calls == [["osascript", "-", "/dev/ttys012", "hola"]]
+
+
+def test_empty_text_still_submits_when_asked_to():
+    runner = FakeOsascript("sent")
+
+    iterm.write_text("/dev/ttys012", "", runner=runner)
+
+    assert runner.calls == [["osascript", "-", "/dev/ttys012", "13"]]
+
+
+def test_delivering_to_a_dead_session_raises_rather_than_typing_into_nothing():
+    runner = FakeOsascript("missing")
+
+    for call in (
+        lambda: iterm.write_text("/dev/ttys999", "hola", runner=runner),
+        lambda: iterm.send_keys("/dev/ttys999", [iterm.ENTER], runner),
+    ):
+        try:
+            call()
+        except iterm.SessionGone:
+            continue
+        raise AssertionError("expected SessionGone")
+
+
+def test_delivering_without_a_tty_never_runs_osascript():
+    runner = FakeOsascript("sent")
+
+    for call in (
+        lambda: iterm.write_text("", "hola", runner=runner),
+        lambda: iterm.send_keys("", [iterm.ENTER], runner),
+    ):
+        try:
+            call()
+        except iterm.SessionGone:
+            pass
+    assert runner.calls == []
+
+
+def test_sending_no_keystrokes_is_a_no_op():
+    runner = FakeOsascript("sent")
+
+    iterm.send_keys("/dev/ttys012", [], runner)
+
+    assert runner.calls == []
+
+
+def test_only_the_focus_script_moves_anything():
+    for script in (iterm.FIND_SESSION, iterm.WRITE_TEXT, iterm.SEND_KEYS):
+        assert "activate" not in script
+        assert "select" not in script
+    assert "activate" in iterm.FOCUS_SESSION
+
+
+def test_focus_reports_whether_it_found_the_window():
+    assert iterm.focus("/dev/ttys012", FakeOsascript("focused")) is True
+    assert iterm.focus("/dev/ttys999", FakeOsascript("missing")) is False
+    assert iterm.focus("", FakeOsascript("focused")) is False
+
+
+def test_scripting_status_reports_the_refusal_verbatim():
+    """A denied Automation prompt is error -1743, and the user needs to see it."""
+    runner = FakeOsascript(returncode=1)
+    runner.stdout = ""
+
+    ok, detail = iterm.scripting_status(runner)
+
+    assert ok is False
+    assert detail
+
+
+def test_scripting_status_is_happy_when_iterm_answers():
+    ok, detail = iterm.scripting_status(FakeOsascript("3"))
+
+    assert ok is True
+    assert "3" in detail

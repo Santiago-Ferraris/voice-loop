@@ -15,8 +15,9 @@ voice-loop closes that gap without a GUI:
 Nothing steals your focus. Requests are answered one at a time, in order, and anything you
 skip stays reachable — ask for your pendings whenever you want.
 
-> **Status: phase 1 shipped — it talks, it doesn't listen yet.** Steps 1 and 2 above work
-> today; the mic lands in phase 2. See [Current state](#current-state).
+> **Status: phase 2 shipped — the loop is closed.** All five steps above work. What is left is
+> polish: naming unnamed windows by voice, asking for your pendings out loud, and the phonetic
+> dictionary. See [Current state](#current-state).
 
 ## Why not just use dictation?
 
@@ -60,7 +61,8 @@ announced with a summary and a proposed name; say "dale" and it sticks *(phase 3
 | Delivery | Submits automatically; reads back first when the recognizer was unsure or the phrase looks destructive |
 | Dictation | Passed through verbatim — Claude handles disfluent speech fine. Only control commands are intercepted |
 | Events | Blocking events speak; milestones (PR opened, CI green) only chime |
-| Speech in | Deepgram `nova-3` (`language=multi`) or OpenAI `gpt-4o-transcribe`, behind a swappable adapter (`whisper-cpp` is *planned*, not implemented) |
+| Speech in | Deepgram `nova-3` (`language=multi`) or OpenAI `gpt-4o-transcribe`, behind a swappable adapter (`whisper-cpp` and Deepgram streaming are *planned*, not implemented) |
+| Menus | Answer by number or keyword; "explicame la dos" reads the option's description. Multi-select takes "uno y tres" |
 | Speech out | macOS `say` — offline, no latency, no cost |
 | Summaries | `gpt-4o-mini` |
 
@@ -87,8 +89,10 @@ the silence cutoff for free.
 - Claude Code
 - An `OPENAI_API_KEY` for the summaries — optional; without one, announcements fall back to
   a fixed phrase instead of a summary
-- *Phase 2:* [`skhd`](https://github.com/koekeishiya/skhd) for the global hotkeys, and an API
-  key for your speech-to-text provider
+- `ffmpeg`, for the microphone — `brew install ffmpeg`
+- A `DEEPGRAM_API_KEY` (or `OPENAI_API_KEY`) for speech-to-text
+- [`skhd`](https://github.com/koekeishiya/skhd) for the global hotkeys — optional, installed by
+  `skhd/install-hotkeys.sh`. Without it the mic still opens after every announcement
 
 ## Install
 
@@ -115,11 +119,45 @@ Hooks are read when a session starts, so **open a new Claude window** to see it 
 that were already running keep their old hook set until you restart them.
 
 ```sh
-bin/voice-loopctl status     # is it up, what's queued
+bin/voice-loopctl status     # is it up, what's queued, is the mic live
+bin/voice-loopctl doctor     # can it reach the mic and iTerm2 — from both sides
 bin/voice-loopctl pendings   # everything still waiting on you
 bin/voice-loopctl skip       # drop the last announcement off the list
 bin/voice-loopctl pause      # silence without losing the queue
 ```
+
+### Hotkeys
+
+```sh
+./skhd/install-hotkeys.sh                            # the two defaults
+./skhd/install-hotkeys.sh --mic-key 'ctrl + alt - space'
+./skhd/install-hotkeys.sh --remove
+```
+
+| Key | What it does |
+|---|---|
+| `ctrl + alt + cmd - m` | Open the mic — or close one that is already open, which is how you send |
+| `ctrl + alt + cmd - b` | Busy mode: announcements chime instead of speaking, and stop opening the mic on their own |
+
+The block goes into `~/.config/skhd/skhdrc` between markers, so re-running updates it in place
+and `--remove` takes it back out; the rest of your file is never touched, and it is backed up
+first. skhd needs Accessibility permission the first time — macOS asks, and the keys do nothing
+until you grant it.
+
+### Permissions
+
+The microphone and iTerm2 Automation prompts are granted to the *responsible process*, and under
+launchd that is the agent, not your terminal. So the first `doctor` run matters:
+
+```sh
+bin/voice-loopctl doctor
+```
+
+It runs the checks locally — which is what makes macOS show you the two consent dialogs, since a
+LaunchAgent may never get the chance to — and then asks the daemon to run the same ones from
+where it lives. Two columns; the difference between them is the bug. A denied Automation prompt
+shows up as AppleScript error `-1743`, and a denied microphone as an ffmpeg capture with no
+samples in it.
 
 ### Why the daemon does not run from the clone
 
@@ -180,6 +218,53 @@ editing it is another reason to re-run the installer.
 | `VOICE_LOOP_ENV_FILE` | where the API keys are read from |
 | `VOICE_LOOP_PIP_INDEX_URL` | the package index `install.sh` uses (defaults to PyPI, ignoring your pip config — a stale token on a private index is not voice-loop's problem to inherit) |
 
+## Answering out loud
+
+The mic opens by itself after every announcement, and by hotkey whenever you want it. It is a
+**toggle**, not push-to-talk: it closes on its own after a beat of silence, or when you press
+the key again. Say nothing and the item simply stays in `pendings` — the queue moves on.
+
+| You say | What happens |
+|---|---|
+| anything at all | Typed into that window verbatim and submitted. Claude reads disfluent speech fine |
+| "dos", "la dos", "postgres" | Picks that option off the menu |
+| "uno y tres" | Both, on a multi-select menu |
+| "explicame la dos" | Reads you that option's description, mic stays open |
+| "repetí" | Says the announcement again |
+| "mostrame" | Focuses that tab. Nothing else ever moves your focus |
+| "salteá" / "después" | Leaves it pending and moves on |
+| "dale" / "no" | Confirms or cancels a read-back. Anywhere else it is just a word, and gets typed |
+
+**Read-backs.** A transcript the recognizer was unsure about, or one matching
+`delivery.confirm_if_matches`, is read back to you before it is sent. Say "dale" to send it, "no"
+to drop it, or just say something else — that replaces it.
+
+## How delivery works
+
+Free text is typed with `write text` and submitted with a separate carriage return. That is not
+belt-and-braces: `write text`'s own trailing newline submits a short prompt but **not** a long
+one — a 150-character reply lands in the input box and sits there. Verified on Claude Code
+2.1.220.
+
+Menus ignore typed text entirely, so the selector is driven with arrow keys, and the index always
+comes from the hook payload — never from what is on screen. The rendered menu has rows the
+payload does not (`Type something.`, `Chat about this`), and a plan menu renders four rows for a
+payload that carries none at all.
+
+| Case | Keystrokes |
+|---|---|
+| Option N | N-1 × `↓`, then `⏎` — the cursor starts on option 1 |
+| Multi-select | `space` on each option on the way down, then `→` onto the review tab and `⏎` |
+| Free text into a menu | Navigate to the text row *first*, then type — text typed on any other row is swallowed |
+
+A plan menu's rows belong to Claude, not to the payload, so they are the one thing that cannot be
+derived: `1` approve with auto mode, `2` approve reviewing each edit, `4` "Tell Claude what to
+change", which is where spoken feedback goes. If a future version of Claude Code reorders them,
+`delivery.plan_menu.feedback_index` is the escape hatch.
+
+Before anything is delivered, the session has to still exist — a window closed between the
+announcement and your answer must not have keystrokes delivered to whatever inherited its tty.
+
 ## How phase 1 behaves
 
 - A turn that ends while **background subagents are still running** is not announced. You have
@@ -216,6 +301,7 @@ socket. After changing anything the daemon runs, `./install.sh` again.
 - [x] Speech-to-text and summary models benchmarked on code-switched speech
 - [x] **Routing spike verified** — AppleScript `write text` delivers into Claude Code's
       fullscreen TUI as a real user turn, Enter included, without stealing focus
-- [x] Phase 1 — hooks, queue, TTS, summaries *(it talks to you; doesn't listen yet)*
-- [ ] Phase 2 — hotkeys, speech-to-text, delivery
-- [ ] Phase 3 — naming, pendings, busy mode, dictionaries
+- [x] Phase 1 — hooks, queue, TTS, summaries *(it talks to you)*
+- [x] Phase 2 — hotkeys, speech-to-text, delivery *(it listens, and answers the right window)*
+- [ ] Phase 3 — naming unnamed windows by voice, asking for pendings out loud, phonetic
+      dictionary, Deepgram streaming instead of the local silence cutoff

@@ -75,6 +75,32 @@ def store(tmp_path):
         yield opened
 
 
+class FakeSpeaker:
+    """Records what would have been said, in order, chimes included."""
+
+    voice = "system"
+
+    def __init__(self):
+        self.said: list = []
+        self.spoken: list[str] = []
+        self.chimes: list = []
+
+    async def announce(self, announcement):
+        self.said.append(announcement)
+
+    async def speak(self, text: str) -> bool:
+        self.spoken.append(text)
+        return True
+
+    async def chime(self, name) -> bool:
+        self.chimes.append(name)
+        return True
+
+    @property
+    def texts(self) -> list[str]:
+        return [item.text for item in self.said if not item.silent]
+
+
 def write_roster(directory: Path, **overrides) -> Path:
     """A roster entry for a session that is alive (this test process)."""
     directory.mkdir(parents=True, exist_ok=True)
