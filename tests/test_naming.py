@@ -52,3 +52,33 @@ def test_a_short_phrase_could_be_a_name(utterance):
 def test_a_sentence_is_not_a_name(utterance):
     """The mic is open on a window that is also waiting for an answer."""
     assert naming.is_plausible(utterance) is False
+
+
+# --- the name inside an answer ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spoken, expected",
+    [
+        ("llama la fecha actual", "fecha actual"),
+        ("llamala índice de migración", "indice de migracion"),
+        ("fecha actual", "fecha actual"),
+        ("ponele el de los hooks", "de los hooks"),
+    ],
+)
+def test_the_lead_in_is_not_part_of_the_name(spoken, expected):
+    assert naming.dictated(spoken) == expected
+
+
+@pytest.mark.parametrize(
+    "spoken",
+    [
+        "mergealo cuando pasen los tests",
+        "llamala cuando termine el deploy de staging",
+        "la",
+        "",
+    ],
+)
+def test_a_sentence_is_never_read_as_a_dictated_name(spoken):
+    """`slugify` would happily truncate this one into a four-word name."""
+    assert naming.dictated(spoken) == ""

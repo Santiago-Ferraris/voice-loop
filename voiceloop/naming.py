@@ -34,8 +34,8 @@ MAX_CHARS = 40
 LEADING_NOISE = frozenset(
     {
         "la", "el", "lo", "las", "los", "una", "un", "que", "se", "sea", "es",
-        "llamala", "llamalo", "llamale", "ponele", "poneme", "ponle", "decile",
-        "nombrala", "nombralo", "mejor", "aa", "eh", "este", "esta",
+        "llama", "llamala", "llamalo", "llamale", "ponele", "poneme", "ponle",
+        "decile", "nombrala", "nombralo", "mejor", "aa", "eh", "este", "esta",
     }
 )
 
@@ -49,6 +49,13 @@ def fold(text: str) -> str:
     return _NON_WORD.sub(" ", stripped.lower()).strip()
 
 
+def _words(text: str) -> list[str]:
+    words = [word for word in fold(text).split(" ") if word]
+    while words and words[0] in LEADING_NOISE:
+        words.pop(0)
+    return words
+
+
 def slugify(text: str) -> str:
     """A spoken name: lowercase words, no accents, no punctuation, at most four.
 
@@ -56,10 +63,22 @@ def slugify(text: str) -> str:
     say back, and `tests-event-processor` only becomes three words again by
     going through the hyphen rule in `announce`.
     """
-    words = [word for word in fold(text).split(" ") if word]
-    while words and words[0] in LEADING_NOISE:
-        words.pop(0)
-    return " ".join(words[:MAX_WORDS])[:MAX_CHARS].strip()
+    return " ".join(_words(text)[:MAX_WORDS])[:MAX_CHARS].strip()
+
+
+def dictated(text: str) -> str:
+    """The name inside an answer to the offer, or `""` when there is none.
+
+    `slugify` truncates, which is what makes it safe on a name and wrong on a
+    sentence: "mergealo cuando pasen los tests" comes back from it as a
+    perfectly plausible four-word name. So the cap is checked on what is left
+    once the lead-in is dropped — "llamala fecha actual" is two words and a
+    name, "mergealo cuando pasen los tests" is five and is not.
+    """
+    words = _words(text)
+    if not MIN_WORDS <= len(words) <= MAX_WORDS:
+        return ""
+    return " ".join(words)[:MAX_CHARS].strip()
 
 
 def is_plausible(text: str) -> bool:

@@ -57,6 +57,18 @@ CONFIRM_PHRASES = frozenset({
     "sip", "yes", "va",
 })
 
+# The first word of a yes, for the one place a yes can carry something after
+# it: the naming offer. "sí, llamala fecha actual" is an acceptance with the
+# answer attached, and whole-phrase matching cannot see that — it reads as a
+# sentence, which is how an acceptance ends up typed into somebody's window.
+# Only the unambiguous ones: "claro que no" and "listo, mandale eso" are not
+# yeses with a payload, and they are already whole phrases above.
+CONFIRM_LEAD = frozenset({
+    "si", "sisi", "sip", "dale", "ok", "oka", "okey", "okay",
+    "correcto", "confirmo", "confirmado", "exacto", "obvio", "perfecto",
+    "afirmativo", "yes",
+})
+
 CANCEL_PHRASES = frozenset({
     "no", "no no", "nop", "cancela", "cancelalo", "cancelala", "cancelar",
     "olvidalo", "olvidate", "nada", "negativo", "mejor no", "no gracias",
@@ -232,6 +244,25 @@ def _multi_selection(raw: str, labels: Sequence[str], keys: Mapping[str, int]) -
             return []
         found.append(index)
     return found
+
+
+def confirmation_tail(text: str) -> str | None:
+    """What a yes carried with it. `None` when the utterance is not a yes at all.
+
+    `""` is a bare confirmation. Anything else is what came after it — the name
+    the answer proposes, or a sentence that was meant for the window and got a
+    "dale" in front of it. The caller decides which, because only the caller
+    knows what was asked.
+    """
+    tokens = [
+        token for token in fold(text).split() if token not in ("por", "favor", "porfa")
+    ]
+    if not tokens or tokens[0] not in CONFIRM_LEAD:
+        return None
+    rest = tokens[1:]
+    while rest and rest[0] in CONFIRM_LEAD:
+        rest.pop(0)
+    return _phrase(rest)
 
 
 def parse(

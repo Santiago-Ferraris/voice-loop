@@ -253,3 +253,37 @@ def test_asking_how_things_are_going(said):
 def test_a_sentence_that_merely_mentions_pendings_is_still_dictation():
     """Control phrases are whole utterances; everything else is for the window."""
     assert parse("dejá los pendientes para mañana").kind == KIND_TEXT
+
+
+# --- a yes with something after it ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "said, tail",
+    [
+        ("sí", ""),
+        ("dale", ""),
+        ("sí, dale", ""),
+        ("dale por favor", ""),
+        ("sí llama la fecha actual", "llama la fecha actual"),
+        ("sí, llamala índice", "llamala indice"),
+        ("dale, índice de migración", "indice de migracion"),
+        ("ok, mergealo cuando pasen los tests", "mergealo cuando pasen los tests"),
+    ],
+)
+def test_a_leading_yes_hands_back_whatever_followed_it(said, tail):
+    assert intents.confirmation_tail(said) == tail
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "mergealo cuando pasen los tests",
+        "no",
+        "no, mejor usá el índice viejo",
+        "claro que no",
+        "",
+    ],
+)
+def test_an_utterance_that_does_not_start_with_a_yes_is_not_one(said):
+    assert intents.confirmation_tail(said) is None

@@ -291,10 +291,15 @@ such a window announces itself you hear:
 > event processor?"*
 
 - **"dale"** keeps that name. **A short phrase** — "índice de migración" — keeps yours instead.
-- **Anything longer** was meant for the window, not for the question: it goes straight through to
-  that window as your answer, rather than becoming a window called "mergealo cuando pasen los
-  tests". Silence goes through too, which ends the turn instead of opening a second mic on
-  somebody who is not there.
+- **A yes with the name attached** — "sí, llamala fecha actual", "dale, índice de migración" —
+  is read as the yes it is. That is how people accept an offer out loud, and the length rule on
+  its own reads it as a sentence: on the first real run it declined the name *and* typed the
+  acceptance into the window it was accepting for.
+- **Anything longer that does not start with a yes** was meant for the window, not for the
+  question: it goes straight through to that window as your answer, rather than becoming a window
+  called "mergealo cuando pasen los tests". Silence goes through too, which ends the turn instead
+  of opening a second mic on somebody who is not there. A yes with a sentence after it does both
+  — the offered name is kept and the sentence is delivered.
 - **"no" or silence is remembered.** You are not asked about that window again — being asked at
   every announcement is worse than `darwin-21`.
 
