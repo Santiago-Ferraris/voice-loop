@@ -492,6 +492,8 @@ class Daemon:
         tail = intents.confirmation_tail(transcript.text)
         if tail is not None:
             named = naming.dictated(tail) if tail else ""
+            if self._name_is_doubtful(named, tail, slug):
+                return await self._settle_doubtful_name(item, slug, named, transcript, tail)
             await self._save_name(item, named or slug)
             if tail and not named:
                 # The yes was real and what followed was not a name: it was the
@@ -516,6 +518,60 @@ class Daemon:
         # Silence included: handing it on ends the cycle at once instead of
         # opening a second mic on somebody who is not there.
         return transcript
+
+    @staticmethod
+    def _name_is_doubtful(named: str, tail: str, slug: str) -> bool:
+        """Is "dale, X" the name X, or a yes and then an answer for the window?
+
+        Only this band asks, and it is narrow on purpose — a read-back on
+        everything was rejected out loud. Three things have to be true at once:
+
+        * something short enough to be a name came after the yes (a whole
+          sentence is not a name, and is already handled);
+        * it is **not** the name that was just offered — "sí, llamala fecha
+          actual" against an offer of "fecha actual" is agreement, not news;
+        * it does **not** say it is a name — "llamala índice" left no doubt.
+        """
+        return bool(named) and named != slug and not naming.says_it_is_a_name(tail)
+
+    async def _settle_doubtful_name(
+        self, item: Item, slug: str, named: str, transcript: Transcript, tail: str
+    ) -> Transcript | None:
+        """Read the doubt back rather than pick a reading of it.
+
+        Both readings of "dale, mergealo" are ordinary Spanish, and guessing
+        costs something either way: one stores the window's answer as its name,
+        the other swallows the answer. So it is asked, in the same shape every
+        other read-back uses.
+
+        Whatever comes back, the offer is settled: "it is the name" saves it,
+        and everything else keeps the name that was offered — the yes was real
+        — differing only in what is handed on to the window. Nothing is typed
+        into anybody's session without an answer to this question.
+        """
+        gate = delivery_mod.Gate(
+            True, "No sé si eso era el nombre", "¿Es el nombre, o te lo mando a la ventana?"
+        )
+        await self.speaker.speak(self._readback_sentence(gate, named))
+        async with self._mic_lock:
+            answer = await self.listen()
+        if answer is None:
+            # The mic broke mid-question. Nothing is stored and nothing is
+            # sent: the offer comes back the next time this window blocks.
+            return None
+
+        choice = intents.name_or_window(answer.text)
+        if choice == intents.ANSWER_NAME:
+            await self._save_name(item, named)
+            return None
+
+        await self._save_name(item, slug)
+        if choice == intents.ANSWER_WINDOW:
+            # The phrase itself goes on, with the confidence it was heard with.
+            return dataclasses.replace(transcript, text=tail)
+        # Anything else replaces it, exactly as it would during a read-back —
+        # silence included, which ends the cycle without typing anything.
+        return answer
 
     async def _save_name(self, item: Item, slug: str) -> None:
         self.store.set_alias(item.session_id, slug, confirmed=True)
@@ -724,11 +780,7 @@ class Daemon:
             if gate.required:
                 pending_action = action
                 await self.speaker.speak(
-                    announce_mod.speakable(
-                        f"{gate.reason}. Dijiste: {self._readback(action, menu)}. "
-                        f"{gate.question}",
-                        self.phonetic,
-                    )
+                    self._readback_sentence(gate, self._readback(action, menu))
                 )
                 continue
             await self._perform(item, action)
@@ -762,6 +814,12 @@ class Daemon:
         if menu is not None:
             return ("menu_text", (menu.free_text_index, text)), gate
         return ("text", text), gate
+
+    def _readback_sentence(self, gate, said: str) -> str:
+        """One shape for every read-back: what I doubt, what I heard, what I ask."""
+        return announce_mod.speakable(
+            f"{gate.reason}. Dijiste: {said}. {gate.question}", self.phonetic
+        )
 
     def _readback(self, action, menu) -> str:
         kind, payload = action

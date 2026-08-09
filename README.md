@@ -305,10 +305,18 @@ such a window announces itself you hear:
 > event processor?"*
 
 - **"dale"** keeps that name. **A short phrase** — "índice de migración" — keeps yours instead.
-- **A yes with the name attached** — "sí, llamala fecha actual", "dale, índice de migración" —
-  is read as the yes it is. That is how people accept an offer out loud, and the length rule on
-  its own reads it as a sentence: on the first real run it declined the name *and* typed the
-  acceptance into the window it was accepting for.
+- **A yes with the name attached** — "sí, llamala fecha actual" — is read as the yes it is. That
+  is how people accept an offer out loud, and the length rule on its own reads it as a sentence:
+  on the first real run it declined the name *and* typed the acceptance into the window it was
+  accepting for.
+- **A yes and something short that could be either** — "dale, mergealo" — is asked about rather
+  than guessed: *"No sé si eso era el nombre. Dijiste: mergealo. ¿Es el nombre, o te lo mando a
+  la ventana?"* Both readings are ordinary Spanish and guessing costs something either way — one
+  stores the window's answer as its name, the other swallows the answer. Say "el nombre" (or
+  "sí") and it is the name; say "a la ventana" (or "no") and the offered name stands while the
+  phrase is delivered. This is the *only* band that asks: a bare yes, a yes repeating the name
+  that was offered, a phrase that says it is a name ("llamala índice"), a yes plus a whole
+  sentence, "no" and silence are all unambiguous and never ask you anything.
 - **Anything longer that does not start with a yes** was meant for the window, not for the
   question: it goes straight through to that window as your answer, rather than becoming a window
   called "mergealo cuando pasen los tests". Silence goes through too, which ends the turn instead
@@ -370,6 +378,12 @@ announcement and your answer must not have keystrokes delivered to whatever inhe
   free of the latency.
 - Milestones (a PR being created) only chime. If some other tool of yours already tracks a
   per-terminal phase in a file, point `integrations.milestone_file_watch` at it — off by default.
+- **The chime and the voice overlap on purpose.** A chime is an attack and then a tail that says
+  nothing — `Ping` rings for 1.5 s — and waiting for `afplay` to exit before starting `say` (which
+  takes ~0.5 s to open its mouth) put about two seconds of silence between the cue and the
+  sentence, every time. The voice now starts a quarter of a second in, under the tail. Two
+  *different* announcements never overlap: the lock is held across the pair, so the chime is also
+  waited out before the next item gets the speaker.
 
 ## Developing
 
