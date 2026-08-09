@@ -158,6 +158,27 @@ With both applied, Deepgram and OpenAI tied on accuracy across the test phrases.
 the default for its free credit, real streaming, and server-side endpointing, which supplies
 the silence cutoff for free.
 
+### A take is judged by what is in it, not by how it ended
+
+`silencedetect` only reports the silences it hears, so in a room whose floor never drops under
+`microphone.silence.noise_db` it reports nothing at all — no silence, therefore no speech —
+and every take ends on the timeout looking empty while holding a full sentence. Which is why
+running out of time is never on its own a reason to throw the audio away: before discarding a
+take, voice-loop measures the file, and anything holding a third of a second above the
+threshold goes to the recognizer regardless of how the mic closed.
+
+The log says which of the two happened, and at what level:
+
+```
+mic ran out of time with audio in it (closed by timeout, 8.3s, peak -10.4 dB, mean -31.3 dB, 1.7s above -40 dB)
+mic heard nothing (closed by timeout, 8.3s, peak -48.1 dB, mean -61.0 dB, 0.0s above -40 dB)
+```
+
+The first is normal — you were still talking when the window closed. The second is the only
+one that means what it says. If it shows up while you *are* talking, the levels in it are the
+answer: raise the input gain in **System Settings → Sound → Input** until your voice measures
+well above `noise_db`, and keep the room measurably under it.
+
 ## Requirements
 
 - macOS (uses `say`, AppleScript and iTerm2's scripting interface)

@@ -20,6 +20,11 @@ Three things the recorder has to get right:
 * **Saying nothing is a normal outcome.** The announce opens the mic whether
   you meant to answer or not. No speech inside `speech_timeout` is not an
   error: the item goes back to pending and the queue moves on.
+* **But running out of time is not the same as saying nothing.** In a room
+  whose floor never drops below `noise_db`, `silencedetect` never reports a
+  silence, so it never reports speech either, and every take ends on the
+  timeout looking empty while holding a full sentence. What a take holds is
+  decided by measuring the file (`measure`), never by how the take ended.
 
 Termination is SIGTERM, which makes ffmpeg finalize the WAV header before
 exiting — the file is playable, and its non-zero exit status is expected.
@@ -27,12 +32,16 @@ exiting — the file is playable, and its non-zero exit status is expected.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import contextlib
 import logging
+import math
 import re
 import shutil
+import sys
 import time
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
@@ -45,6 +54,15 @@ SAMPLE_RATE = 16_000
 
 # WAV header plus ~0.3 s of 16-bit mono at 16 kHz. Anything shorter is noise.
 MIN_USABLE_BYTES = 44 + int(SAMPLE_RATE * 2 * 0.3)
+
+FULL_SCALE = 32768.0
+# Nothing is reported quieter than this; digital silence has no dB value.
+SILENCE_FLOOR_DB = -120.0
+# Short enough that a single word lands inside a handful of windows.
+LEVEL_WINDOW_SECONDS = 0.03
+# How much audio above the threshold makes a take worth transcribing. Matched
+# to MIN_USABLE_BYTES: a third of a second is the shortest thing worth a word.
+MIN_SIGNAL_SECONDS = 0.3
 
 REASON_SILENCE = "silence"
 REASON_TOGGLE = "toggle"
@@ -79,20 +97,117 @@ class MicConsentPending(AudioUnavailable):
 
 
 @dataclass(frozen=True)
+class Level:
+    """What a take holds, measured off the file.
+
+    `loud_seconds` is the one that decides anything: how much of the take sat
+    above the same threshold `silencedetect` was given. Peak and mean are for
+    the log — they are what tells you afterwards whether the room was loud, the
+    input gain was low, or nobody said anything.
+    """
+
+    seconds: float
+    peak_db: float
+    mean_db: float
+    loud_seconds: float
+    noise_db: float
+
+    @property
+    def has_signal(self) -> bool:
+        return self.loud_seconds >= MIN_SIGNAL_SECONDS
+
+    def __str__(self) -> str:
+        return (
+            f"peak {self.peak_db:.1f} dB, mean {self.mean_db:.1f} dB, "
+            f"{self.loud_seconds:.1f}s above {self.noise_db:g} dB"
+        )
+
+
+def dbfs(amplitude: float) -> float:
+    """A 16-bit sample amplitude as dB below full scale, the way ffmpeg reports it."""
+    if amplitude <= 0:
+        return SILENCE_FLOOR_DB
+    return max(SILENCE_FLOOR_DB, 20 * math.log10(min(amplitude / FULL_SCALE, 1.0)))
+
+
+def measure(path: Path | str, *, noise_db: float = -35.0) -> Level | None:
+    """Read the captured WAV and report what is actually in it.
+
+    `silencedetect` only ever reports what it *stopped* hearing, so in a room
+    whose floor never dips under the threshold it reports nothing at all — no
+    `silence_end`, no speech, and a take full of voice that looks exactly like
+    an empty one. The file does not have that blind spot.
+
+    `None` means the audio could not be measured: missing, truncated, or not
+    the 16-bit PCM the recorder writes. Unknown is not silent, so callers fall
+    back to what ffmpeg told them instead of throwing the take away.
+    """
+    try:
+        with wave.open(str(path), "rb") as wav:
+            if wav.getsampwidth() != 2:
+                return None
+            rate = wav.getframerate() or SAMPLE_RATE
+            channels = max(1, wav.getnchannels())
+            raw = wav.readframes(wav.getnframes())
+    except (OSError, EOFError, ValueError, wave.Error):
+        return None
+
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) - len(raw) % samples.itemsize])
+    if sys.byteorder == "big":
+        # WAV is little-endian; `array` is native.
+        samples.byteswap()
+
+    per_second = max(1, int(rate) * channels)
+    window = max(1, int(per_second * LEVEL_WINDOW_SECONDS))
+    peak = 0
+    squares = 0
+    loud = 0
+    for start in range(0, len(samples), window):
+        chunk = samples[start : start + window]
+        chunk_squares = sum(value * value for value in chunk)
+        squares += chunk_squares
+        peak = max(peak, max(chunk), -min(chunk))
+        if dbfs(math.sqrt(chunk_squares / len(chunk))) >= noise_db:
+            loud += len(chunk)
+    mean = math.sqrt(squares / len(samples)) if samples else 0.0
+    return Level(
+        seconds=len(samples) / per_second,
+        peak_db=dbfs(peak),
+        mean_db=dbfs(mean),
+        loud_seconds=loud / per_second,
+        noise_db=noise_db,
+    )
+
+
+@dataclass(frozen=True)
 class Recording:
     path: Path
     seconds: float
     spoke: bool
     reason: str
+    level: Level | None = None
 
     @property
     def usable(self) -> bool:
-        if not self.spoke:
-            return False
         try:
-            return self.path.stat().st_size >= MIN_USABLE_BYTES
+            if self.path.stat().st_size < MIN_USABLE_BYTES:
+                return False
         except OSError:
             return False
+        if self.spoke:
+            return True
+        # `spoke` is what `silencedetect` inferred, and how the take ended is
+        # not evidence about what is in it: a take that ran out of time is a
+        # listening window that closed, not a person who said nothing. Only the
+        # audio can say that, so ask the audio before throwing it away.
+        return self.level is not None and self.level.has_signal
+
+    @property
+    def summary(self) -> str:
+        """One line for the log: how the take ended, and what was in it."""
+        detail = "" if self.level is None else f", {self.level}"
+        return f"closed by {self.reason}, {self.seconds:.1f}s{detail}"
 
 
 class SilenceTracker:
@@ -333,7 +448,13 @@ class Recorder:
         if reason == REASON_TOGGLE:
             # You pressed the key to stop: assume you meant to say something.
             spoke = True
-        return Recording(path=path, seconds=seconds, spoke=spoke, reason=reason)
+        # Always, whatever ffmpeg thought it heard: the measurement is what
+        # rescues a take the filter never noticed, and what the log needs to
+        # make a discarded one explainable instead of just "nothing".
+        level = await asyncio.to_thread(measure, path, noise_db=self.noise_db)
+        return Recording(
+            path=path, seconds=seconds, spoke=spoke, reason=reason, level=level
+        )
 
     async def _wait_for_end(
         self,

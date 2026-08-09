@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from voiceloop.audio import Recording
+from voiceloop.audio import Level, Recording
 from voiceloop.daemon import Daemon
 from voiceloop.milestones import MilestoneWatcher
 from voiceloop.store import Store
@@ -252,9 +252,18 @@ class StubRecorder:
     device = ":0"
     available = True
 
-    def __init__(self, *, spoke: bool = True, error: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        spoke: bool = True,
+        error: Exception | None = None,
+        reason: str = "silence",
+        level: Level | None = None,
+    ):
         self.spoke = spoke
         self.error = error
+        self.reason = reason
+        self.level = level
         self.takes = 0
         # How long each take was given, in order. A mic that opened under a
         # sentence gets the grace; one that opened on its own gets the timeout.
@@ -285,7 +294,13 @@ class StubRecorder:
         path.write_bytes(b"\0" * 200_000)
         if on_open is not None:
             await on_open()
-        return Recording(path=path, seconds=1.0, spoke=self.spoke, reason="silence")
+        return Recording(
+            path=path,
+            seconds=1.0,
+            spoke=self.spoke,
+            reason=self.reason,
+            level=self.level,
+        )
 
 
 class TimedRecorder(StubRecorder):

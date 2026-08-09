@@ -55,7 +55,10 @@ microphone:
   keep_recordings: false
   silence:
     enabled: true
-    # Anything quieter than this counts as silence…
+    # Anything quieter than this counts as silence — for the cutoff that ends
+    # a take, and for deciding whether a take that ran out of time has anything
+    # in it worth transcribing. Set it between your room and your voice: the
+    # log prints both levels on every take that closes on the timeout.
     noise_db: -35
     # …and this much of it, after you have started talking, closes the mic.
     min_seconds: 1.2

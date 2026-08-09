@@ -9,9 +9,10 @@ gate and the real keystroke builders — with nothing but the two ends faked.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from voiceloop.announce import Announcement
-from voiceloop.audio import AudioUnavailable, MicConsentPending
+from voiceloop.audio import AudioUnavailable, Level, MicConsentPending
 from voiceloop.daemon import REPLY_DELIVERED, REPLY_FAILED, REPLY_PENDING, Daemon
 from voiceloop.events import Event
 from voiceloop.store import (
@@ -485,6 +486,85 @@ def test_recordings_can_be_kept_for_debugging(build, config):
     answer(daemon, item)
 
     assert len(list((config.state_dir / "mic").glob("*.wav"))) == 1
+
+
+# --- a take that ran out of time is not an empty take -----------------------
+
+
+HEARD = Level(seconds=8.3, peak_db=-10.4, mean_db=-31.3, loud_seconds=3.4, noise_db=-40)
+NOTHING = Level(seconds=8.3, peak_db=-33.9, mean_db=-48.9, loud_seconds=0.0, noise_db=-40)
+
+
+def test_a_take_that_only_ran_out_of_time_is_still_transcribed(build):
+    """The mic was never deaf: it heard the sentence and the daemon binned it.
+
+    With the room floor above the threshold `silencedetect` never reports a
+    silence, so it never reports speech either, and every single take ends on
+    the timeout with `spoke` false — while the file holds eight seconds of
+    voice that Deepgram reads back at 0.996.
+    """
+    daemon = build(
+        ["mergealo"], recorder=StubRecorder(spoke=False, reason="timeout", level=HEARD)
+    )
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert len(daemon.stt.calls) == 1
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_a_take_with_nothing_in_it_never_reaches_the_recognizer(build):
+    """The one legitimate reason to discard: measured silence, not the clock."""
+    daemon = build(
+        ["mergealo"], recorder=StubRecorder(spoke=False, reason="timeout", level=NOTHING)
+    )
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_PENDING
+    assert daemon.stt.calls == []
+    assert daemon.delivery.sent == []
+
+
+def test_an_unmeasurable_take_that_ffmpeg_heard_nothing_in_is_still_discarded(build):
+    """No measurement, no second opinion: what ffmpeg said stands."""
+    daemon = build(["mergealo"], recorder=StubRecorder(spoke=False, reason="timeout"))
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_PENDING
+    assert daemon.stt.calls == []
+
+
+def test_running_out_of_time_and_hearing_nothing_read_differently_in_the_log(build, caplog):
+    """Both used to log "mic heard nothing"; only one of them ever meant it."""
+    timed_out = build(
+        ["mergealo"], recorder=StubRecorder(spoke=False, reason="timeout", level=HEARD)
+    )
+    empty = build(
+        [], recorder=StubRecorder(spoke=False, reason="timeout", level=NOTHING)
+    )
+
+    with caplog.at_level(logging.INFO, logger="voiceloop"):
+        answer(timed_out, queue(timed_out, kind="stop"))
+        kept = [line for line in caplog.messages if "ran out of time" in line]
+        caplog.clear()
+        answer(empty, queue(empty, kind="stop"))
+        discarded = [line for line in caplog.messages if "heard nothing" in line]
+
+    assert kept == ["mic ran out of time with audio in it (closed by timeout, 1.0s, "
+                    "peak -10.4 dB, mean -31.3 dB, 3.4s above -40 dB)"]
+    assert discarded == ["mic heard nothing (closed by timeout, 1.0s, "
+                         "peak -33.9 dB, mean -48.9 dB, 0.0s above -40 dB)"]
+
+
+def test_a_take_cut_off_by_silence_is_transcribed_the_way_it_always_was(build, caplog):
+    daemon = build(["mergealo"], recorder=StubRecorder(spoke=True, reason="silence"))
+    item = queue(daemon, kind="stop")
+
+    with caplog.at_level(logging.INFO, logger="voiceloop"):
+        assert answer(daemon, item) == REPLY_DELIVERED
+
+    assert len(daemon.stt.calls) == 1
+    assert not any("ran out of time" in line for line in caplog.messages)
 
 
 # --- what the recognizer is told exists ------------------------------------

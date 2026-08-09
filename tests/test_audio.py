@@ -7,13 +7,20 @@ cutoff logic is exercised for real while the suite stays offline and silent.
 
 from __future__ import annotations
 
+import array
 import asyncio
+import math
+import random
+import wave
+from pathlib import Path
 
 import pytest
 
 from voiceloop import audio
 from voiceloop.audio import (
+    FULL_SCALE,
     AudioUnavailable,
+    Level,
     MicConsentPending,
     Recorder,
     Recording,
@@ -22,6 +29,61 @@ from voiceloop.audio import (
 
 OPEN_LINE = "Output #0, wav, to 'reply.wav':"
 PROGRESS = "size=      12KiB time=00:00:00.50 bitrate= 197.2kbits/s speed=0.993x"
+
+
+# --- audio to measure ------------------------------------------------------
+
+
+def write_wav(path: Path, samples, *, rate: int = audio.SAMPLE_RATE) -> Path:
+    """The 16-bit mono WAV the recorder asks ffmpeg for."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(samples.tobytes())
+    return path
+
+
+def tone(seconds: float, *, rms_db: float, rate: int = audio.SAMPLE_RATE):
+    """A steady note at a known level — a stand-in for a phrase."""
+    peak = FULL_SCALE * math.sqrt(2) * 10 ** (rms_db / 20)
+    return array.array(
+        "h",
+        (
+            int(peak * math.sin(2 * math.pi * 220 * n / rate))
+            for n in range(int(seconds * rate))
+        ),
+    )
+
+
+def hiss(seconds: float, *, rms_db: float, rate: int = audio.SAMPLE_RATE, seed: int = 7):
+    """The room: quiet, but never actually zero."""
+    spread = FULL_SCALE * math.sqrt(3) * 10 ** (rms_db / 20)
+    rng = random.Random(seed)
+    return array.array(
+        "h", (int(rng.uniform(-spread, spread)) for _ in range(int(seconds * rate)))
+    )
+
+
+def silence(seconds: float, *, rate: int = audio.SAMPLE_RATE):
+    return array.array("h", bytes(int(seconds * rate) * 2))
+
+
+def speech(seconds: float = 8.0, *, voice_db: float = -28.0, room_db: float = -49.0):
+    """A take shaped like somebody talking: phrases, and the room between them.
+
+    It measures about -31 dB mean overall — the level of the take that started
+    all this. Deepgram read it back at 0.996 confidence; the daemon threw it
+    away because the room never went quiet enough for `silencedetect` to notice
+    anything at all.
+    """
+    frames = array.array("h")
+    while len(frames) < seconds * audio.SAMPLE_RATE:
+        frames += tone(0.4, rms_db=voice_db)
+        frames += hiss(0.4, rms_db=room_db)
+    del frames[int(seconds * audio.SAMPLE_RATE) :]
+    return frames
 
 
 def silence_start(at: float) -> str:
@@ -70,10 +132,13 @@ class FakeProcess:
         return self.returncode or 0
 
 
-def recorder(lines, *, separator: str = "\n", **kwargs) -> tuple[Recorder, list]:
+def recorder(lines, *, separator: str = "\n", take=None, **kwargs) -> tuple[Recorder, list]:
+    """`take`, when given, is the audio this fake ffmpeg leaves on disk."""
     spawned: list = []
 
     async def spawn(argv):
+        if take is not None:
+            write_wav(Path(argv[-1]), take)
         process = FakeProcess(lines, separator)
         spawned.append((list(argv), process))
         return process
@@ -310,6 +375,124 @@ def test_a_recording_with_audio_in_it_is_usable(tmp_path):
     path.write_bytes(b"\0" * (audio.MIN_USABLE_BYTES + 1))
 
     assert Recording(path=path, seconds=2.0, spoke=True, reason="silence").usable is True
+
+
+# --- what the take holds, which is not how it ended -------------------------
+
+
+def test_the_level_of_a_take_is_measured_off_the_file(tmp_path):
+    path = write_wav(tmp_path / "r.wav", speech(4.0))
+
+    level = audio.measure(path, noise_db=-40)
+
+    assert level.seconds == pytest.approx(4.0, abs=0.05)
+    assert level.mean_db == pytest.approx(-31.3, abs=1.5)
+    assert level.loud_seconds > 1.0
+    assert level.has_signal is True
+
+
+def test_digital_silence_is_reported_as_silence(tmp_path):
+    path = write_wav(tmp_path / "r.wav", silence(4.0))
+
+    level = audio.measure(path, noise_db=-40)
+
+    assert level.peak_db == audio.SILENCE_FLOOR_DB
+    assert level.loud_seconds == 0
+    assert level.has_signal is False
+
+
+def test_a_room_under_the_threshold_is_not_signal(tmp_path):
+    """-49 dB of room against a -40 dB threshold is what "nothing" sounds like."""
+    path = write_wav(tmp_path / "r.wav", hiss(4.0, rms_db=-49))
+
+    assert audio.measure(path, noise_db=-40).has_signal is False
+
+
+def test_the_take_is_measured_against_the_configured_threshold(tmp_path):
+    path = write_wav(tmp_path / "r.wav", tone(2.0, rms_db=-45))
+
+    assert audio.measure(path, noise_db=-40).has_signal is False
+    assert audio.measure(path, noise_db=-50).has_signal is True
+
+
+def test_a_third_of_a_second_of_sound_is_enough_to_be_worth_transcribing():
+    below = Level(seconds=8, peak_db=-10, mean_db=-31, loud_seconds=0.29, noise_db=-40)
+    above = Level(seconds=8, peak_db=-10, mean_db=-31, loud_seconds=0.31, noise_db=-40)
+
+    assert below.has_signal is False
+    assert above.has_signal is True
+
+
+def test_audio_that_cannot_be_measured_is_never_called_silent(tmp_path):
+    """Unknown is not empty, so the caller is left with ffmpeg's word for it."""
+    unreadable = tmp_path / "r.wav"
+    unreadable.write_bytes(b"\0" * 100_000)
+
+    assert audio.measure(unreadable) is None
+    assert audio.measure(tmp_path / "never-written.wav") is None
+
+
+def test_a_take_that_ran_out_of_time_with_a_voice_in_it_is_kept(tmp_path):
+    """The bug, in one test.
+
+    With a room floor above the threshold, `silencedetect` reports no silence —
+    and therefore no speech either — so every take ends on the timeout looking
+    empty. This one holds eight seconds of "River perdió seis partidos
+    seguidos", which Deepgram read back at 0.996 confidence after the daemon
+    had already thrown it away.
+    """
+    subject, _ = recorder([OPEN_LINE], noise_db=-40, take=speech(2.0))
+
+    recording = run(subject, tmp_path / "r.wav")
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    assert recording.spoke is False  # ffmpeg never noticed a thing
+    assert recording.usable is True  # the audio says otherwise, and it wins
+
+
+def test_a_take_that_ran_out_of_time_in_silence_is_still_discarded(tmp_path):
+    subject, _ = recorder([OPEN_LINE], noise_db=-40, take=silence(2.0))
+
+    recording = run(subject, tmp_path / "r.wav")
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    assert recording.level.has_signal is False
+    assert recording.usable is False
+
+
+def test_a_take_cut_off_by_silence_is_measured_too(tmp_path):
+    """However it ended, the level is on the recording — the log needs it."""
+    subject, _ = recorder(
+        [OPEN_LINE, silence_end(1.0), silence_start(2.5)], noise_db=-40, take=speech(2.0)
+    )
+
+    recording = run(subject, tmp_path / "r.wav")
+
+    assert recording.reason == audio.REASON_SILENCE
+    assert recording.spoke is True
+    assert recording.usable is True
+    assert recording.level.mean_db > -40
+
+
+def test_the_summary_says_how_the_take_ended_and_what_was_in_it(tmp_path):
+    level = audio.measure(write_wav(tmp_path / "r.wav", speech(2.0)), noise_db=-40)
+    ended = dict(path=tmp_path / "r.wav", level=level)
+
+    timed_out = Recording(seconds=8.0, spoke=False, reason=audio.REASON_TIMEOUT, **ended)
+    cut = Recording(seconds=3.0, spoke=True, reason=audio.REASON_SILENCE, **ended)
+
+    assert timed_out.summary.startswith("closed by timeout, 8.0s, ")
+    assert cut.summary.startswith("closed by silence, 3.0s, ")
+    assert "peak" in timed_out.summary and "mean" in timed_out.summary
+    assert "above -40 dB" in timed_out.summary
+
+
+def test_an_unmeasurable_take_falls_back_to_what_ffmpeg_said(tmp_path):
+    path = tmp_path / "r.wav"
+    path.write_bytes(b"\0" * (audio.MIN_USABLE_BYTES + 1))
+
+    assert Recording(path=path, seconds=2.0, spoke=False, reason="timeout").usable is False
+    assert Recording(path=path, seconds=2.0, spoke=True, reason="timeout").usable is True
 
 
 # --- the mic that is already open while we are talking ----------------------
