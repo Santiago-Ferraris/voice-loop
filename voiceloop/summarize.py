@@ -18,7 +18,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from .naming import slugify
+from .naming import fold, slugify
 
 API_URL = "https://api.openai.com/v1/chat/completions"
 
@@ -29,7 +29,10 @@ SYSTEM_PROMPT = (
     "esperando de la persona una sesión de Claude Code, a partir de su último mensaje. "
     "Lo va a leer un sintetizador de voz: sin markdown, sin comillas, sin rutas de "
     "archivo, sin código y sin emojis. Si el mensaje termina en una pregunta, resumí "
-    "la pregunta. No agregues preámbulo."
+    "la pregunta. Si no pregunta nada, contá qué hizo la sesión: terminó de listar los "
+    "archivos, corrió los tests y pasaron, aplicó la migración. Nunca describas la "
+    "ausencia de una pregunta: decir que no hay pregunta, que no hay expectativa o que "
+    "no espera nada no le dice a nadie qué pasó en esa ventana. No agregues preámbulo."
 )
 
 # The same request, asked for one field more. A window's name and the summary of
@@ -47,6 +50,20 @@ NAMING_PROMPT = (
 Transport = Callable[[str, dict, bytes, float], bytes]
 
 _WHITESPACE = re.compile(r"\s+")
+
+# "No hay expectativa de la persona en este mensaje" — what came back on the
+# first real run for a turn that had simply finished doing something. It is a
+# comment on the prompt, not a summary: it says nothing about what the window
+# did, which is the one thing the announcement exists to say.
+_ABOUT_NOTHING = re.compile(
+    r"^(?:"
+    r"no (?:hay|tiene|existe|se plantea|aparece) (?:ninguna |ningun |nada )?"
+    r"(?:pregunta|expectativa|consulta|duda|solicitud|peticion|requerimiento)"
+    r"|no (?:pregunta|espera|pide|solicita|requiere|necesita) nada"
+    r"|(?:el mensaje|el ultimo mensaje|la sesion|esta sesion) no "
+    r"(?:pregunta|espera|pide|requiere|plantea)"
+    r")"
+)
 
 
 class SummaryUnavailable(Exception):
@@ -75,6 +92,11 @@ def clean(text: str, max_words: int) -> str:
     if max_words > 0 and len(words) > max_words:
         flat = " ".join(words[:max_words])
     return flat.strip().rstrip(".")
+
+
+def describes_no_question(text: str) -> bool:
+    """Is this a summary of the turn, or a remark about there not being a question?"""
+    return bool(_ABOUT_NOTHING.match(fold(text)))
 
 
 @dataclass
@@ -131,11 +153,16 @@ class Summarizer:
             raise SummaryUnavailable(f"unexpected response: {exc}") from exc
         return content if isinstance(content, str) else ""
 
-    def _call(self, text: str) -> str:
-        summary = clean(self._content(text), self.max_words)
+    def _usable(self, summary: str) -> str:
+        """One retry, then the fallback — for both ways a summary can be no summary."""
         if not summary:
             raise SummaryUnavailable("empty summary")
+        if describes_no_question(summary):
+            raise SummaryUnavailable(f"no summary, just the lack of a question: {summary!r}")
         return summary
+
+    def _call(self, text: str) -> str:
+        return self._usable(clean(self._content(text), self.max_words))
 
     def _call_named(self, text: str) -> Summary:
         """The summary and a proposed window name, from one request."""
@@ -145,9 +172,7 @@ class Summarizer:
             raise SummaryUnavailable(f"not JSON: {exc}") from exc
         if not isinstance(fields, dict):
             raise SummaryUnavailable("expected a JSON object")
-        summary = clean(str(fields.get("summary") or ""), self.max_words)
-        if not summary:
-            raise SummaryUnavailable("empty summary")
+        summary = self._usable(clean(str(fields.get("summary") or ""), self.max_words))
         # A bad name is not worth a retry — the summary is the part the
         # announcement cannot do without, and no slug just means no offer.
         return Summary(text=summary, slug=slugify(str(fields.get("slug") or "")))

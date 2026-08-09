@@ -145,7 +145,7 @@ def test_the_summary_is_stored_so_a_replay_does_not_pay_twice(daemon, tmp_path):
     assert len(daemon.speaker.texts) == 2
 
 
-def test_the_queue_is_announced_in_order_with_a_countdown(daemon, tmp_path):
+def test_the_queue_is_announced_in_order_and_never_counts_down_up_front(daemon, tmp_path):
     for index, name in enumerate(("alpha", "beta", "gamma")):
         write_roster(daemon.roster_path, sessionId=name, name=name)
         daemon.store.ingest(
@@ -159,8 +159,8 @@ def test_the_queue_is_announced_in_order_with_a_countdown(daemon, tmp_path):
     asyncio.run(drain())
 
     assert daemon.speaker.texts == [
-        "alpha: quiere que revises el diff. Quedan 2.",
-        "beta: quiere que revises el diff. Queda uno.",
+        "alpha: quiere que revises el diff.",
+        "beta: quiere que revises el diff.",
         "gamma: quiere que revises el diff.",
     ]
 

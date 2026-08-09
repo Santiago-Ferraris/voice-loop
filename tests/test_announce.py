@@ -50,25 +50,28 @@ def test_several_left_is_plural(count, expected):
 
 
 def test_an_empty_queue_ends_the_announcement_cleanly():
-    result = announce.build(item(), name="migration", summary="terminó el backfill", remaining=0)
+    result = announce.build(item(), name="migration", summary="terminó el backfill")
 
     assert result.text == "migration: terminó el backfill."
 
 
-def test_the_queue_tail_is_appended():
-    result = announce.build(item(), name="migration", summary="terminó el backfill", remaining=3)
+def test_the_countdown_is_never_part_of_the_announcement():
+    """It belongs to the end of the cycle: you answer, *then* you hear what is left.
 
-    assert result.text == "migration: terminó el backfill. Quedan 3."
+    In the announcement of a window being offered a name it landed between the
+    summary and the question — "…Queda uno. ¿La llamo fecha actual?" — which is
+    what made the user ask which one was left.
+    """
+    result = announce.build(
+        item(), name="migration", summary="terminó el backfill", naming_offer="indice viejo"
+    )
 
-
-def test_one_remaining_reads_as_a_word():
-    result = announce.build(item(), name="migration", summary="listo", remaining=1)
-
-    assert result.text.endswith("Queda uno.")
+    assert result.text == "migration: terminó el backfill. ¿La llamo indice viejo?"
+    assert "Queda" not in result.text
 
 
 def test_a_stop_without_a_summary_uses_the_fallback_phrase():
-    result = announce.build(item(), name="migration", summary=None, remaining=0)
+    result = announce.build(item(), name="migration", summary=None)
 
     assert result.text == "migration: terminó y te espera."
 
@@ -89,11 +92,46 @@ def test_menu_options_are_enumerated_as_words():
         },
     }
 
-    result = announce.build(item("menu", **payload), name="indice", remaining=0)
+    result = announce.build(item("menu", **payload), name="indice")
 
     assert result.text == (
         "indice: ¿Qué base uso? Opciones: uno: SQLite, dos: Postgres, tres: Ninguna."
     )
+
+
+@pytest.mark.parametrize(
+    "label, spoken",
+    [
+        ("Probalo sin hotkeys primero (Recomendado)", "Probalo sin hotkeys primero"),
+        ("Actualizar Command Line Tools", "Actualizar Command Line Tools"),
+        ("Postgres — ya corre en staging", "Postgres"),
+        ("Migrar [beta] ahora", "Migrar ahora"),
+        ("Adaptar a Hammerspoon; es lo más rápido", "Adaptar a Hammerspoon"),
+        ("Migrar la base de datos vieja a Postgres", "Migrar la base de datos"),
+        ("(Recomendado)", "(Recomendado)"),
+        ("", ""),
+    ],
+)
+def test_a_label_is_shortened_before_it_is_spoken(label, spoken):
+    assert announce.short_label(label) == spoken
+
+
+def test_four_options_are_read_short_not_whole():
+    """The live case: twenty-five seconds of audio for a five-second decision."""
+    labels = [
+        "Probalo sin hotkeys primero (Recomendado)",
+        "Actualizar Command Line Tools",
+        "Adaptar a Hammerspoon",
+        "Adaptar a Shortcuts de macOS",
+    ]
+
+    spoken = announce.enumerate_options(labels)
+
+    assert spoken == (
+        "Opciones: uno: Probalo sin hotkeys primero, dos: Actualizar Command Line Tools, "
+        "tres: Adaptar a Hammerspoon, cuatro: Adaptar a Shortcuts de macOS"
+    )
+    assert "Recomendado" not in spoken
 
 
 def test_option_numbers_beyond_ten_fall_back_to_digits():
@@ -104,7 +142,7 @@ def test_option_numbers_beyond_ten_fall_back_to_digits():
 def test_a_menu_without_options_still_reads_the_question():
     payload = {"tool_input": {"questions": [{"question": "¿Seguimos?"}]}}
 
-    result = announce.build(item("menu", **payload), name="indice", remaining=0)
+    result = announce.build(item("menu", **payload), name="indice")
 
     assert result.text == "indice: ¿Seguimos?"
 
@@ -120,7 +158,7 @@ def test_extra_questions_are_flagged_not_read():
         }
     }
 
-    text = announce.build(item("menu", **payload), name="x", remaining=0).text
+    text = announce.build(item("menu", **payload), name="x").text
 
     assert "Primera" in text
     assert "Segunda" not in text
@@ -274,7 +312,7 @@ def test_hyphens_inside_names_become_spaces():
 
 
 def test_hyphens_are_stripped_in_the_announced_name():
-    result = announce.build(item(), name="draft-mode-changes", summary="listo", remaining=0)
+    result = announce.build(item(), name="draft-mode-changes", summary="listo")
 
     assert result.text == "draft mode changes: listo."
 
@@ -301,16 +339,16 @@ def test_speakable_collapses_newlines_and_whitespace():
 
 def test_the_summary_goes_through_the_phonetic_dictionary():
     result = announce.build(
-        item(), name="x", summary="quiere hacer merge", phonetic=PHONETIC, remaining=0
+        item(), name="x", summary="quiere hacer merge", phonetic=PHONETIC
     )
 
     assert result.text == "x: quiere hacer merch."
 
 
 def test_a_trailing_period_in_the_summary_is_not_doubled():
-    result = announce.build(item(), name="x", summary="listo.", remaining=2)
+    result = announce.build(item(), name="x", summary="listo.", naming_offer="el del backfill")
 
-    assert result.text == "x: listo. Quedan 2."
+    assert result.text == "x: listo. ¿La llamo el del backfill?"
 
 
 # --- the queue, read out loud ----------------------------------------------

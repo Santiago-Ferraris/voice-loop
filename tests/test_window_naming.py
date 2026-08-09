@@ -186,6 +186,45 @@ def test_dale_saves_the_proposed_name(build, tmp_path):
     assert any("Listo, tests event processor." in said for said in daemon.speaker.spoken)
 
 
+def test_a_yes_that_repeats_the_name_back_is_still_a_yes(build, tmp_path):
+    """The first real run: the offer was accepted and the acceptance was typed.
+
+    "sí llama la fecha actual" (verbatim from the log) is five words, so the
+    length rule read it as a sentence, declined the name, and delivered the
+    acceptance into the window it was accepting for.
+    """
+    daemon = build(
+        ["sí llama la fecha actual", "mergealo"],
+        summarizer=NamingSummarizer(slug="fecha actual"),
+    )
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == "fecha actual"
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_a_yes_carrying_a_different_name_uses_that_one(build, tmp_path):
+    daemon = build(["dale, llamala índice de migración", "mergealo"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == "indice de migracion"
+
+
+def test_a_yes_with_a_sentence_after_it_names_and_answers_the_window(build, tmp_path):
+    """Nothing anybody said is thrown away: the yes names, the rest goes through."""
+    daemon = build(["dale, mergealo cuando pasen los tests"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == SLUG
+    assert daemon.delivery.sent == [("text", TTY, "mergealo cuando pasen los tests")]
+
+
 def test_a_name_you_dictate_wins_over_the_one_offered(build, tmp_path):
     daemon = build(["mejor, índice de migración", "mergealo"])
     queue_stop(daemon, tmp_path)

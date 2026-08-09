@@ -12,6 +12,7 @@ from voiceloop.summarize import (
     Summary,
     SummaryUnavailable,
     clean,
+    describes_no_question,
 )
 
 TAIL = "Terminé la migración del índice. ¿La aplico también en staging?"
@@ -63,6 +64,60 @@ def test_the_request_carries_model_prompt_and_tail():
     system, user = call["body"]["messages"]
     assert system["role"] == "system" and "9 palabras" in system["content"]
     assert user == {"role": "user", "content": TAIL}
+
+
+def test_the_prompt_asks_for_what_the_turn_did_when_it_asks_nothing():
+    """The live failure: "No hay expectativa de la persona en este mensaje."."""
+    transport = Recorder()
+
+    make(transport).summarize(TAIL)
+
+    prompt = transport.calls[0]["body"]["messages"][0]["content"]
+    assert "Si no pregunta nada, contá qué hizo la sesión" in prompt
+    assert "Nunca describas la ausencia de una pregunta" in prompt
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "No hay expectativa de la persona en este mensaje",
+        "no hay ninguna pregunta",
+        "No hay ninguna consulta pendiente",
+        "El mensaje no pregunta nada",
+        "no espera nada de la persona",
+        "La sesión no espera una respuesta",
+    ],
+)
+def test_a_remark_about_there_being_no_question_is_not_a_summary(said):
+    assert describes_no_question(said) is True
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "terminó de listar los archivos del worker",
+        "corrió los tests y pasaron todos",
+        "no pudo aplicar la migración, pregunta si sigue igual",
+        "no hay tests para el índice nuevo, quiere escribirlos",
+        "",
+    ],
+)
+def test_a_summary_that_merely_starts_with_no_is_left_alone(said):
+    assert describes_no_question(said) is False
+
+
+def test_a_summary_of_nothing_is_retried_and_then_given_up_on():
+    """Better "terminó y te espera" than a remark about the prompt."""
+    transport = Recorder(reply("No hay expectativa de la persona en este mensaje."))
+
+    assert make(transport).summarize(TAIL) == FALLBACK_SUMMARY
+    assert len(transport.calls) == 2
+
+
+def test_the_same_goes_for_the_call_that_also_names_the_window():
+    transport = Recorder(named("No hay ninguna pregunta en el mensaje", "indice viejo"))
+
+    assert make(transport).summarize_and_name(TAIL) == Summary(text=FALLBACK_SUMMARY)
 
 
 def test_the_configured_timeout_is_passed_to_the_transport():

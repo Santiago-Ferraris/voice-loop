@@ -10,7 +10,7 @@ voice-loop closes that gap without a GUI:
 2. You hear its **name** and a one-sentence summary of what it wants.
 3. The mic opens. You answer out loud.
 4. Your reply is typed into **that** window — not the focused one — and submitted.
-5. *"Quedan 2."* Next in the queue.
+5. *"Quedan 2."* — once your answer is in, not before it. Next in the queue.
 
 Nothing steals your focus. Requests are answered one at a time, in order, and anything you
 skip stays reachable — ask for your pendings whenever you want.
@@ -267,12 +267,26 @@ the key again. Say nothing and the item simply stays in `pendings` — the queue
 | "mostrame" | Focuses that tab. Nothing else ever moves your focus |
 | "salteá" / "después" | Leaves it pending and moves on |
 | "dale" / "no" | Confirms or cancels a read-back. Anywhere else it is just a word, and gets typed |
-| "dame los pendientes" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
+| "dame los pendientes" / "cuál queda" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
 | "estado" / "cómo venimos" | Windows open, how many are working, how many are waiting on you |
+| "qué dijiste" / "no te entendí" | Says the announcement again |
+| "esperá" / "un segundo" | Holds the mic. Not an answer and not a refusal — nothing is typed, nothing is dropped |
 
-**Read-backs.** A transcript the recognizer was unsure about, or one matching
-`delivery.confirm_if_matches`, is read back to you before it is sent. Say "dale" to send it, "no"
-to drop it, or just say something else — that replaces it.
+**Menus are read short.** A question plus its labels, and the labels only as far as they say
+something: "(Recomendado)", "[beta]" and anything hanging off a dash are dropped, and what is
+left is cut to its first few words. Four labels read whole are twenty-five seconds of audio for a
+decision that takes five. Nothing goes out of reach — "explicame la dos" reads the option in
+full, and a spoken keyword is still matched against the *whole* label, whichever part of it you
+say back.
+
+**Read-backs.** A transcript the recognizer was unsure about, one matching
+`delivery.confirm_if_matches`, or one that sounds like it was a question *for voice-loop* — a
+short question naming the queue, the windows or what was just said — is read back to you before
+it is sent: *"No sé si eso era para mí. Dijiste: cuántas ventanas quedan abiertas. ¿Te lo mando a
+la ventana?"* Say "dale" to send it, "no" to drop it, or just say something else — that replaces
+it. The heuristic is deliberately narrow, and both halves have to hold: this is not a read-back
+on everything you say, which would be worse than the problem. "cuántos tests corriste" goes
+straight through.
 
 **The queue, out loud.** "dame los pendientes" works from anywhere, busy mode included, where the
 hotkey is the only microphone you get. It reads the list in the order things arrived and then
@@ -291,10 +305,15 @@ such a window announces itself you hear:
 > event processor?"*
 
 - **"dale"** keeps that name. **A short phrase** — "índice de migración" — keeps yours instead.
-- **Anything longer** was meant for the window, not for the question: it goes straight through to
-  that window as your answer, rather than becoming a window called "mergealo cuando pasen los
-  tests". Silence goes through too, which ends the turn instead of opening a second mic on
-  somebody who is not there.
+- **A yes with the name attached** — "sí, llamala fecha actual", "dale, índice de migración" —
+  is read as the yes it is. That is how people accept an offer out loud, and the length rule on
+  its own reads it as a sentence: on the first real run it declined the name *and* typed the
+  acceptance into the window it was accepting for.
+- **Anything longer that does not start with a yes** was meant for the window, not for the
+  question: it goes straight through to that window as your answer, rather than becoming a window
+  called "mergealo cuando pasen los tests". Silence goes through too, which ends the turn instead
+  of opening a second mic on somebody who is not there. A yes with a sentence after it does both
+  — the offered name is kept and the sentence is delivered.
 - **"no" or silence is remembered.** You are not asked about that window again — being asked at
   every announcement is worse than `darwin-21`.
 

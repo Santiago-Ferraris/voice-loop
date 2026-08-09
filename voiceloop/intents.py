@@ -35,6 +35,7 @@ KIND_SHOW = "show"
 KIND_SILENCE = "silence"
 KIND_PENDINGS = "pendings"
 KIND_STATUS = "status"
+KIND_WAIT = "wait"
 
 NUMBERS: Mapping[str, int] = {
     "uno": 1, "una": 1, "un": 1, "primero": 1, "primera": 1, "primer": 1,
@@ -57,6 +58,18 @@ CONFIRM_PHRASES = frozenset({
     "sip", "yes", "va",
 })
 
+# The first word of a yes, for the one place a yes can carry something after
+# it: the naming offer. "sí, llamala fecha actual" is an acceptance with the
+# answer attached, and whole-phrase matching cannot see that — it reads as a
+# sentence, which is how an acceptance ends up typed into somebody's window.
+# Only the unambiguous ones: "claro que no" and "listo, mandale eso" are not
+# yeses with a payload, and they are already whole phrases above.
+CONFIRM_LEAD = frozenset({
+    "si", "sisi", "sip", "dale", "ok", "oka", "okey", "okay",
+    "correcto", "confirmo", "confirmado", "exacto", "obvio", "perfecto",
+    "afirmativo", "yes",
+})
+
 CANCEL_PHRASES = frozenset({
     "no", "no no", "nop", "cancela", "cancelalo", "cancelala", "cancelar",
     "olvidalo", "olvidate", "nada", "negativo", "mejor no", "no gracias",
@@ -64,9 +77,20 @@ CANCEL_PHRASES = frozenset({
 })
 
 REPEAT_PHRASES = frozenset({
-    "repeti", "repetilo", "repetila", "repetime", "repetimelo", "repetir",
-    "de nuevo", "otra vez", "como era", "que dijiste", "que era",
-    "no escuche", "no te escuche", "volve a decirlo",
+    "repeti", "repetilo", "repetila", "repetime", "repetimelo", "repetimela",
+    "repetir", "de nuevo", "otra vez", "una vez mas", "como era", "que dijiste",
+    "que me dijiste", "que dijiste recien", "como dijiste", "que decias",
+    "que era", "que era eso", "no escuche", "no te escuche", "no entendi",
+    "no te entendi", "volve a decirlo", "perdon que dijiste",
+})
+
+# "esperá" is neither an answer nor a refusal — it is you asking for a beat.
+# Typed into a window it is a turn nobody meant to take.
+WAIT_PHRASES = frozenset({
+    "espera", "esperate", "esperame", "espera un momento", "espera un segundo",
+    "pera", "un momento", "un segundo", "un minuto", "momento", "aguanta",
+    "aguantame", "dame un segundo", "dame un momento", "dame un minuto",
+    "ahi voy", "ya voy",
 })
 
 SKIP_PHRASES = frozenset({
@@ -92,6 +116,12 @@ PENDINGS_PHRASES = frozenset({
     "que esta pendiente", "que me falta", "que me queda", "que tengo",
     "lista de pendientes", "leeme los pendientes", "decime los pendientes",
     "quien me espera", "que ventanas me esperan",
+    # Asked back at the countdown, which is exactly when it is asked.
+    "cual queda", "cual falta", "cuales quedan", "cuales faltan",
+    "cuantas quedan", "cuantos quedan", "cuantas faltan", "cuantos faltan",
+    "cuantas me quedan", "cuantos me quedan", "cual me queda", "que queda",
+    "que quedan", "que falta", "que faltan", "cuantas ventanas quedan",
+    "cual es el que queda", "cual es la que queda",
 })
 
 STATUS_PHRASES = frozenset({
@@ -99,6 +129,26 @@ STATUS_PHRASES = frozenset({
     "como va todo", "como viene la mano", "que esta pasando", "que pasa",
     "que hay", "situacion", "como estamos", "resumen", "panorama",
 })
+
+# A question that no phrase above matched, but that is plainly about
+# voice-loop's own business rather than about anybody's code. Both halves have
+# to be true — it opens like a question *and* it names something only
+# voice-loop has — because the fallback is a read-back, and a read-back on
+# every sentence was rejected out loud: the cost of asking is one round, the
+# cost of not asking is a stray turn typed into somebody's session.
+QUESTION_WORDS = frozenset({
+    "que", "cual", "cuales", "cuanto", "cuanta", "cuantos", "cuantas",
+    "quien", "quienes", "como", "donde", "cuando",
+})
+
+SYSTEM_WORDS = frozenset({
+    "queda", "quedan", "quedaban", "falta", "faltan", "pendiente", "pendientes",
+    "ventana", "ventanas", "sesion", "sesiones", "cola", "dijiste", "decias",
+    "escuchaste", "entendiste", "escuchando", "hablando", "anunciaste",
+    "leiste", "preguntaste", "microfono", "mic", "espera", "esperan",
+})
+
+MAX_SYSTEMWARD_WORDS = 6
 
 EXPLAIN_VERBS = (
     "explicame", "explicamela", "explicamelo", "explica", "explicar",
@@ -165,7 +215,16 @@ def as_number(token: str) -> int | None:
 
 
 def option_keys(labels: Sequence[str]) -> dict[str, int]:
-    """Folded label -> index, plus a distinctive first word when it is unique."""
+    """Folded label -> index: the whole label, any leading part, any distinct word.
+
+    Three shapes, because there are three ways to name an option out loud. The
+    whole label is what you say reading it off the screen. A **leading part** is
+    what you say repeating what you *heard*, since options are spoken short —
+    "Probalo sin hotkeys primero (Recomendado)" is read out without the aside.
+    A single word is what you say when only one option had that word in it.
+
+    Anything two options could both mean is dropped rather than guessed.
+    """
     keys: dict[str, int] = {}
     collisions: set[str] = set()
 
@@ -182,10 +241,15 @@ def option_keys(labels: Sequence[str]) -> dict[str, int]:
         folded = fold(str(label))
         if not folded:
             continue
+        words = folded.split(" ")
         offer(folded, index)
-        first = folded.split(" ")[0]
-        if len(first) >= MIN_KEYWORD_CHARS:
-            offer(first, index)
+        for count in range(1, len(words)):
+            # A one-word prefix has to be distinctive; two words already are.
+            if count > 1 or len(words[0]) >= MIN_KEYWORD_CHARS:
+                offer(" ".join(words[:count]), index)
+        for word in words[1:]:
+            if len(word) >= MIN_KEYWORD_CHARS:
+                offer(word, index)
     return keys
 
 
@@ -234,6 +298,41 @@ def _multi_selection(raw: str, labels: Sequence[str], keys: Mapping[str, int]) -
     return found
 
 
+def confirmation_tail(text: str) -> str | None:
+    """What a yes carried with it. `None` when the utterance is not a yes at all.
+
+    `""` is a bare confirmation. Anything else is what came after it — the name
+    the answer proposes, or a sentence that was meant for the window and got a
+    "dale" in front of it. The caller decides which, because only the caller
+    knows what was asked.
+    """
+    tokens = [
+        token for token in fold(text).split() if token not in ("por", "favor", "porfa")
+    ]
+    if not tokens or tokens[0] not in CONFIRM_LEAD:
+        return None
+    rest = tokens[1:]
+    while rest and rest[0] in CONFIRM_LEAD:
+        rest.pop(0)
+    return _phrase(rest)
+
+
+def looks_systemward(text: str) -> bool:
+    """Might this short question have been meant for voice-loop, not the window?
+
+    Only a hint, and a deliberately narrow one: the caller reads it back and
+    asks rather than acting on it. "cuál queda" is a phrase above and never
+    gets here; "cuántas ventanas quedan abiertas" is not, and typing it into
+    somebody's session is the failure this exists to avoid.
+    """
+    words = fold(text).split()
+    if not words or len(words) > MAX_SYSTEMWARD_WORDS:
+        return False
+    if words[0] not in QUESTION_WORDS:
+        return False
+    return any(word in SYSTEM_WORDS for word in words)
+
+
 def parse(
     text: str,
     options: Sequence[str] = (),
@@ -255,6 +354,7 @@ def parse(
         (CANCEL_PHRASES, KIND_CANCEL),
         (REPEAT_PHRASES, KIND_REPEAT),
         (SKIP_PHRASES, KIND_SKIP),
+        (WAIT_PHRASES, KIND_WAIT),
         (SHOW_PHRASES, KIND_SHOW),
         (PENDINGS_PHRASES, KIND_PENDINGS),
         (STATUS_PHRASES, KIND_STATUS),

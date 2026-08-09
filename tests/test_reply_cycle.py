@@ -70,6 +70,25 @@ TWO_QUESTIONS = {
 
 PLAN = {"tool": "ExitPlanMode", "tool_input": {"plan": "## Migrar el índice\n\n1. Nada\n"}}
 
+# The live one, verbatim: four labels read whole are twenty-five seconds.
+HOTKEYS = {
+    "tool": "AskUserQuestion",
+    "tool_input": {
+        "questions": [
+            {
+                "question": "¿Cómo seguimos con las hotkeys?",
+                "options": [
+                    {
+                        "label": "Probalo sin hotkeys primero (Recomendado)",
+                        "description": "No hace falta tocar las Command Line Tools.",
+                    },
+                    {"label": "Actualizar Command Line Tools"},
+                ],
+            }
+        ]
+    },
+}
+
 
 class StubRecorder:
     """A mic that always captures something, unless told otherwise."""
@@ -238,6 +257,26 @@ def test_free_text_on_a_question_goes_to_the_row_past_the_options(build):
     assert daemon.delivery.sent == [("menu_text", TTY, 3, "ninguna de las dos, usá duckdb")]
 
 
+def test_an_option_is_read_short_and_answered_by_what_was_heard(build):
+    """Shortening the labels must not put the answer out of reach."""
+    daemon = build(["probalo sin hotkeys primero"])
+    queue(daemon, HOTKEYS)
+
+    asyncio.run(daemon.announce_next())
+
+    assert "Recomendado" not in daemon.speaker.texts[0]
+    assert daemon.delivery.sent == [("choice", TTY, 1)]
+
+
+def test_the_full_label_is_still_there_for_anyone_who_asks(build):
+    daemon = build(["explicame la uno", "uno"])
+    item = queue(daemon, HOTKEYS)
+
+    answer(daemon, item)
+
+    assert "No hace falta tocar las Command Line Tools." in daemon.speaker.spoken
+
+
 def test_each_question_of_a_multi_question_menu_is_asked_in_turn(build):
     daemon = build(["uno", "dos"])
     item = queue(daemon, TWO_QUESTIONS)
@@ -347,6 +386,34 @@ def test_saying_something_else_during_a_read_back_replaces_it(build):
     assert daemon.delivery.sent == [("text", TTY, "mejor corré los tests")]
 
 
+def test_a_question_that_might_have_been_for_voice_loop_is_read_back(build):
+    """Asking costs a round; typing it into somebody's session costs the session."""
+    daemon = build(["cuántas ventanas quedan abiertas", "no"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_PENDING
+    assert daemon.delivery.sent == []
+    assert any("¿Te lo mando a la ventana?" in said for said in daemon.speaker.spoken)
+
+
+def test_and_it_goes_through_if_you_say_it_was_for_the_window(build):
+    daemon = build(["cuántas ventanas quedan abiertas", "dale"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert daemon.delivery.sent == [("text", TTY, "cuántas ventanas quedan abiertas")]
+
+
+def test_an_ordinary_question_for_the_window_is_not_second_guessed(build):
+    """The read-back is for doubt, not for questions — this is not confirm-everything."""
+    daemon = build(["qué base te parece mejor"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert daemon.delivery.sent == [("text", TTY, "qué base te parece mejor")]
+    assert daemon.speaker.spoken == []
+
+
 # --- the conversational bits -----------------------------------------------
 
 
@@ -361,6 +428,26 @@ def test_asking_for_a_repeat_says_it_again_and_keeps_listening(build):
     assert outcome == REPLY_DELIVERED
     assert "indice: terminó y te espera." in daemon.speaker.spoken
     assert daemon.delivery.sent == [("text", TTY, "dale, mergealo")]
+
+
+def test_asking_which_one_is_left_reads_the_queue_instead_of_typing_it(build):
+    """Verbatim from the first real run: "cuál queda" was typed into the window."""
+    daemon = build(["cuál queda"])
+    daemon.stt.default = ""
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_PENDING
+    assert daemon.delivery.sent == []
+    assert any("pendiente" in said for said in daemon.speaker.spoken)
+
+
+def test_asking_for_a_beat_holds_the_mic_instead_of_answering(build):
+    daemon = build(["esperá", "mergealo"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+    assert "Dale, espero." in daemon.speaker.spoken
 
 
 def test_mostrame_focuses_the_window_without_answering_it(build):
@@ -501,6 +588,37 @@ def test_announcing_an_item_opens_the_mic_on_it_and_delivers_the_answer(build):
     ]
     assert daemon.recorder.takes == 1
     assert daemon.delivery.sent == [("choice", TTY, 2)]
+
+
+def test_what_is_left_is_said_when_the_cycle_closes_not_when_it_opens(build):
+    """You answer, *then* you hear how many are left — the announcement is not it."""
+    daemon = build(["la dos"])
+    queue(daemon, QUESTION)
+    queue(daemon, QUESTION, session="session-2")
+
+    asyncio.run(daemon.announce_next())
+
+    assert "Queda" not in daemon.speaker.texts[0]
+    assert daemon.speaker.spoken[-1] == "Queda uno."
+
+
+def test_an_empty_queue_counts_down_to_nothing(build):
+    daemon = build(["la dos"])
+    queue(daemon, QUESTION)
+
+    asyncio.run(daemon.announce_next())
+
+    assert not any("Queda" in said for said in daemon.speaker.spoken)
+
+
+def test_nothing_is_counted_down_when_nobody_answered(build):
+    daemon = build([], recorder=StubRecorder(spoke=False))
+    queue(daemon, QUESTION)
+    queue(daemon, QUESTION, session="session-2")
+
+    asyncio.run(daemon.announce_next())
+
+    assert not any("Queda" in said for said in daemon.speaker.spoken)
 
 
 def test_the_mic_chimes_open_and_closed_around_the_take(build):
