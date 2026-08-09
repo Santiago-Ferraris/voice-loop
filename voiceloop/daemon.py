@@ -60,7 +60,14 @@ from .audio import AudioUnavailable, MicConsentPending, Recorder
 from .config import Config, ConfigError, load as load_config
 from .control import ControlError, ControlServer, DaemonAlreadyRunning
 from .delivery import Delivery, GatePolicy
-from .events import TYPE_MENU, TYPE_MILESTONE, TYPE_STOP, Event
+from .events import (
+    TYPE_MENU,
+    TYPE_MILESTONE,
+    TYPE_NOTIFICATION,
+    TYPE_STOP,
+    Event,
+    is_idle_notification,
+)
 from .milestones import MilestoneWatcher
 from .store import Item, Store
 from .stt import SttError, SttNotImplemented, Transcript, create as create_stt
@@ -236,6 +243,10 @@ class Daemon:
     def ingest_once(self) -> int:
         count = 0
         for path, event in spool.read_pending(self.config.spool_dir):
+            if self._muted(event):
+                log.debug("muted idle notification from %s", event.session_id[:8])
+                spool.discard([path])
+                continue
             try:
                 outcome = self.store.ingest(event)
             except Exception:  # noqa: BLE001 - quarantine rather than replay forever
@@ -246,6 +257,24 @@ class Daemon:
             spool.discard([path])
             count += 1
         return count
+
+    def _muted(self, event: Event) -> bool:
+        """Dropped on arrival, not announced quietly.
+
+        `notification_events: false` used to mean chime-only, and a chime every
+        time is the same interruption without the words. It now means silence,
+        and silence has to start here: an event that reaches the queue is a
+        pendiente — it is counted in "quedan dos", it comes back when you ask
+        what is waiting, and it holds a slot the announce loop keeps checking.
+
+        Only the idle nudge. A permission prompt is a window that cannot move
+        until you answer it, and so is anything whose wording we do not know.
+        """
+        return (
+            event.type == TYPE_NOTIFICATION
+            and not self.notification_events
+            and is_idle_notification(event.payload.get("message"))
+        )
 
     async def _announce_loop(self) -> None:
         while True:

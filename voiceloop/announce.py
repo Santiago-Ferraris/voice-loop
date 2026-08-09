@@ -18,7 +18,13 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .delivery import PLAN_LABELS
-from .events import TYPE_MENU, TYPE_MILESTONE, TYPE_NOTIFICATION, TYPE_STOP
+from .events import (
+    TYPE_MENU,
+    TYPE_MILESTONE,
+    TYPE_NOTIFICATION,
+    TYPE_STOP,
+    is_idle_notification,
+)
 from .summarize import FALLBACK_SUMMARY
 
 NUMBER_WORDS = (
@@ -367,6 +373,19 @@ def name_question(slug: str, phonetic: Mapping[str, Any] | None = None) -> str:
     return f"¿La llamo {spoken}?" if spoken else ""
 
 
+def muted_notification(item, *, notification_events: bool) -> bool:
+    """An idle nudge, with `notification_events` off. Nothing about it happens.
+
+    The announcement is built anyway so the queue and the log still know what
+    arrived; it just never reaches a speaker, a chime, or the mic.
+    """
+    return (
+        item.type == TYPE_NOTIFICATION
+        and not notification_events
+        and is_idle_notification(item.payload.get("message"))
+    )
+
+
 def build(
     item,
     *,
@@ -404,7 +423,9 @@ def build(
     if offer:
         text = join_sentences([text, offer])
 
-    speak = True
-    if item.type == TYPE_NOTIFICATION and not notification_events:
-        speak = False
-    return Announcement(text=text, chime=blocking_chime, speak=speak)
+    if muted_notification(item, notification_events=notification_events):
+        # Not "chime instead of speaking": a chime every time is the same
+        # interruption with the words taken out, and the words were the only
+        # part that ever justified it.
+        return Announcement(text=text, chime=None, speak=False)
+    return Announcement(text=text, chime=blocking_chime)

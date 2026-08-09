@@ -101,8 +101,14 @@ announce:
   # How long the mic waits for you to start talking. Say nothing and the item
   # stays pending; the queue moves on.
   mic_timeout_seconds: 8
-  # Claude's own Notification events (permission prompts, idle nudges). These
-  # are blocking too, so they speak. Set to false for chime-only.
+  # Claude's own Notification events. Two different things arrive through this
+  # one hook and the payload says which: a permission prompt ("Claude needs your
+  # permission to use Bash") is a window that cannot move until you answer, and
+  # an idle nudge ("Claude is waiting for your input") repeats for as long as
+  # you leave a window alone — usually the one you are already sitting in front
+  # of. Set to false to drop the idle nudges outright: no voice, no chime, and
+  # no entry in the queue. Permission prompts still speak, and so does any
+  # wording this does not recognise.
   notification_events: true
 
 delivery:
