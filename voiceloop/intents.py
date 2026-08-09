@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Mapping, Sequence
 
 KIND_TEXT = "text"
@@ -403,6 +404,70 @@ def looks_systemward(text: str) -> bool:
     if words[0] not in QUESTION_WORDS:
         return False
     return any(word in SYSTEM_WORDS for word in words)
+
+
+@dataclass(frozen=True)
+class NearMiss:
+    """A control phrase the recognizer very nearly gave us."""
+
+    kind: str
+    phrase: str
+    ratio: float
+
+
+# Every set matched whole, in one place, so a near miss can be looked for
+# against exactly the same vocabulary an exact match is.
+CONTROL_SETS: tuple[tuple[frozenset, str], ...] = (
+    (GIVE_PHRASES, KIND_GIVE),
+    (LATER_PHRASES, KIND_LATER),
+    (CONFIRM_PHRASES, KIND_CONFIRM),
+    (CANCEL_PHRASES, KIND_CANCEL),
+    (REPEAT_PHRASES, KIND_REPEAT),
+    (SKIP_PHRASES, KIND_SKIP),
+    (WAIT_PHRASES, KIND_WAIT),
+    (SHOW_PHRASES, KIND_SHOW),
+    (PENDINGS_PHRASES, KIND_PENDINGS),
+    (STATUS_PHRASES, KIND_STATUS),
+)
+
+# Measured against the phrases people actually dictate: "dame al pendiente"
+# scores 0.89 against "dame los pendientes", and the closest a real instruction
+# gets is "cerrá la ventana" at 0.74 against "mostrame la ventana". Above this
+# line it is a command the recognizer fumbled; below it, it is your sentence.
+NEAR_MISS_RATIO = 0.8
+
+# A near miss is a short phrase said wrong. A long one is a sentence that
+# happens to rhyme with something, and asking about every sentence was rejected
+# out loud — the point of asking is that it is rare enough to be worth it.
+MAX_NEAR_MISS_WORDS = 5
+
+
+def nearest_control(text: str) -> NearMiss | None:
+    """The command this almost was, when it is not a command at all.
+
+    "dame al pendiente" is what Deepgram heard for "dame los pendientes", and
+    the whole cost of the miss was paid downstream: it matched nothing, so it
+    was a sentence, so it was typed into somebody's Claude session. Asking
+    costs one round. Not asking costs a turn nobody meant to take, in a window
+    that was already waiting on an answer.
+
+    `None` for anything that matched exactly (there is nothing to ask about)
+    and for anything long enough to be a real instruction.
+    """
+    folded = fold(text)
+    if not folded or len(folded.split()) > MAX_NEAR_MISS_WORDS:
+        return None
+    best: NearMiss | None = None
+    for phrases, kind in CONTROL_SETS:
+        if folded in phrases:
+            return None
+        for phrase in phrases:
+            score = SequenceMatcher(None, folded, phrase, autojunk=False).ratio()
+            if score < NEAR_MISS_RATIO:
+                continue
+            if best is None or score > best.ratio:
+                best = NearMiss(kind=kind, phrase=phrase, ratio=score)
+    return best
 
 
 def parse(

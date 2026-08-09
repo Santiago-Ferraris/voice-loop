@@ -385,6 +385,37 @@ def describe_status(
     return join_sentences(parts)
 
 
+# What each control intent is, said the way you would ask for it. Used only to
+# ask "is this what you meant?", so it reads as the object of "¿querés …?".
+CONTROL_WISH: Mapping[str, str] = {
+    "give": "que te lo lea",
+    "later": "dejarlo para después",
+    "skip": "saltearlo",
+    "show": "que te muestre la ventana",
+    "repeat": "que lo repita",
+    "wait": "que espere",
+    "pendings": "los pendientes",
+    "status": "el estado",
+    "confirm": "confirmar",
+    "cancel": "cancelar",
+}
+
+
+def near_miss_question(heard: str, kind: str) -> str:
+    """"Entendí: dame al pendiente. ¿Querés los pendientes?"
+
+    The one thing a doubtful transcript may never do is end up inside somebody's
+    Claude session, so when it is *nearly* a command it is asked about instead —
+    by name, because "¿te lo mando a la ventana?" is not the question when what
+    you plainly meant was the queue.
+    """
+    wish = CONTROL_WISH.get(kind)
+    said = normalize(heard)
+    if not wish or not said:
+        return ""
+    return f"Entendí: {said}. ¿Querés {wish}?"
+
+
 def name_question(slug: str, phonetic: Mapping[str, Any] | None = None) -> str:
     """The offer to christen a window Claude called `darwin-21`."""
     spoken = speakable(slug, phonetic)

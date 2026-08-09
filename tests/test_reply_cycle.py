@@ -326,7 +326,7 @@ def test_saying_something_else_during_a_read_back_replaces_it(build):
 
 def test_a_question_that_might_have_been_for_voice_loop_is_read_back(build):
     """Asking costs a round; typing it into somebody's session costs the session."""
-    daemon = build(["cuántas ventanas quedan abiertas", "no"])
+    daemon = build(["cuántas sesiones tengo esperando ahora", "no"])
     item = queue(daemon, kind="stop")
 
     assert answer(daemon, item) == REPLY_PENDING
@@ -335,11 +335,11 @@ def test_a_question_that_might_have_been_for_voice_loop_is_read_back(build):
 
 
 def test_and_it_goes_through_if_you_say_it_was_for_the_window(build):
-    daemon = build(["cuántas ventanas quedan abiertas", "dale"])
+    daemon = build(["cuántas sesiones tengo esperando ahora", "dale"])
     item = queue(daemon, kind="stop")
 
     assert answer(daemon, item) == REPLY_DELIVERED
-    assert daemon.delivery.sent == [("text", TTY, "cuántas ventanas quedan abiertas")]
+    assert daemon.delivery.sent == [("text", TTY, "cuántas sesiones tengo esperando ahora")]
 
 
 def test_an_ordinary_question_for_the_window_is_not_second_guessed(build):

@@ -655,6 +655,23 @@ class Daemon:
                     self._switch_to = chosen.id
                     return ALERT_NONE, None
 
+                guess = intents.nearest_control(transcript.text)
+                if guess is not None and carried is None:
+                    # Not "was that for the window?" — it was plainly for me,
+                    # and only the recognizer disagrees. Ask by name.
+                    question = announce_mod.speakable(
+                        announce_mod.near_miss_question(transcript.text, guess.kind),
+                        self.phonetic,
+                    )
+                    answer = await self._say_then(question, listening=more_rounds)
+                    if answer is not None and intents.parse(answer.text).kind == (
+                        intents.KIND_CONFIRM
+                    ):
+                        follow = dataclasses.replace(answer, text=guess.phrase)
+                    else:
+                        follow = answer
+                    continue
+
                 carried = transcript
                 follow = await self._say_then(
                     self._readback_sentence(gate, transcript.text), listening=more_rounds
@@ -1053,6 +1070,30 @@ class Daemon:
         log.info("echo filtered: %r -> %r", transcript.text, kept)
         return dataclasses.replace(transcript, text=kept)
 
+    def _settle_guess(self, guess, intent, transcript, menu):
+        """What the answer to "¿Querés los pendientes?" turned the utterance into.
+
+        A yes replaces it with the command it was nearly saying. Anything else
+        replaces the utterance outright — a correction is a new thing said, not
+        a refusal — and silence resolves to nothing at all, which is the whole
+        point: a phrase we were unsure about is never typed anywhere.
+        """
+        if intent.kind == intents.KIND_CONFIRM:
+            phrase = guess.phrase
+            log.info("near miss %r -> %s (%.2f)", transcript.text, guess.kind, guess.ratio)
+            return (
+                intents.parse(
+                    phrase, menu.labels if menu else (), multi=bool(menu and menu.multi_select)
+                ),
+                dataclasses.replace(transcript, text=phrase),
+                None,
+            )
+        if intent.kind in (intents.KIND_SILENCE, intents.KIND_CANCEL):
+            # "no" answers the question, and there is nothing behind it: what
+            # we were unsure about is dropped, never sent on to a window.
+            return None, transcript, None
+        return intent, transcript, None
+
     async def _say_then(self, text: str, *, listening: bool) -> Transcript | None:
         """Say something in the middle of a cycle, with the mic open if it is worth it.
 
@@ -1157,6 +1198,7 @@ class Daemon:
         self, item: Item, menu, announced: str, *, first: Transcript | None = None
     ) -> str:
         pending_action = None
+        pending_guess: intents.NearMiss | None = None
         for round_number in range(self.mic_rounds):
             more_rounds = round_number < self.mic_rounds - 1
             if first is not None:
@@ -1170,6 +1212,15 @@ class Daemon:
                 menu.labels if menu else (),
                 multi=bool(menu and menu.multi_select),
             )
+
+            if pending_guess is not None:
+                intent, transcript, pending_guess = self._settle_guess(
+                    pending_guess, intent, transcript, menu
+                )
+                if intent is None:
+                    # Neither a yes nor anything else worth acting on. The
+                    # doubtful phrase is dropped rather than delivered.
+                    return REPLY_PENDING
 
             if intent.kind == intents.KIND_LATER:
                 # Same instruction as at the heads-up: not now, and not first.
@@ -1205,6 +1256,19 @@ class Daemon:
                     listening=more_rounds,
                 )
                 continue
+
+            if intent.kind == intents.KIND_TEXT and pending_action is None:
+                guess = intents.nearest_control(transcript.text)
+                if guess is not None:
+                    pending_guess = guess
+                    first = await self._say_then(
+                        announce_mod.speakable(
+                            announce_mod.near_miss_question(transcript.text, guess.kind),
+                            self.phonetic,
+                        ),
+                        listening=more_rounds,
+                    )
+                    continue
 
             if pending_action is not None:
                 if intent.kind == intents.KIND_CONFIRM:
