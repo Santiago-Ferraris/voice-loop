@@ -160,14 +160,16 @@ def test_a_missing_summary_is_computed_while_reading_the_list(build, tmp_path):
 # --- picking one off it ----------------------------------------------------
 
 
-def test_a_window_picked_by_number_is_re_announced_and_gets_the_mic(build):
+def test_a_window_picked_by_number_is_served_at_once_without_asking_twice(build):
+    """You picked it by name off the list; being asked "dámelo" now is absurd."""
     daemon = build(["dame los pendientes", "la dos", "mergealo"])
     waiting(daemon, "s1", "alpha", ts=1000, summary="espera tu aprobación")
     waiting(daemon, "s2", "beta", ts=2000, summary="terminó el backfill")
 
     hotkey(daemon)
 
-    assert daemon.speaker.texts[-1].startswith("beta:")
+    assert daemon.speaker.spoken[-1] == "terminó el backfill."
+    assert daemon.speaker.texts == []  # no second heads-up for the one you asked for
     assert daemon.delivery.sent == [("text", TTY, "mergealo")]
 
 
@@ -178,7 +180,7 @@ def test_a_window_picked_by_name_is_the_one_served(build):
 
     hotkey(daemon)
 
-    assert daemon.speaker.texts[-1].startswith("alpha:")
+    assert "espera tu aprobación." in daemon.speaker.spoken
 
 
 def test_picking_nothing_leaves_the_queue_alone(build):
@@ -196,12 +198,12 @@ def test_the_list_can_be_asked_for_in_the_middle_of_answering(build):
     daemon = build(["dame los pendientes", "la dos", "mergealo"])
     first = waiting(daemon, "s1", "alpha", ts=1000, summary="espera tu aprobación")
     waiting(daemon, "s2", "beta", ts=2000, summary="terminó el backfill")
-    daemon.store.requeue(first)  # alpha is the one being answered
+    daemon.store.requeue(first)  # alpha is the one being announced
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.speaker.texts[0].startswith("alpha:")
-    assert daemon.speaker.texts[-1].startswith("beta:")
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
+    assert "terminó el backfill." in daemon.speaker.spoken
     assert daemon.delivery.sent == [("text", TTY, "mergealo")]
     assert daemon.store.get(first).state == STATE_PENDING
 
@@ -256,3 +258,42 @@ def test_status_says_nothing_about_milestones_when_the_bridge_is_off(build):
     hotkey(daemon)
 
     assert "con CI" not in said(daemon)
+
+
+# --- what a "después" costs -------------------------------------------------
+
+
+def test_a_postponed_item_is_not_summarised_a_second_time(build, tmp_path):
+    """The summary computed on arrival is still the summary an hour later."""
+    daemon = build(["después", "dame los pendientes", "la uno", "mergealo"])
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    daemon.store.ingest(
+        Event.new("stop", "s1", ts=1000, tty=TTY, transcript_path=transcript(tmp_path, "s1"))
+    )
+
+    async def body():
+        daemon.prefetch_summaries()
+        for task in list(daemon._mic_tasks):
+            await task
+        await daemon.announce_next()  # heads-up, and "después"
+        await daemon.dispatch("mic-toggle", {})  # ask for the list, pick it, answer it
+        for task in list(daemon._mic_tasks):
+            await task
+
+    asyncio.run(body())
+
+    assert daemon.store.pendings()[0].deferred_at is not None  # it really was postponed
+    assert daemon.summarizer.seen == ["Terminé. ¿Lo mergeo?"]
+    assert "quiere que revises el diff." in daemon.speaker.spoken
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_the_hotkey_says_how_many_are_waiting_when_nothing_has_been_announced(build):
+    """Busy announces nothing, so "nothing spoke last" says nothing about the queue."""
+    daemon = build(["algo que no es un comando"])
+    daemon.busy = True
+    daemon.store.ingest(Event.new("stop", "s1", ts=1000, tty=TTY, payload={}))
+
+    hotkey(daemon)
+
+    assert "Tenés un pendiente." in said(daemon)

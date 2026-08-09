@@ -37,8 +37,13 @@ speech_to_text:
 
 microphone:
   enabled: true
-  # avfoundation input. ":0" is the default audio device; use ":1", ":2"… or
-  # `ffmpeg -f avfoundation -list_devices true -i ""` to see the list.
+  # avfoundation input. Prefer the device *name* — ":MacBook Pro Microphone" —
+  # over an index: avfoundation renumbers, so ":0" silently becomes whatever
+  # the Mac decided is first today. With Continuity that can be your iPhone in
+  # another room, which records nothing and looks exactly like a broken mic.
+  # `ffmpeg -f avfoundation -list_devices true -i ""` lists names and indices.
+  # ":0" is left as the default only because it is the one value that exists on
+  # every Mac; put the name of yours in config.local.yml.
   device: ":0"
   ffmpeg: ffmpeg
   # Hard cap on one take. The silence cutoff normally ends it long before.
@@ -98,9 +103,14 @@ announce:
   mic_close_chime: Pop
   # Played when the busy-mode hotkey flips, in either direction.
   busy_chime: Submarine
-  # How long the mic waits for you to start talking. Say nothing and the item
-  # stays pending; the queue moves on.
+  # How long the mic waits for you to start talking when you are answering a
+  # window. Say nothing and the item stays pending; the queue moves on.
   mic_timeout_seconds: 8
+  # The same, for the mic that opens on the heads-up ("Nuevo evento de X"). It
+  # is asking a question with two words for an answer — "dámelo" or "después" —
+  # so it is deliberately short: if you have not started by then, you are not
+  # there, and the item quietly stays in the queue.
+  alert_mic_timeout_seconds: 4
   # Claude's own Notification events. Two different things arrive through this
   # one hook and the payload says which: a permission prompt ("Claude needs your
   # permission to use Bash") is a window that cannot move until you answer, and

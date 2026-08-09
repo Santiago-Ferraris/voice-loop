@@ -15,6 +15,8 @@ from voiceloop.intents import (
     KIND_CANCEL,
     KIND_CONFIRM,
     KIND_EXPLAIN,
+    KIND_GIVE,
+    KIND_LATER,
     KIND_REPEAT,
     KIND_SELECT,
     KIND_PENDINGS,
@@ -192,9 +194,48 @@ def test_asking_for_a_repeat_is_recognized(said):
     assert parse(said).kind == KIND_REPEAT
 
 
-@pytest.mark.parametrize("said", ["salteá", "después", "ahora no", "siguiente"])
+@pytest.mark.parametrize("said", ["salteá", "salteala", "siguiente", "paso"])
 def test_skipping_is_recognized(said):
     assert parse(said).kind == KIND_SKIP
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "después",
+        "más tarde",
+        "ahora no",
+        "en un rato",
+        "dejalo para después",
+        # The same instruction said the other way round: there is no snooze by
+        # the clock, only a place in the line.
+        "mandalo al fondo",
+        "al fondo de la cola",
+        "ponelo al final",
+    ],
+)
+def test_putting_it_at_the_back_of_the_line_is_recognized(said):
+    assert parse(said).kind == KIND_LATER
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["dámelo", "damela", "dame", "contame", "decime", "leemelo", "qué dice", "a ver"],
+)
+def test_asking_for_the_one_that_was_announced_is_recognized(said):
+    assert parse(said).kind == KIND_GIVE
+
+
+def test_asking_for_the_list_is_not_asking_for_this_one():
+    """"damelos" is the queue; "dámelo" is the item that just chimed."""
+    assert parse("dame los pendientes").kind == KIND_PENDINGS
+    assert parse("damelos").kind == KIND_PENDINGS
+    assert parse("dámelo").kind == KIND_GIVE
+
+
+def test_a_give_word_inside_a_sentence_is_still_dictation():
+    assert parse("dame un minuto más con el índice").kind == KIND_TEXT
+    assert parse("contame qué hiciste con el worker").kind == KIND_TEXT
 
 
 @pytest.mark.parametrize("said", ["mostrame", "mostrámelo", "llevame", "quiero verlo"])

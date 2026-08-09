@@ -28,6 +28,10 @@ Two rules the rest of the system leans on:
 * **Nothing is ever dropped.** Items leave the queue only by being resolved:
   explicitly, by `skip`, or because the session saw real user activity. There
   is no delete path.
+
+Order is `deferred_at` if it has one and `ts` otherwise — "después" moves an
+item to the back of the line without rewriting when it arrived, so the list
+still says how long that window has actually been waiting.
 """
 
 from __future__ import annotations
@@ -70,8 +74,10 @@ CREATE TABLE IF NOT EXISTS events (
     name            TEXT,
     state           TEXT NOT NULL,
     summary         TEXT,
+    slug            TEXT,
     payload         TEXT NOT NULL DEFAULT '{}',
     announced_at    INTEGER,
+    deferred_at     INTEGER,
     resolved_at     INTEGER,
     resolved_by     TEXT
 );
@@ -90,6 +96,14 @@ CREATE TABLE IF NOT EXISTS kv (
     value TEXT
 );
 """
+
+# Columns added after the first release. `CREATE TABLE IF NOT EXISTS` does
+# nothing to a database that already exists, so they are added by hand — the
+# daemon upgrades in place, with a queue in it.
+ADDED_COLUMNS = (("slug", "TEXT"), ("deferred_at", "INTEGER"))
+
+# What "first in line" means, everywhere it is asked.
+QUEUE_ORDER = "COALESCE(deferred_at, ts), rowid"
 
 INGEST_INSERTED = "inserted"
 INGEST_COALESCED = "coalesced"
@@ -113,6 +127,8 @@ class Item:
     announced_at: int | None
     resolved_at: int | None
     resolved_by: str | None
+    slug: str | None = None
+    deferred_at: int | None = None
 
     @property
     def display_name(self) -> str:
@@ -139,6 +155,8 @@ def _row_to_item(row: sqlite3.Row) -> Item:
         announced_at=row["announced_at"],
         resolved_at=row["resolved_at"],
         resolved_by=row["resolved_by"],
+        slug=row["slug"],
+        deferred_at=row["deferred_at"],
     )
 
 
@@ -152,6 +170,14 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=3000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns a database created by an older version does not have."""
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(events)")}
+        for column, kind in ADDED_COLUMNS:
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE events ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         self._conn.close()
@@ -240,7 +266,7 @@ class Store:
             """
             UPDATE events
                SET id = ?, tty = ?, cwd = ?, transcript_path = ?, payload = ?,
-                   summary = NULL
+                   summary = NULL, slug = NULL
              WHERE id = ?
             """,
             (
@@ -261,7 +287,7 @@ class Store:
 
     def next_queued(self) -> Item | None:
         row = self._conn.execute(
-            "SELECT * FROM events WHERE state = ? ORDER BY ts, rowid LIMIT 1",
+            f"SELECT * FROM events WHERE state = ? ORDER BY {QUEUE_ORDER} LIMIT 1",
             (STATE_QUEUED,),
         ).fetchone()
         return _row_to_item(row) if row else None
@@ -269,7 +295,7 @@ class Store:
     def queued_items(self) -> list[Item]:
         """Everything still waiting to be announced, in FIFO order."""
         rows = self._conn.execute(
-            "SELECT * FROM events WHERE state = ? ORDER BY ts, rowid",
+            f"SELECT * FROM events WHERE state = ? ORDER BY {QUEUE_ORDER}",
             (STATE_QUEUED,),
         ).fetchall()
         return [_row_to_item(row) for row in rows]
@@ -292,7 +318,7 @@ class Store:
         """Everything still waiting on the user, oldest first."""
         placeholders = ",".join("?" for _ in OPEN_STATES)
         rows = self._conn.execute(
-            f"SELECT * FROM events WHERE state IN ({placeholders}) ORDER BY ts, rowid",
+            f"SELECT * FROM events WHERE state IN ({placeholders}) ORDER BY {QUEUE_ORDER}",
             OPEN_STATES,
         ).fetchall()
         return [_row_to_item(row) for row in rows]
@@ -352,6 +378,28 @@ class Store:
 
     def set_summary(self, event_id: str, summary: str | None) -> None:
         self._conn.execute("UPDATE events SET summary = ? WHERE id = ?", (summary, event_id))
+
+    def set_slug(self, event_id: str, slug: str | None) -> None:
+        """The name proposed for this window, computed with the summary and kept.
+
+        The offer is made when you ask for the item, which is long after the
+        request that could produce it — so the proposal is stored rather than
+        paid for a second time.
+        """
+        self._conn.execute("UPDATE events SET slug = ? WHERE id = ?", (slug or None, event_id))
+
+    def defer(self, event_id: str, *, now: int | None = None) -> None:
+        """"Después": to the back of the line, still exactly as old as it is.
+
+        `ts` is what `pendings` counts the wait from and what a supersede keeps
+        the item's place with, so it is left alone; the ordering reads
+        `deferred_at` first, and only this writes it.
+        """
+        stamp = int(time.time()) if now is None else now
+        self._conn.execute(
+            "UPDATE events SET deferred_at = ? WHERE id = ? AND state != ?",
+            (stamp, event_id, STATE_RESOLVED),
+        )
 
     def resolve(self, event_id: str, by: str, *, now: int | None = None) -> int:
         stamp = int(time.time()) if now is None else now

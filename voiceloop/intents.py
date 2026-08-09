@@ -36,6 +36,8 @@ KIND_SILENCE = "silence"
 KIND_PENDINGS = "pendings"
 KIND_STATUS = "status"
 KIND_WAIT = "wait"
+KIND_GIVE = "give"
+KIND_LATER = "later"
 
 NUMBERS: Mapping[str, int] = {
     "uno": 1, "una": 1, "un": 1, "primero": 1, "primera": 1, "primer": 1,
@@ -95,8 +97,33 @@ WAIT_PHRASES = frozenset({
 
 SKIP_PHRASES = frozenset({
     "saltea", "saltealo", "salteala", "saltear", "salta", "saltalo",
-    "siguiente", "el siguiente", "proximo", "el proximo", "despues",
-    "mas tarde", "ahora no", "paso", "dejalo", "next", "skip",
+    "siguiente", "el siguiente", "proximo", "el proximo",
+    "paso", "dejalo", "next", "skip",
+})
+
+# The answer to a heads-up that is neither "tell me" nor silence: not now, and
+# not first either. "después" and "mandalo al fondo" are the same instruction —
+# there is no snooze by the clock, only a place in the line — which is why they
+# are one set and not two.
+LATER_PHRASES = frozenset({
+    "despues", "mas tarde", "ahora no", "luego", "en un rato", "al rato",
+    "despues lo veo", "despues la veo", "despues me lo decis", "despues me decis",
+    "despues lo vemos", "dejalo para despues", "dejala para despues",
+    "dejalo para mas tarde", "al fondo", "al fondo de la cola", "al final",
+    "al final de la cola", "mandalo al fondo", "mandala al fondo",
+    "mandalo al final", "mandala al final", "ponelo al fondo", "ponela al fondo",
+    "ponelo al final", "ultimo", "de ultimo", "ahora no puedo",
+})
+
+# "dámelo": read me the one you just announced. The heads-up says a name and
+# nothing else, so this is the word that asks for the rest of it.
+GIVE_PHRASES = frozenset({
+    "damelo", "damela", "dame", "dame eso", "damelo ya", "damelo ahora",
+    "dale damelo", "si damelo", "contamelo", "contamela", "contame", "contame eso",
+    "decime", "decimelo", "decimela", "decime eso", "leelo", "leela", "leemelo",
+    "leemela", "que dice", "que quiere", "que necesita", "que paso", "que paso ahi",
+    "que hay ahi", "escuchemos", "a ver", "a ver eso",
+    "el resumen", "dame el resumen",
 })
 
 SHOW_PHRASES = frozenset({
@@ -395,6 +422,8 @@ def parse(
     tokens = folded.split()
     bare = _phrase([token for token in tokens if token not in ("por", "favor", "porfa")])
     for phrases, kind in (
+        (GIVE_PHRASES, KIND_GIVE),
+        (LATER_PHRASES, KIND_LATER),
         (CONFIRM_PHRASES, KIND_CONFIRM),
         (CANCEL_PHRASES, KIND_CANCEL),
         (REPEAT_PHRASES, KIND_REPEAT),

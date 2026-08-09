@@ -32,6 +32,59 @@ def item(event_type: str = "stop", **payload) -> Item:
     )
 
 
+# --- the heads-up ---------------------------------------------------------
+
+
+def test_the_heads_up_is_the_name_and_nothing_else():
+    """Heard dozens of times a day. Everything past the name is paid for every time."""
+    result = announce.alert(item(), name="inbox realtime", blocking_chime="Ping")
+
+    assert result.text == "Nuevo evento de inbox realtime."
+    assert result.chime == "Ping"
+    assert result.speak is True
+
+
+def test_the_heads_up_carries_no_summary_and_no_countdown():
+    result = announce.alert(
+        item("stop", message="lo que sea"), name="indice", blocking_chime="Ping"
+    )
+
+    assert result.text == "Nuevo evento de indice."
+    assert "Queda" not in result.text
+    assert "espera" not in result.text
+
+
+def test_a_menu_gets_the_same_heads_up_as_anything_else():
+    """The question is what you get for asking; being told there is one is free."""
+    payload = {
+        "tool_input": {
+            "questions": [{"question": "¿Qué base uso?", "options": [{"label": "SQLite"}]}]
+        }
+    }
+
+    result = announce.alert(item("menu", **payload), name="indice")
+
+    assert result.text == "Nuevo evento de indice."
+    assert "SQLite" not in result.text
+
+
+def test_an_unnamed_window_is_announced_by_the_name_claude_gave_it():
+    """`darwin-21` is a bad name, but it is the name; the better one is offered later."""
+    result = announce.alert(item(), name="darwin-21")
+
+    assert result.text == "Nuevo evento de darwin 21."
+
+
+def test_the_heads_up_goes_through_the_phonetic_dictionary():
+    result = announce.alert(item(), name="merge worker", phonetic=PHONETIC)
+
+    assert result.text == "Nuevo evento de merch worker."
+
+
+def test_a_nameless_item_still_says_something():
+    assert announce.alert(item(), name="").text == "Nuevo evento."
+
+
 # --- "quedan N" -----------------------------------------------------------
 
 
@@ -49,10 +102,9 @@ def test_several_left_is_plural(count, expected):
     assert announce.remaining_phrase(count) == expected
 
 
-def test_an_empty_queue_ends_the_announcement_cleanly():
-    result = announce.build(item(), name="migration", summary="terminó el backfill")
-
-    assert result.text == "migration: terminó el backfill."
+def test_the_detail_is_what_that_window_wants_and_nothing_else():
+    """No name in front: it was the whole of the heads-up two seconds ago."""
+    assert announce.detail(item(), summary="terminó el backfill") == "terminó el backfill."
 
 
 def test_the_countdown_is_never_part_of_the_announcement():
@@ -62,18 +114,16 @@ def test_the_countdown_is_never_part_of_the_announcement():
     summary and the question — "…Queda uno. ¿La llamo fecha actual?" — which is
     what made the user ask which one was left.
     """
-    result = announce.build(
-        item(), name="migration", summary="terminó el backfill", naming_offer="indice viejo"
+    text = announce.detail(
+        item(), summary="terminó el backfill", naming_offer="indice viejo"
     )
 
-    assert result.text == "migration: terminó el backfill. ¿La llamo indice viejo?"
-    assert "Queda" not in result.text
+    assert text == "terminó el backfill. ¿La llamo indice viejo?"
+    assert "Queda" not in text
 
 
 def test_a_stop_without_a_summary_uses_the_fallback_phrase():
-    result = announce.build(item(), name="migration", summary=None)
-
-    assert result.text == "migration: terminó y te espera."
+    assert announce.detail(item(), summary=None) == "terminó y te espera."
 
 
 # --- menus ----------------------------------------------------------------
@@ -92,11 +142,9 @@ def test_menu_options_are_enumerated_as_words():
         },
     }
 
-    result = announce.build(item("menu", **payload), name="indice")
+    text = announce.detail(item("menu", **payload))
 
-    assert result.text == (
-        "indice: ¿Qué base uso? Opciones: uno: SQLite, dos: Postgres, tres: Ninguna."
-    )
+    assert text == "¿Qué base uso? Opciones: uno: SQLite, dos: Postgres, tres: Ninguna."
 
 
 @pytest.mark.parametrize(
@@ -176,9 +224,7 @@ def test_option_numbers_beyond_ten_fall_back_to_digits():
 def test_a_menu_without_options_still_reads_the_question():
     payload = {"tool_input": {"questions": [{"question": "¿Seguimos?"}]}}
 
-    result = announce.build(item("menu", **payload), name="indice")
-
-    assert result.text == "indice: ¿Seguimos?"
+    assert announce.detail(item("menu", **payload)) == "¿Seguimos?"
 
 
 def test_extra_questions_are_flagged_not_read():
@@ -192,7 +238,7 @@ def test_extra_questions_are_flagged_not_read():
         }
     }
 
-    text = announce.build(item("menu", **payload), name="x").text
+    text = announce.detail(item("menu", **payload))
 
     assert "Primera" in text
     assert "Segunda" not in text
@@ -202,7 +248,7 @@ def test_extra_questions_are_flagged_not_read():
 def test_a_single_extra_question_is_singular():
     payload = {"tool_input": {"questions": [{"question": "Primera"}, {"question": "Segunda"}]}}
 
-    assert "Y una pregunta más" in announce.build(item("menu", **payload), name="x").text
+    assert "Y una pregunta más" in announce.detail(item("menu", **payload))
 
 
 def test_long_option_labels_are_clipped():
@@ -212,7 +258,7 @@ def test_long_option_labels_are_clipped():
         }
     }
 
-    text = announce.build(item("menu", **payload), name="x").text
+    text = announce.detail(item("menu", **payload))
 
     assert "…" in text
     assert len(text) < 200
@@ -225,15 +271,14 @@ def test_an_option_without_a_label_uses_its_description():
         }
     }
 
-    assert "uno: la segura" in announce.build(item("menu", **payload), name="x").text
+    assert "uno: la segura" in announce.detail(item("menu", **payload))
 
 
 def test_a_malformed_menu_payload_still_says_something():
     for payload in ({}, {"tool_input": {}}, {"tool_input": {"questions": []}},
                     {"tool_input": {"questions": "nope"}}):
-        text = announce.build(item("menu", **payload), name="x").text
-        assert text.startswith("x: ")
-        assert len(text) > 4
+        text = announce.detail(item("menu", **payload))
+        assert "te está preguntando algo" in text
 
 
 # --- plans ----------------------------------------------------------------
@@ -242,17 +287,17 @@ def test_a_malformed_menu_payload_still_says_something():
 def test_a_plan_is_announced_by_its_first_heading():
     plan = "Some preamble\n\n## Migrar el índice\n\n1. Crear la tabla\n"
 
-    result = announce.build(item("menu", tool_input={"plan": plan}), name="indice")
+    text = announce.detail(item("menu", tool_input={"plan": plan}))
 
-    assert result.text.startswith("indice: pide aprobar un plan: Migrar el índice.")
+    assert text.startswith("pide aprobar un plan: Migrar el índice.")
 
 
 def test_a_plan_reads_out_the_options_it_can_be_answered_with():
     """The plan menu's rows are Claude's, not the payload's — say them anyway."""
-    result = announce.build(item("menu", tool_input={"plan": "## Migrar"}), name="x")
+    text = announce.detail(item("menu", tool_input={"plan": "## Migrar"}))
 
-    assert "Opciones: uno: aprobar y seguir en auto" in result.text
-    assert "dos: aprobar revisando cada edición" in result.text
+    assert "Opciones: uno: aprobar y seguir en auto" in text
+    assert "dos: aprobar revisando cada edición" in text
 
 
 @pytest.mark.parametrize(
@@ -272,29 +317,22 @@ def test_first_heading_extraction(markdown, expected):
 
 
 def test_a_plan_without_any_text_still_announces():
-    result = announce.build(item("menu", tool_input={"plan": "   "}), name="x")
-
-    assert "te está preguntando algo" in result.text
+    assert "te está preguntando algo" in announce.detail(item("menu", tool_input={"plan": "   "}))
 
 
 # --- notifications and milestones ----------------------------------------
 
 
 def test_a_notification_reads_its_message():
-    result = announce.build(
-        item("notification", message="Claude needs your permission to use Bash"),
-        name="workspace 21",
-        blocking_chime="Ping",
-    )
+    said = item("notification", message="Claude needs your permission to use Bash")
 
-    assert result.text == "workspace 21: Claude needs your permission to use Bash."
-    assert result.speak is True
-    assert result.chime == "Ping"
+    assert announce.detail(said) == "Claude needs your permission to use Bash."
+    assert announce.alert(said, name="workspace 21", blocking_chime="Ping").speak is True
 
 
 def test_muting_an_idle_nudge_takes_the_chime_with_it():
     """Chime-only was the same interruption without the part that justified it."""
-    result = announce.build(
+    result = announce.alert(
         item("notification", message="Claude is waiting for your input"),
         name="x",
         notification_events=False,
@@ -308,7 +346,7 @@ def test_muting_an_idle_nudge_takes_the_chime_with_it():
 
 def test_muting_the_nudges_does_not_mute_a_permission_prompt():
     """The two arrive through the same hook and are not the same thing."""
-    result = announce.build(
+    result = announce.alert(
         item("notification", message="Claude needs your permission to use Bash"),
         name="x",
         notification_events=False,
@@ -320,7 +358,7 @@ def test_muting_the_nudges_does_not_mute_a_permission_prompt():
 
 
 def test_a_notification_nobody_recognises_is_treated_as_a_block():
-    result = announce.build(
+    result = announce.alert(
         item("notification", message="Claude tripped over something new"),
         name="x",
         notification_events=False,
@@ -348,13 +386,11 @@ def test_only_the_idle_wording_reads_as_a_nudge(message, idle):
 
 
 def test_a_long_notification_is_clipped():
-    result = announce.build(item("notification", message="palabra " * 100), name="x")
-
-    assert len(result.text) < 200
+    assert len(announce.detail(item("notification", message="palabra " * 100))) < 200
 
 
 def test_a_milestone_only_chimes():
-    result = announce.build(
+    result = announce.alert(
         item("milestone", label="PR created"), name="x", milestone_chime="Glass"
     )
 
@@ -388,9 +424,9 @@ def test_hyphens_inside_names_become_spaces():
 
 
 def test_hyphens_are_stripped_in_the_announced_name():
-    result = announce.build(item(), name="draft-mode-changes", summary="listo")
+    result = announce.alert(item(), name="draft-mode-changes")
 
-    assert result.text == "draft mode changes: listo."
+    assert result.text == "Nuevo evento de draft mode changes."
 
 
 def test_an_empty_phonetic_dictionary_changes_nothing():
@@ -414,17 +450,15 @@ def test_speakable_collapses_newlines_and_whitespace():
 
 
 def test_the_summary_goes_through_the_phonetic_dictionary():
-    result = announce.build(
-        item(), name="x", summary="quiere hacer merge", phonetic=PHONETIC
-    )
+    text = announce.detail(item(), summary="quiere hacer merge", phonetic=PHONETIC)
 
-    assert result.text == "x: quiere hacer merch."
+    assert text == "quiere hacer merch."
 
 
 def test_a_trailing_period_in_the_summary_is_not_doubled():
-    result = announce.build(item(), name="x", summary="listo.", naming_offer="el del backfill")
+    text = announce.detail(item(), summary="listo.", naming_offer="el del backfill")
 
-    assert result.text == "x: listo. ¿La llamo el del backfill?"
+    assert text == "listo. ¿La llamo el del backfill?"
 
 
 # --- the queue, read out loud ----------------------------------------------
@@ -505,20 +539,29 @@ def test_pause_wins_over_busy_because_nothing_is_being_announced():
 
 
 def test_the_naming_offer_is_the_last_thing_asked():
-    result = announce.build(
-        item(), name="darwin-21", summary="terminó los tests", naming_offer="tests worker"
-    )
+    text = announce.detail(item(), summary="terminó los tests", naming_offer="tests worker")
 
-    assert result.text == "darwin 21: terminó los tests. ¿La llamo tests worker?"
+    assert text == "terminó los tests. ¿La llamo tests worker?"
 
 
 def test_no_offer_leaves_the_announcement_exactly_as_it_was():
-    assert announce.build(item(), name="x", summary="listo", naming_offer="").text == "x: listo."
+    assert announce.detail(item(), summary="listo", naming_offer="") == "listo."
 
 
 def test_the_offered_name_goes_through_the_phonetic_dictionary():
-    result = announce.build(
-        item(), name="x", summary="listo", naming_offer="merge worker", phonetic=PHONETIC
+    text = announce.detail(
+        item(), summary="listo", naming_offer="merge worker", phonetic=PHONETIC
     )
 
-    assert result.text.endswith("¿La llamo merch worker?")
+    assert text.endswith("¿La llamo merch worker?")
+
+
+# --- how much piled up while you were busy ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "count, expected",
+    [(0, ""), (1, "Tenés un pendiente"), (3, "Tenés tres pendientes"), (12, "Tenés 12 pendientes")],
+)
+def test_the_count_on_its_own_is_what_busy_mode_owes_you(count, expected):
+    assert announce.pendings_count(count) == expected

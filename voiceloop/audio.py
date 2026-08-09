@@ -228,8 +228,15 @@ class Recorder:
         *,
         stop: asyncio.Event | None = None,
         on_open: Callable[[], Awaitable[None]] | None = None,
+        speech_timeout: float | None = None,
     ) -> Recording:
-        """Capture until silence, the toggle, the timeout, or `max_seconds`."""
+        """Capture until silence, the toggle, the timeout, or `max_seconds`.
+
+        `speech_timeout` overrides how long this one take waits for you to
+        start. The heads-up mic uses a short one: it is asking a question with
+        two words for an answer, and if you have not started in four seconds
+        you are not there.
+        """
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
@@ -268,7 +275,9 @@ class Recorder:
 
         pumping = asyncio.create_task(pump())
         try:
-            reason = await self._wait_for_end(process, opened, cut, stop, on_open)
+            reason = await self._wait_for_end(
+                process, opened, cut, stop, on_open, speech_timeout
+            )
         finally:
             pumping.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -289,6 +298,7 @@ class Recorder:
         cut: asyncio.Event,
         stop: asyncio.Event | None,
         on_open: Callable[[], Awaitable[None]] | None,
+        speech_timeout: float | None = None,
     ) -> str:
         try:
             await asyncio.wait_for(opened.wait(), timeout=self.open_timeout)
@@ -307,7 +317,7 @@ class Recorder:
             waits[asyncio.ensure_future(stop.wait())] = REASON_TOGGLE
 
         # No speech at all closes the mic early; speech extends it to the cap.
-        deadline = self.speech_timeout
+        deadline = self.speech_timeout if speech_timeout is None else max(0.1, speech_timeout)
         reason = REASON_TIMEOUT
         try:
             while True:
