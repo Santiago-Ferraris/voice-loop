@@ -65,6 +65,7 @@ from . import (
     preflight,
     roster as roster_mod,
     spool,
+    vocabulary,
 )
 from .audio import AudioUnavailable, MicConsentPending, Recorder
 from .config import Config, ConfigError, load as load_config
@@ -88,6 +89,9 @@ from .tts import Speaker
 INGEST_INTERVAL = 0.25
 ANNOUNCE_INTERVAL = 0.2
 MILESTONE_INTERVAL = 1.0
+# The vocabulary is derived from months of transcripts; checking whether it is
+# due costs a stat, and recomputing it is minutes-old-at-worst either way.
+VOCABULARY_INTERVAL = 300.0
 # Windows close all the time and say nothing about it. Often enough that
 # `pendings` never lists a dead one, rarely enough to be a few JSON reads.
 RECONCILE_INTERVAL = 5.0
@@ -188,6 +192,15 @@ class Daemon:
         self.output = output or output_mod.OutputProbe.from_config(config)
         self.classifier = classifier or classify_mod.Classifier.from_config(config)
         self.new_tab_command = str(config.get("windows.new_tab_command", "") or "")
+        self.vocabulary_enabled = bool(config.get("vocabulary.enabled", True))
+        self.vocabulary_pattern = str(
+            config.get("vocabulary.transcripts", vocabulary.DEFAULT_TRANSCRIPT_GLOB)
+        )
+        self.vocabulary_max_age = float(config.get("vocabulary.refresh_hours", 6)) * 3600
+        self.vocabulary_limit = int(config.get("vocabulary.limit", vocabulary.DEFAULT_LIMIT))
+        self.vocabulary_min_count = int(
+            config.get("vocabulary.min_count", vocabulary.DEFAULT_MIN_COUNT)
+        )
         self.plan_feedback_index = int(
             config.get("delivery.plan_menu.feedback_index", delivery_mod.PLAN_FEEDBACK)
         )
@@ -236,6 +249,7 @@ class Daemon:
             asyncio.create_task(self._announce_loop(), name="announce"),
             asyncio.create_task(self._reconcile_loop(), name="reconcile"),
             asyncio.create_task(self._milestone_loop(), name="milestones"),
+            asyncio.create_task(self._vocabulary_loop(), name="vocabulary"),
         ]
         try:
             await self._stop.wait()
@@ -383,6 +397,14 @@ class Daemon:
             except Exception:  # noqa: BLE001 - never let the announcer die
                 log.exception("announce failed")
             await asyncio.sleep(ANNOUNCE_INTERVAL)
+
+    async def _vocabulary_loop(self) -> None:
+        while True:
+            try:
+                await self.refresh_vocabulary()
+            except Exception:  # noqa: BLE001
+                log.exception("vocabulary refresh failed")
+            await asyncio.sleep(VOCABULARY_INTERVAL)
 
     async def _milestone_loop(self) -> None:
         while True:
@@ -629,6 +651,26 @@ class Daemon:
                 action = queued.pop(0)
                 intent = action.as_intent()
 
+                if guess is not None and carried is None:
+                    # Not "was that for the window?" — it was plainly for me,
+                    # and only the recognizer disagrees. Ask by name, before
+                    # anything is acted on.
+                    question = announce_mod.speakable(
+                        announce_mod.near_miss_question(transcript.text, guess.kind),
+                        self.phonetic,
+                    )
+                    answer = await self._say_then(question, listening=more_rounds)
+                    if answer is not None and intents.parse(answer.text).kind == (
+                        intents.KIND_CONFIRM
+                    ):
+                        queued = [guess]
+                        follow = None
+                        guess = None
+                        continue
+                    follow = answer
+                    queued = []
+                    continue
+
                 if carried is not None:
                     if intent.kind == intents.KIND_CONFIRM:
                         return ALERT_ANSWER, carried
@@ -684,22 +726,6 @@ class Daemon:
                     # Served once this cycle has unwound; see `_follow_switch`.
                     self._switch_to = chosen.id
                     return ALERT_NONE, None
-
-                if guess is not None and carried is None:
-                    # Not "was that for the window?" — it was plainly for me,
-                    # and only the recognizer disagrees. Ask by name.
-                    question = announce_mod.speakable(
-                        announce_mod.near_miss_question(transcript.text, guess.kind),
-                        self.phonetic,
-                    )
-                    answer = await self._say_then(question, listening=more_rounds)
-                    if answer is not None and intents.parse(answer.text).kind == (
-                        intents.KIND_CONFIRM
-                    ):
-                        follow = dataclasses.replace(answer, text=guess.phrase)
-                    else:
-                        follow = answer
-                    continue
 
                 carried = dataclasses.replace(transcript, text=intent.text or transcript.text)
                 follow = await self._say_then(
@@ -935,14 +961,20 @@ class Daemon:
         return bool(self.mic_enabled and self.stt is not None)
 
     def keyterms(self) -> list[str]:
-        """Config vocabulary plus the names of the windows that exist right now.
+        """Everything the recognizer should have heard of before you say it.
 
-        A session name only transcribes if the recognizer has been told it
-        exists, and the names change every time you open a window — so they are
-        collected per request rather than baked into the engine.
+        Three sources, and only the first is hand-kept: the `keyterms` list in
+        the config, the vocabulary extracted from your own Claude transcripts
+        (see `vocabulary.py` — this is where `mergeado` and `lambda` come
+        from), and the names of the windows that exist *right now*. The last
+        one is why this is collected per request rather than baked into the
+        engine: a session name only transcribes if the recognizer has been told
+        it exists, and the names change every time you open a tab.
         """
         configured = self.config.get("keyterms") or []
         terms = [str(term) for term in configured] if isinstance(configured, (list, tuple)) else []
+        if self.vocabulary_enabled:
+            terms.extend(vocabulary.load(self.state_dir))
         try:
             sessions = roster_mod.load(self.roster_dir)
         except OSError:
@@ -952,6 +984,31 @@ class Daemon:
                 terms.append(session.name)
         terms.extend(self.store.aliases())
         return terms
+
+    async def refresh_vocabulary(self, *, force: bool = False) -> list[str]:
+        """Recompute the extracted vocabulary if it is stale. Off the loop.
+
+        Never fatal and never blocking: a machine with no transcripts, or a
+        read that fails halfway, leaves the config list and the window names
+        doing exactly what they did before this existed.
+        """
+        if not self.vocabulary_enabled:
+            return []
+        now = time.time()
+        if not force and vocabulary.age_seconds(self.state_dir, now=now) < self.vocabulary_max_age:
+            return []
+        try:
+            return await asyncio.to_thread(
+                vocabulary.refresh,
+                self.state_dir,
+                now=now,
+                pattern=self.vocabulary_pattern,
+                min_count=self.vocabulary_min_count,
+                limit=self.vocabulary_limit,
+            )
+        except Exception:  # noqa: BLE001 - vocabulary is a nicety, not a dependency
+            log.exception("could not refresh the vocabulary")
+            return []
 
     async def listen(self, *, timeout: float | None = None) -> Transcript | None:
         """One take with nothing to say first: chime, record, transcribe.
@@ -1108,15 +1165,9 @@ class Daemon:
         point: a phrase we were unsure about is never typed anywhere.
         """
         if intent.kind == intents.KIND_CONFIRM:
-            phrase = guess.phrase
-            log.info("near miss %r -> %s (%.2f)", transcript.text, guess.kind, guess.ratio)
-            return (
-                intents.parse(
-                    phrase, menu.labels if menu else (), multi=bool(menu and menu.multi_select)
-                ),
-                dataclasses.replace(transcript, text=phrase),
-                None,
-            )
+            log.info("doubt settled: %r -> %s", transcript.text, guess.kind)
+            del menu
+            return guess.as_intent(), transcript, None
         if intent.kind in (intents.KIND_SILENCE, intents.KIND_CANCEL):
             # "no" answers the question, and there is nothing behind it: what
             # we were unsure about is dropped, never sent on to a window.
@@ -1139,9 +1190,13 @@ class Daemon:
         if intent.kind != intents.KIND_TEXT:
             return classify_mod.Plan.of(intent)
 
-        guess = intents.nearest_control(transcript.text)
-        if guess is not None:
-            return classify_mod.Plan.of(intent, classify_mod.SOURCE_DOUBTFUL, guess=guess)
+        near = intents.nearest_control(transcript.text)
+        if near is not None:
+            return classify_mod.Plan.of(
+                intent,
+                classify_mod.SOURCE_DOUBTFUL,
+                guess=classify_mod.Action(kind=near.kind),
+            )
 
         actions = await asyncio.to_thread(
             self.classifier.classify, transcript.text, self.window_names()
@@ -1165,7 +1220,26 @@ class Daemon:
             transcript.text,
             ", ".join(action.kind for action in resolved),
         )
+        if self._unsure(transcript) and resolved[0].kind != intents.KIND_TEXT:
+            # Measured on the real thing: "dámelo" came back as "jamelo" at
+            # 0.75 and "dame los pendientes" as "dame los pendins" at 0.70. A
+            # model can read through that, and often should — but a command
+            # built on words the recognizer itself doubted is asked about, not
+            # run. Dictation is exempt: it has its own gate downstream.
+            return classify_mod.Plan.of(
+                intent, classify_mod.SOURCE_DOUBTFUL, guess=resolved[0]
+            )
         return classify_mod.Plan(resolved, classify_mod.SOURCE_LLM)
+
+    def _unsure(self, transcript: Transcript) -> bool:
+        """Did the recognizer itself say it was not sure? Inclusive of the line.
+
+        The delivery gate uses the same number to decide whether to read a
+        phrase back before typing it, and the boundary is `<=` here because
+        0.75 *is* what a bad take measured at.
+        """
+        confidence = transcript.confidence
+        return confidence is not None and confidence <= self.gate.threshold
 
     def window_names(self) -> list[str]:
         """Every window that can be addressed by name, for "decile a X que…"."""
@@ -1427,6 +1501,20 @@ class Daemon:
                     # Neither a yes nor anything else worth acting on. The
                     # doubtful phrase is dropped rather than delivered.
                     return REPLY_PENDING
+            elif guess is not None:
+                # Before anything is dispatched: a command built out of words
+                # the recognizer doubted is asked about, never run.
+                pending_guess = guess
+                self._queue_actions(queued)
+                queued = []
+                first = await self._say_then(
+                    announce_mod.speakable(
+                        announce_mod.near_miss_question(transcript.text, guess.kind),
+                        self.phonetic,
+                    ),
+                    listening=more_rounds,
+                )
+                continue
 
             if intent.kind == intents.KIND_LATER:
                 # Same instruction as at the heads-up: not now, and not first.
@@ -1471,22 +1559,6 @@ class Daemon:
                 first = await self._say_then(
                     announce_mod.speakable(menu.describe(intent.index), self.phonetic),
                     listening=more_rounds and not queued,
-                )
-                continue
-
-            if intent.kind == intents.KIND_TEXT and pending_action is None and guess:
-                pending_guess = guess
-                # Whatever else the same breath asked for waits until this is
-                # settled: a question with an answer half-said into it is worse
-                # than one thing at a time.
-                self._queue_actions(queued)
-                queued = []
-                first = await self._say_then(
-                    announce_mod.speakable(
-                        announce_mod.near_miss_question(transcript.text, guess.kind),
-                        self.phonetic,
-                    ),
-                    listening=more_rounds,
                 )
                 continue
 
@@ -1603,6 +1675,10 @@ class Daemon:
         question you ask precisely when you have not been listening.
         """
         text = self.status_sentence()
+        # Logged because from outside the machine a spoken answer and no answer
+        # at all look identical, and this is the one command whose whole output
+        # is a sentence nobody can grep for afterwards.
+        log.info("status: %s", text)
         await self.speaker.speak(announce_mod.speakable(text, self.phonetic))
         return text
 
@@ -1637,6 +1713,7 @@ class Daemon:
         spoken = announce_mod.speakable(
             announce_mod.describe_pendings(entries), self.phonetic
         )
+        log.info("pendings: %d item(s) — %s", len(items), spoken)
         if not items:
             await self.speaker.speak(spoken)
             return None

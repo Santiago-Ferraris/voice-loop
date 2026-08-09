@@ -110,11 +110,38 @@ honest:
   things, and they run in the order you said them. A failure in one is spoken and the rest
   still run; anything on the destructive list still gets read back first.
 
-**A near miss never reaches the model.** "dame al pendiente" is what the recognizer heard for
-"dame los pendientes" — 0.89 similar to a phrase we know — and a transcript we already distrust
-is not made trustworthy by a second opinion on its wording. It is asked about by name:
-*"Entendí: dame al pendiente. ¿Querés los pendientes?"* A yes runs the command; a no, silence,
-or anything else drops it. It is never delivered.
+**A near miss never reaches the model.** It is asked about by name — *"Entendí: dame al
+pendiente. ¿Querés los pendientes?"* — and a yes runs the command, while a no, silence, or
+anything else drops it. It is never delivered.
+
+How close it has to be depends on how much is at stake, because **recognizer confidence does
+not detect this failure and never will**. Measured out loud on a machine somebody was working
+on:
+
+| said | heard | confidence |
+|---|---|---|
+| "contame" | `'contain'` | **0.96** |
+| "dámelo" | `'chamelo'` / `'jamelo'` | 0.75 |
+| "dame los pendientes" | `'dame los pendins'` | 0.70 |
+
+`'contain'` was typed into a working window and the user asked what it was. The recognizer was
+*right* — it heard a sound that genuinely resembles "contain" — so the error is semantic and
+the score was 0.96. So the policy is inverted: not "deliver unless the recognizer was unsure",
+but **"deliver only when this is plausibly something you would dictate"**. A phrase long enough
+to be an instruction has to look *a lot* like a command (0.8) before we doubt it; one or two
+words has only to look *somewhat* like one (0.7), because nobody dictates two words to Claude.
+A yes in front — "dale, mergealo" — is stripped before comparing, or every instruction that
+opens with "dale" would be asked about forever.
+
+### The vocabulary writes itself
+
+`keyterms` is what stops the recognizer inventing domain words — without it *"mergealo"* comes
+back as *"MGalo"* — and a hand-kept list is wrong the week after you write it. So most of it is
+derived: Claude already stores every prompt you have typed under `~/.claude/projects/*/*.jsonl`,
+and counting the words in **your own** messages, minus ordinary Spanish, produces the real list
+(`pr`, `test`, `issue`, `draft`, `stage`, `mergeado`, `lambda`…). Recomputed in the background
+every `vocabulary.refresh_hours`, and merged with your `keyterms` and the names of the windows
+open right now.
 
 ### Getting spanglish right
 

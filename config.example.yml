@@ -64,13 +64,32 @@ microphone:
 
 # Terms the recognizer would otherwise invent. Deepgram sends these as `keyterm`
 # params; OpenAI folds them into the transcription prompt. Without them, domain
-# words come back mangled. Put YOUR services, tools and verbs here.
+# words come back mangled. Put YOUR services, tools and verbs here — but see
+# `vocabulary` below: most of this list writes itself.
 keyterms:
   - staging-api
   - worker-queue
   - integration-suite
   - rate-limiter
   - feature-flag
+
+# The rest of the vocabulary, taken from the words you have actually used.
+#
+# A hand-kept `keyterms` list is wrong the week after you write it, and it can
+# never contain the terms that matter most — whatever you happen to be working
+# on this month. Claude already keeps every prompt you have typed; counting the
+# words in your own messages produces the real list (`pr`, `test`, `issue`,
+# `draft`, `stage`, `mergeado`, `lambda`…). Recomputed in the background, and
+# merged with `keyterms` above and the names of the windows open right now.
+vocabulary:
+  enabled: true
+  transcripts: ~/.claude/projects/*/*.jsonl
+  refresh_hours: 6
+  # Deepgram rejects an over-long query string, and the tail of a frequency
+  # list is the least useful part of it.
+  limit: 80
+  # Said fewer times than this, it is a typo, not a term.
+  min_count: 3
 
 summaries:
   provider: openai

@@ -317,3 +317,62 @@ def test_the_hotkey_still_answers_the_window_that_spoke_last(build):
     hotkey(daemon)
 
     assert daemon.delivery.sent == [("text", TTY, "y agregá un test")]
+
+
+# --- the two holes, measured on the installed system ------------------------
+#
+# Synthetic voice through the speakers, against the daemon as it ships today:
+#
+#   "dame los pendientes" -> 'dame los pendientes'  exact, answered.  works
+#   "estado"              -> 'estado'               exact, answered.  works
+#   "dámelo"              -> 'chamelo'              -> text -> nothing happened
+#   "later"               -> 'later'                -> text -> nothing happened
+#
+# What is in the lexicon and transcribes cleanly already works. The two holes
+# are imperfect transcription and phrasing the lexicon never heard of, and they
+# are the two halves of this module.
+
+
+def test_chamelo_is_understood_and_then_asked_about(build):
+    """The recognizer mangled it; the model reads through it; we still ask.
+
+    "chamelo" scores 0.77 against "damelo" — under the near-miss line — so it
+    reaches the model, which has no trouble with it. But it arrived at 0.75
+    confidence, and a command built out of words the recognizer doubted is
+    asked about before it runs.
+    """
+    daemon = build(
+        ["chamelo", "dale", "mergealo"],
+        confidence=0.75,
+        classifier=understanding({"chamelo": [{"intent": "give"}]}),
+    )
+    queue(daemon, kind="stop")
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.speaker.spoken[0] == "Entendí: chamelo. ¿Querés que te lo lea?"
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_later_is_understood_without_being_in_the_lexicon(build):
+    """Transcribed perfectly, and the lexicon has no English. It did nothing."""
+    item_ids = []
+    daemon = build(
+        ["later"], classifier=understanding({"later": [{"intent": "later"}]})
+    )
+    item_ids.append(queue(daemon, kind="stop"))
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.delivery.sent == []
+    assert daemon.store.get(item_ids[0]).deferred_at is not None
+
+
+def test_what_already_worked_still_works_and_still_offline(build):
+    """The other half of the baseline: do not regress what was answering."""
+    daemon = build(["dame los pendientes", ""], classifier=understanding(transport=NoNetwork()))
+    queue(daemon, kind="stop")
+
+    asyncio.run(daemon.announce_next())
+
+    assert any("pendiente" in spoken.lower() for spoken in daemon.speaker.spoken)

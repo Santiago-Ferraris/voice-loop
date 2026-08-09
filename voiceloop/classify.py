@@ -153,10 +153,14 @@ class Plan:
 
     actions: tuple[Action, ...] = ()
     source: str = SOURCE_LEXICON
-    # Set when the phrase was *nearly* a command: the caller asks rather than
-    # acting, and the model is never consulted — a transcript we do not trust
-    # is not made more trustworthy by a second opinion on its wording.
-    guess: intents.NearMiss | None = None
+    # What we think it was, when we are not sure enough to just do it. Two
+    # things put a plan here and both are about the *transcript*, not the
+    # meaning: a phrase that was nearly a control word ("jamelo" for "dámelo",
+    # measured), and a recognizer that said out loud it was unsure. Either way
+    # the caller asks — "Entendí: jamelo. ¿Querés que te lo lea?" — and never
+    # acts, because both readings of a bad transcript are cheap to ask about
+    # and expensive to guess.
+    guess: Action | None = None
 
     @property
     def first(self) -> Action | None:
