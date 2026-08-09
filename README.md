@@ -48,16 +48,34 @@ that owns state, and the only one that does anything slow — summarizing, speak
 
 Windows identify themselves by Claude's own session name, so what you hear matches what you see
 in the prompt box and in `/resume`. A session still running an auto-generated name (`darwin-21`)
-is announced with a summary and a proposed name; say "dale" and it sticks. See
-[Naming windows out loud](#naming-windows-out-loud).
+is announced as "darwin 21" and offered a better one the moment you ask what it wants; say "dale"
+and it sticks. See [Naming windows out loud](#naming-windows-out-loud).
+
+**The announcement is a heads-up, not a report.** A window that blocks gets a chime, its name,
+and four seconds of microphone:
+
+```
+ventana se bloquea
+  → chime + "Nuevo evento de inbox realtime"
+  → el mic se abre solo, ~4 s
+     → "dámelo"   → el resumen, y el mic para contestarlo → "quedan N"
+     → "después"  → al fondo de la cola
+     → silencio   → se queda en la cola y el mic se cierra
+```
+
+That is the whole interruption. Nothing is ever announced twice and nothing is ever reminded
+about: an ignored window waits in `pendings`, silently, until you ask for it. See
+[Answering out loud](#answering-out-loud).
 
 ## Design decisions
 
 | Area | Decision |
 |---|---|
-| Mic | Opens automatically after each announce; also on a global hotkey. Toggle, with silence cutoff — not push-to-hold |
+| Announcing | A heads-up: a chime and the window's name. What it wants is what "dámelo" is for |
+| Mic | Opens automatically after each announce — four seconds on the heads-up, longer once you are answering — and on a global hotkey. Toggle, with silence cutoff, not push-to-hold |
 | Hotkeys | Two, via `skhd` (no GUI, no menu bar icon): open mic, and toggle busy mode |
-| Busy mode | Chime only, no speech. The mic still works — you can ask for your pendings at any time |
+| Busy mode | Silence: no chime, no voice, no mic. The queue piles up and the toggle says how much. The hotkey still works — you can ask for your pendings at any time |
+| Reminders | None. An announcement happens once; after that the item waits to be asked for |
 | Queue | FIFO, auto-chaining. Skipped items are never dropped |
 | Focus | Never moves on its own. "mostrame" focuses the tab on request |
 | Delivery | Submits automatically; reads back first when the recognizer was unsure or the phrase looks destructive |
@@ -153,7 +171,7 @@ bin/voice-loopctl pause      # silence without losing the queue
 | Key | What it does |
 |---|---|
 | `ctrl + alt + cmd - m` | Open the mic — or close one that is already open, which is how you send |
-| `ctrl + alt + cmd - b` | Busy mode: announcements chime instead of speaking, and stop opening the mic on their own |
+| `ctrl + alt + cmd - b` | Busy mode: nothing is announced at all and the queue piles up. It says which mode it left you in — "ocupado" going in, "te escucho" and how much piled up coming out |
 
 The block goes into `~/.config/skhd/skhdrc` between markers, so re-running updates it in place
 and `--remove` takes it back out; the rest of your file is never touched, and it is backed up
@@ -257,19 +275,27 @@ The mic opens by itself after every announcement, and by hotkey whenever you wan
 **toggle**, not push-to-talk: it closes on its own after a beat of silence, or when you press
 the key again. Say nothing and the item simply stays in `pendings` — the queue moves on.
 
+**The heads-up mic is shorter** (`announce.alert_mic_timeout_seconds`, four seconds) because it
+is asking a question with two words for an answer. Everything below works in it — it is a
+microphone, not a menu — with one difference: a **sentence** is read back rather than delivered.
+Nothing has been said about that window yet, so a sentence there is as likely to be a word to
+somebody in the room as an answer for a window you have not heard about.
+
 | You say | What happens |
 |---|---|
+| "dámelo" / "contame" / "a ver" | Reads out what that window wants, and opens the mic to answer it |
+| "después" / "mandalo al fondo" | To the back of the line, without a word about what it wanted. There is no snooze by the clock |
 | anything at all | Typed into that window verbatim and submitted. Claude reads disfluent speech fine |
 | "dos", "la dos", "postgres" | Picks that option off the menu |
 | "uno y tres" | Both, on a multi-select menu |
 | "explicame la dos" | Reads you that option's description, mic stays open |
-| "repetí" | Says the announcement again |
+| "repetí" | Says the last thing it said again |
 | "mostrame" | Focuses that tab. Nothing else ever moves your focus |
-| "salteá" / "después" | Leaves it pending and moves on |
-| "dale" / "no" | Confirms or cancels a read-back. Anywhere else it is just a word, and gets typed |
+| "salteá" | Leaves it where it is and moves on |
+| "dale" / "no" | Confirms or cancels a read-back. On a heads-up, "dale" means "dámelo". Anywhere else it is just a word, and gets typed |
 | "dame los pendientes" / "cuál queda" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
 | "estado" / "cómo venimos" | Windows open, how many are working, how many are waiting on you |
-| "qué dijiste" / "no te entendí" | Says the announcement again |
+| "qué dijiste" / "no te entendí" | Says the last thing it said again |
 | "esperá" / "un segundo" | Holds the mic. Not an answer and not a refusal — nothing is typed, nothing is dropped |
 
 **Menus are read short.** A question plus its labels, and the labels only as far as they say
@@ -290,19 +316,21 @@ straight through.
 
 **The queue, out loud.** "dame los pendientes" works from anywhere, busy mode included, where the
 hotkey is the only microphone you get. It reads the list in the order things arrived and then
-waits for a pick — "la dos", or the window's name. The window you pick is re-announced and gets
-the mic exactly as if it had just blocked; the one you were on stays pending, reachable, and in
-its place in line. Any item whose summary was dropped by a supersede is summarised as the list is
-read, so no entry is ever just a name.
+waits for a pick — "la dos", or the window's name. The window you pick is served **at once**, with
+no heads-up and no second "dámelo": you just said which one you wanted. The one you were on stays
+pending, reachable, and in its place in line. Any item whose summary is missing is summarised as
+the list is read, so no entry is ever just a name — and windows that have closed since are
+dropped before the list is read at all.
 
 ## Naming windows out loud
 
 Claude names an unnamed window after its directory and two hex characters — `darwin-21`,
 `darwin-ae`. Spoken, three of those in one repo are three identical noises. So the first time
-such a window announces itself you hear:
+such a window announces itself you hear *"Nuevo evento de darwin 21"* — the autogenerated name
+is a bad name, but it is the name, and the heads-up has no room for anything else. The offer
+comes with the summary, when you ask for it:
 
-> *"Ventana nueva en darwin platform: terminó los tests del event processor. ¿La llamo tests
-> event processor?"*
+> *"Terminó los tests del event processor. ¿La llamo tests event processor?"*
 
 - **"dale"** keeps that name. **A short phrase** — "índice de migración" — keeps yours instead.
 - **A yes with the name attached** — "sí, llamala fecha actual" — is read as the yes it is. That
@@ -330,8 +358,9 @@ become what the announcement says *and* vocabulary for the recognizer, so saying
 window transcribes as the name and not as three unrelated words.
 
 The proposal costs nothing extra: it is one more field on the `gpt-4o-mini` request that was
-already summarising that turn — two readings of the same paragraph, one call. If the model is
-down you lose the offer and keep the announcement.
+already summarising that turn — two readings of the same paragraph, one call. Both are stored,
+so an item you postpone and come back to an hour later still has its name to offer without
+paying for the paragraph twice. If the model is down you lose the offer and keep the summary.
 
 ## How delivery works
 
@@ -372,10 +401,15 @@ announcement and your answer must not have keystrokes delivered to whatever inhe
 - Ignored announcements are never dropped: `voice-loopctl pendings` still lists them, by window
   name, whether or not they have been announced yet. `voice-loopctl skip [id]` is the way out
   for an item that stopped mattering — without it, only real activity in that session clears it.
-- A superseded item loses its summary on purpose — it described a turn that is no longer the last
-  one — and gets a fresh one **when the list is read**, by `pendings` or out loud. Not in the
-  background: nothing is spent summarising turns you never ask about, and the announce path stays
-  free of the latency.
+- **Summaries are computed on arrival**, off the loop, so "dámelo" answers at once instead of
+  going quiet for five seconds in the middle of a sentence you started. Once per item: the
+  fallback is not stored, so a provider that is down is not retried four times a second. A
+  superseded item loses its summary on purpose — it described a turn that is no longer the last
+  one — and gets a fresh one on arrival of the turn that replaced it, or when the list is read.
+- **An event whose window has closed is dropped, not announced.** There is nobody left to answer
+  it, and listing it in `pendings` is an errand you can never run. Checked before announcing,
+  before reading the list, and on a five-second timer — tabs close while you work, and say
+  nothing when they do. An unreadable roster means "I cannot tell", and drops nothing.
 - Milestones (a PR being created) only chime. If some other tool of yours already tracks a
   per-terminal phase in a file, point `integrations.milestone_file_watch` at it — off by default.
 - **The chime and the voice overlap on purpose.** A chime is an attack and then a tail that says
