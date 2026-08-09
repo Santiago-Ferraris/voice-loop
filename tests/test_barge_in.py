@@ -148,3 +148,31 @@ def test_barge_in_off_is_the_speakers_path_whatever_is_plugged_in(build):
 
     assert daemon.speaker.interruptions == 0
     assert daemon.recorder.armings == [True, True]
+
+
+# --- the mic that opens with nothing to say --------------------------------
+
+
+def test_on_speakers_the_cue_chime_is_not_you_starting_to_talk(build):
+    """The hotkey mic still makes a noise, and the mic hears it on speakers.
+
+    Now that a take ends when *you* stop talking, a chime counted as speech is
+    a take that closes three seconds after it rang — before you have said a
+    word, and with the window it was supposed to give you already gone.
+    """
+    daemon = build(["la dos"])
+
+    asyncio.run(daemon.listen())
+
+    assert daemon.recorder.armings == [True]
+    assert daemon.recorder.barges == [False]
+
+
+def test_the_cue_chime_goes_behind_the_arm_point_on_headphones_too(build):
+    """Nothing of ours is being *said* on this path, so there is no sentence to
+    barge in on and nothing is lost by waiting out the cue either way."""
+    daemon = build(["la dos"], output=audio_output(private=True))
+
+    asyncio.run(daemon.listen())
+
+    assert daemon.recorder.armings == [True]

@@ -46,22 +46,35 @@ microphone:
   # every Mac; put the name of yours in config.local.yml.
   device: ":0"
   ffmpeg: ffmpeg
-  # Hard cap on one take. The silence cutoff normally ends it long before.
+  # The net, not the window: a take ends when you stop talking, and this is
+  # only what happens if you never do.
   max_seconds: 60
   # avfoundation takes about a second to hand over the first sample; the "speak
   # now" chime waits for it. Give up if it never arrives.
   open_timeout_seconds: 8
   # Keep the WAVs in <state_dir>/mic instead of deleting them. Debugging only.
   keep_recordings: false
+  # What ends a take. The threshold is not a number you have to get right: the
+  # room is measured at the start of every take and your voice is whatever
+  # sits `margin_db` above it, which is the only thing that survives a
+  # different room, a different input gain or new headphones.
   silence:
     enabled: true
-    # Anything quieter than this counts as silence — for the cutoff that ends
-    # a take, and for deciding whether a take that ran out of time has anything
-    # in it worth transcribing. Set it between your room and your voice: the
-    # log prints both levels on every take that closes on the timeout.
+    # How long you have to stop talking for the take to be over. This is the
+    # one to move if you feel rushed (up) or waited on (down).
+    min_seconds: 3
+    # How much of the take is the room. Measured before your first word, so
+    # keep it comfortably shorter than it takes anyone to start answering.
+    calibration_seconds: 0.5
+    # How far above the room a voice has to be. Ten dB, against the twenty-odd
+    # a voice actually clears a room by, leaves room for a quiet answer and
+    # still ignores the chair and the keyboard.
+    margin_db: 10
+    # Only a fallback: used when the measured floor is not a room at all —
+    # digital silence, or a floor nothing could clear. It is also what decides
+    # whether a take that ran out of time has anything in it worth
+    # transcribing; the log prints the levels on every take that ends that way.
     noise_db: -35
-    # …and this much of it, after you have started talking, closes the mic.
-    min_seconds: 1.2
     # Silence reported before this point is you not having started yet.
     min_speech_seconds: 0.6
 
@@ -157,10 +170,10 @@ announce:
   busy_chime: Submarine
   # How long a mic that opened on its own waits for you to start talking.
   mic_timeout_seconds: 8
-  # How long a mic that opened *under a sentence* stays open once that sentence
-  # ends. It is not a window you have to catch: capture starts before the
-  # chime, runs under every word, and only then does this start counting. Start
-  # talking inside it and it waits for you to finish.
+  # How long a mic that opened *under a sentence* waits, once that sentence
+  # ends, for you to start. It is not how long you have to talk: say a word
+  # inside it and this stops applying — from there the take ends
+  # `microphone.silence.min_seconds` after your last one.
   mic_grace_seconds: 10
   # Claude's own Notification events. Two different things arrive through this
   # one hook and the payload says which: a permission prompt ("Claude needs your

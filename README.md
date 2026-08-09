@@ -72,7 +72,7 @@ about: an ignored window waits in `pendings`, silently, until you ask for it. Se
 | Area | Decision |
 |---|---|
 | Announcing | A heads-up: a chime and the window's name. What it wants is what "dámelo" is for |
-| Mic | Opens automatically after each announce — four seconds on the heads-up, longer once you are answering — and on a global hotkey. Toggle, with silence cutoff, not push-to-hold |
+| Mic | Opens automatically after each announce and on a global hotkey. The window is time to *start*: once you do, the take ends three seconds after your last word, not on a clock. Toggle, not push-to-hold |
 | Hotkeys | Two, via `skhd` (no GUI, no menu bar icon): open mic, and toggle busy mode |
 | Busy mode | Silence: no chime, no voice, no mic. The queue piles up and the toggle says how much. The hotkey still works — you can ask for your pendings at any time |
 | Reminders | None. An announcement happens once; after that the item waits to be asked for |
@@ -158,12 +158,27 @@ With both applied, Deepgram and OpenAI tied on accuracy across the test phrases.
 the default for its free credit, real streaming, and server-side endpointing, which supplies
 the silence cutoff for free.
 
+### The cutoff is relative to your room, and the window is time to start
+
+**A take ends three seconds after you stop talking** (`microphone.silence.min_seconds`), not
+at a fixed number of seconds after it opened. A ceiling is the wrong shape for an answer: talk
+for eight seconds into a ten-second window and you have two left to finish a sentence you are
+in the middle of. `announce.mic_grace_seconds` is how long the mic waits for you to *start*;
+`microphone.max_seconds` is the net behind all of it, and a take that hits it is still
+transcribed.
+
+Which only works if "you stopped talking" can actually be detected, and an absolute threshold
+in dB cannot do it: it is a guess about a room. Set it for a quiet one and a noisy one never
+falls under it — `silencedetect` reports no silence, therefore no speech, and every take runs
+to the ceiling. What survives a different room, a different input gain or new headphones is
+the *distance* between the room and a voice, about 20 dB wherever the two of them happen to
+sit. So voice-loop measures the room in the first half second of each take and treats anything
+`microphone.silence.margin_db` above it as you. `noise_db` is now only the fallback, for when
+the measured floor is not a room at all — digital silence, or a floor nothing could clear.
+
 ### A take is judged by what is in it, not by how it ended
 
-`silencedetect` only reports the silences it hears, so in a room whose floor never drops under
-`microphone.silence.noise_db` it reports nothing at all — no silence, therefore no speech —
-and every take ends on the timeout looking empty while holding a full sentence. Which is why
-running out of time is never on its own a reason to throw the audio away: before discarding a
+Running out of time is never on its own a reason to throw the audio away: before discarding a
 take, voice-loop measures the file, and anything holding a third of a second above the
 threshold goes to the recognizer regardless of how the mic closed.
 
@@ -174,10 +189,10 @@ mic ran out of time with audio in it (closed by timeout, 8.3s, peak -10.4 dB, me
 mic heard nothing (closed by timeout, 8.3s, peak -48.1 dB, mean -61.0 dB, 0.0s above -40 dB)
 ```
 
-The first is normal — you were still talking when the window closed. The second is the only
-one that means what it says. If it shows up while you *are* talking, the levels in it are the
-answer: raise the input gain in **System Settings → Sound → Input** until your voice measures
-well above `noise_db`, and keep the room measurably under it.
+Neither should be common now: the window only closes on its own when nothing in the take ever
+cleared the room by `margin_db`, which is what a mic set far too quiet looks like. When one of
+them shows up while you *are* talking, the levels in it are the answer: raise the input gain in
+**System Settings → Sound → Input** until your voice measures well clear of the room.
 
 ## Requirements
 
@@ -349,11 +364,12 @@ editing it is another reason to re-run the installer.
 ## Answering out loud
 
 **The mic is not a window you have to catch.** It opens *with* the chime, stays open under
-every word of whatever is being said, and keeps listening for `announce.mic_grace_seconds`
-(ten) after the last one. Start talking late and it waits for you to finish; start talking
-early and you are talking over it, which is allowed. Say nothing and the item simply stays in
-`pendings` — the queue moves on. It closes with a chime of its own (`mic_close_chime`), which
-is the only way to know it is no longer listening.
+every word of whatever is being said, and waits `announce.mic_grace_seconds` (ten) after the
+last one for you to start. Once you have started, that number stops applying: the take ends
+three seconds after *you* stop, however long that takes. Start talking late and it waits for
+you; start talking early and you are talking over it, which is allowed. Say nothing and the
+item simply stays in `pendings` — the queue moves on. It closes with a chime of its own
+(`mic_close_chime`), which is the only way to know it is no longer listening.
 
 So the announcement chime no longer means "your turn now". It means *"I am about to say
 something, and you can talk to me"*.
