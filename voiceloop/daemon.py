@@ -384,7 +384,6 @@ class Daemon:
             item,
             name=name,
             summary=summary,
-            remaining=self.store.queued_count(),
             phonetic=self.phonetic,
             blocking_chime=self.blocking_chime,
             milestone_chime=self.milestone_chime,
@@ -409,8 +408,23 @@ class Daemon:
         # thing asked, and whatever is not a name is handed straight on to the
         # window's own reply cycle rather than thrown away.
         overheard = await self._settle_name(item, slug) if slug else None
-        await self.reply_cycle(item, announcement.text, first=overheard)
+        outcome = await self.reply_cycle(item, announcement.text, first=overheard)
+        if outcome == REPLY_DELIVERED:
+            await self.speak_remaining()
         await self._follow_switch(depth)
+
+    async def speak_remaining(self) -> str:
+        """"Quedan dos" — after you answer, which is the only moment it means it.
+
+        In the announcement it landed before there was anything to count down
+        from, and on a window being offered a name it wedged itself between the
+        summary and the question: "No hay expectativa… Queda uno. ¿La llamo
+        fecha actual?" is what made the user ask which one was left.
+        """
+        phrase = announce_mod.remaining_phrase(self.store.queued_count())
+        if phrase:
+            await self.speaker.speak(f"{phrase}.")
+        return phrase
 
     # -- naming windows -----------------------------------------------------
 
@@ -955,7 +969,9 @@ class Daemon:
             if item is None or not item.tty:
                 await self.speaker.speak("No hay nada pendiente.")
                 return
-            await self.reply_cycle(item, item.summary or "", first=transcript)
+            outcome = await self.reply_cycle(item, item.summary or "", first=transcript)
+            if outcome == REPLY_DELIVERED:
+                await self.speak_remaining()
             await self._follow_switch(0)
         except Exception:  # noqa: BLE001 - a background task must not die silently
             log.exception("hotkey mic failed")

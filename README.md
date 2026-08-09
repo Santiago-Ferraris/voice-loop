@@ -10,7 +10,7 @@ voice-loop closes that gap without a GUI:
 2. You hear its **name** and a one-sentence summary of what it wants.
 3. The mic opens. You answer out loud.
 4. Your reply is typed into **that** window — not the focused one — and submitted.
-5. *"Quedan 2."* Next in the queue.
+5. *"Quedan 2."* — once your answer is in, not before it. Next in the queue.
 
 Nothing steals your focus. Requests are answered one at a time, in order, and anything you
 skip stays reachable — ask for your pendings whenever you want.

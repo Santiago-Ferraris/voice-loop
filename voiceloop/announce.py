@@ -111,7 +111,12 @@ def speakable(text: str, phonetic: Mapping[str, Any] | None = None) -> str:
 
 
 def remaining_phrase(remaining: int) -> str:
-    """'Quedan N' — nothing at all when the queue empties out."""
+    """'Quedan N' — nothing at all when the queue empties out.
+
+    Said when a cycle closes, never in the announcement: before you have
+    answered there is nothing to count down from, and wedged between the
+    summary and the naming question it reads as part of neither.
+    """
     if remaining <= 0:
         return ""
     if remaining == 1:
@@ -339,7 +344,6 @@ def build(
     *,
     name: str,
     summary: str | None = None,
-    remaining: int = 0,
     phonetic: Mapping[str, Any] | None = None,
     blocking_chime: str | None = None,
     milestone_chime: str | None = None,
@@ -364,11 +368,9 @@ def build(
     else:
         body = summary or FALLBACK_SUMMARY
 
-    sentence = f"{spoken_name}: {speakable(body, phonetic)}".strip()
-    if sentence and sentence[-1] not in ".?!":
-        sentence += "."
-    tail = remaining_phrase(remaining)
-    text = f"{sentence} {tail}." if tail else sentence
+    text = f"{spoken_name}: {speakable(body, phonetic)}".strip()
+    if text and text[-1] not in ".?!":
+        text += "."
     # Last, so it is the question the open microphone is answering.
     offer = name_question(naming_offer, phonetic)
     if offer:

@@ -542,6 +542,37 @@ def test_announcing_an_item_opens_the_mic_on_it_and_delivers_the_answer(build):
     assert daemon.delivery.sent == [("choice", TTY, 2)]
 
 
+def test_what_is_left_is_said_when_the_cycle_closes_not_when_it_opens(build):
+    """You answer, *then* you hear how many are left — the announcement is not it."""
+    daemon = build(["la dos"])
+    queue(daemon, QUESTION)
+    queue(daemon, QUESTION, session="session-2")
+
+    asyncio.run(daemon.announce_next())
+
+    assert "Queda" not in daemon.speaker.texts[0]
+    assert daemon.speaker.spoken[-1] == "Queda uno."
+
+
+def test_an_empty_queue_counts_down_to_nothing(build):
+    daemon = build(["la dos"])
+    queue(daemon, QUESTION)
+
+    asyncio.run(daemon.announce_next())
+
+    assert not any("Queda" in said for said in daemon.speaker.spoken)
+
+
+def test_nothing_is_counted_down_when_nobody_answered(build):
+    daemon = build([], recorder=StubRecorder(spoke=False))
+    queue(daemon, QUESTION)
+    queue(daemon, QUESTION, session="session-2")
+
+    asyncio.run(daemon.announce_next())
+
+    assert not any("Queda" in said for said in daemon.speaker.spoken)
+
+
 def test_the_mic_chimes_open_and_closed_around_the_take(build):
     daemon = build(["la dos"])
     queue(daemon, QUESTION)
