@@ -877,3 +877,82 @@ def test_status_reports_the_recognizer_and_the_mic(build):
     assert status["speech_to_text"] == "mock"
     assert status["mic"] == "idle"
     assert status["busy"] is False
+
+
+# --- busy mode: silence, and what it cost -----------------------------------
+
+
+def test_everything_that_arrives_in_busy_mode_waits_in_the_queue(build):
+    daemon = build([], recorder=StubRecorder(spoke=False))
+    daemon.busy = True
+    queue(daemon, QUESTION, ts=1000)
+    write_roster(daemon.roster_dir, sessionId="session-2", name="beta")
+    queue(daemon, QUESTION, session="session-2", ts=1001)
+
+    async def drain():
+        while await daemon.announce_next():
+            pass
+
+    asyncio.run(drain())
+
+    assert daemon.store.queued_count() == 2
+    assert daemon.speaker.said == []
+    assert daemon.speaker.chimes == []
+
+
+def test_and_arrives_all_at_once_when_you_come_back_out(build):
+    daemon = build([], recorder=StubRecorder(spoke=False))
+    daemon.busy = True
+    queue(daemon, QUESTION, ts=1000)
+    write_roster(daemon.roster_dir, sessionId="session-2", name="beta")
+    queue(daemon, QUESTION, session="session-2", ts=1001)
+
+    async def body():
+        await daemon.announce_next()
+        await daemon.dispatch("busy-toggle", {})
+        while await daemon.announce_next():
+            pass
+
+    asyncio.run(body())
+
+    assert daemon.speaker.texts == ["Nuevo evento de indice.", "Nuevo evento de beta."]
+
+
+def test_the_toggle_says_which_mode_it_left_you_in(build):
+    """A chime sounds the same in both directions, which is no answer at all."""
+    daemon = build([])
+
+    asyncio.run(daemon.dispatch("busy-toggle", {}))
+    assert daemon.speaker.spoken == ["Ocupado."]
+
+    asyncio.run(daemon.dispatch("busy-toggle", {}))
+    assert daemon.speaker.spoken[-1] == "Te escucho."
+
+
+def test_leaving_busy_mode_says_how_much_piled_up(build):
+    daemon = build([])
+    daemon.busy = True
+    queue(daemon, QUESTION, ts=1000)
+    write_roster(daemon.roster_dir, sessionId="session-2", name="beta")
+    queue(daemon, QUESTION, session="session-2", ts=1001)
+
+    asyncio.run(daemon.dispatch("busy-toggle", {}))
+
+    assert daemon.speaker.spoken[-1] == "Te escucho. Tenés dos pendientes."
+
+
+def test_the_hotkey_still_opens_the_mic_in_busy_mode(build):
+    """"I am in a meeting" and "I cannot answer you" are different things."""
+    daemon = build(["la dos"])
+    daemon.busy = True
+    queue(daemon, QUESTION)
+    daemon.store.mark_pending(daemon.store.pendings()[0].id)
+
+    async def body():
+        await daemon.dispatch("mic-toggle", {})
+        for task in list(daemon._mic_tasks):
+            await task
+
+    asyncio.run(body())
+
+    assert daemon.delivery.sent == [("choice", TTY, 2)]

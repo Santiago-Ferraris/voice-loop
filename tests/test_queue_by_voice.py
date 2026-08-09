@@ -258,3 +258,42 @@ def test_status_says_nothing_about_milestones_when_the_bridge_is_off(build):
     hotkey(daemon)
 
     assert "con CI" not in said(daemon)
+
+
+# --- what a "después" costs -------------------------------------------------
+
+
+def test_a_postponed_item_is_not_summarised_a_second_time(build, tmp_path):
+    """The summary computed on arrival is still the summary an hour later."""
+    daemon = build(["después", "dame los pendientes", "la uno", "mergealo"])
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    daemon.store.ingest(
+        Event.new("stop", "s1", ts=1000, tty=TTY, transcript_path=transcript(tmp_path, "s1"))
+    )
+
+    async def body():
+        daemon.prefetch_summaries()
+        for task in list(daemon._mic_tasks):
+            await task
+        await daemon.announce_next()  # heads-up, and "después"
+        await daemon.dispatch("mic-toggle", {})  # ask for the list, pick it, answer it
+        for task in list(daemon._mic_tasks):
+            await task
+
+    asyncio.run(body())
+
+    assert daemon.store.pendings()[0].deferred_at is not None  # it really was postponed
+    assert daemon.summarizer.seen == ["Terminé. ¿Lo mergeo?"]
+    assert "quiere que revises el diff." in daemon.speaker.spoken
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_the_hotkey_says_how_many_are_waiting_when_nothing_has_been_announced(build):
+    """Busy announces nothing, so "nothing spoke last" says nothing about the queue."""
+    daemon = build(["algo que no es un comando"])
+    daemon.busy = True
+    daemon.store.ingest(Event.new("stop", "s1", ts=1000, tty=TTY, payload={}))
+
+    hotkey(daemon)
+
+    assert "Tenés un pendiente." in said(daemon)

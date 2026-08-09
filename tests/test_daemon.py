@@ -553,6 +553,53 @@ def test_reconcile_keeps_everything_when_the_roster_is_empty(daemon):
     assert daemon.store.get(event.id).state == STATE_QUEUED
 
 
+# --- windows that closed --------------------------------------------------
+
+
+def test_an_event_from_a_window_that_closed_is_dropped_not_announced(daemon, tmp_path):
+    """"si una tab no está abierta, no tiene que tener eventos en la cola"."""
+    write_roster(daemon.roster_path, sessionId="alive", name="alpha")
+    gone = stop_event("closed-window", ts=999, transcript_path=transcript(tmp_path, "g"))
+    daemon.store.ingest(gone)
+    daemon.store.ingest(stop_event("alive", ts=1000, transcript_path=transcript(tmp_path, "a")))
+
+    assert asyncio.run(daemon.announce_next()) is True
+
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
+    assert daemon.store.get(gone.id).state == STATE_RESOLVED
+    assert daemon.store.get(gone.id).resolved_by == "session-gone"
+
+
+def test_a_window_that_closes_later_leaves_the_pendings_list(daemon, tmp_path):
+    """Reconciliation is not only a startup thing: tabs close while you work."""
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    closing = write_roster(daemon.roster_path, sessionId="s2", name="beta")
+    daemon.store.ingest(stop_event("s1", ts=1000, transcript_path=transcript(tmp_path, "s1")))
+    daemon.store.ingest(stop_event("s2", ts=1001, transcript_path=transcript(tmp_path, "s2")))
+
+    closing.unlink()
+
+    assert [entry["name"] for entry in asyncio.run(daemon.dispatch("pendings", {}))] == ["alpha"]
+
+
+def test_an_empty_roster_is_not_a_reason_to_drop_anything(daemon):
+    """No roster at all is "I cannot tell", which is not the same as "all gone"."""
+    event = stop_event("s1")
+    daemon.store.ingest(event)
+
+    assert daemon.sweep_gone() == 0
+    assert daemon.store.get(event.id).state == STATE_QUEUED
+
+
+def test_the_sweep_leaves_live_windows_alone(daemon):
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    event = stop_event("s1")
+    daemon.store.ingest(event)
+
+    assert daemon.sweep_gone() == 0
+    assert daemon.store.get(event.id).state == STATE_QUEUED
+
+
 # --- the control surface --------------------------------------------------
 
 
