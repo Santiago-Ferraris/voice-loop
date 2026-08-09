@@ -225,6 +225,167 @@ def test_a_yes_with_a_sentence_after_it_names_and_answers_the_window(build, tmp_
     assert daemon.delivery.sent == [("text", TTY, "mergealo cuando pasen los tests")]
 
 
+# --- the one band that is genuinely doubtful --------------------------------
+
+DOUBT = "¿Es el nombre, o te lo mando a la ventana?"
+
+
+def asked_which(daemon) -> bool:
+    return any(DOUBT in said for said in daemon.speaker.spoken)
+
+
+def test_a_yes_and_a_short_phrase_is_asked_about_rather_than_guessed(build, tmp_path):
+    """"dale, mergealo" is a name and an answer in equal measure. Ask."""
+    daemon = build(["dale, mergealo", "el nombre"])
+    daemon.stt.default = ""
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert asked_which(daemon)
+    assert daemon.store.get_alias("s1") == "mergealo"
+    assert daemon.delivery.sent == []
+
+
+def test_and_it_goes_to_the_window_when_that_is_what_it_was(build, tmp_path):
+    daemon = build(["dale, mergealo", "a la ventana"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == SLUG  # the yes was real
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_a_bare_yes_to_the_doubt_takes_the_half_it_was_asked_first(build, tmp_path):
+    daemon = build(["dale, mergealo", "sí"])
+    daemon.stt.default = ""
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == "mergealo"
+
+
+def test_a_bare_no_to_the_doubt_sends_it_to_the_window(build, tmp_path):
+    daemon = build(["dale, mergealo", "no"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == SLUG
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_saying_something_else_replaces_it_the_way_any_read_back_does(build, tmp_path):
+    daemon = build(["dale, mergealo", "mejor corré los tests primero"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == SLUG
+    assert daemon.delivery.sent == [("text", TTY, "mejor corré los tests primero")]
+
+
+def test_nobody_answering_the_doubt_types_nothing_anywhere(build, tmp_path):
+    daemon = build(["dale, mergealo", ""])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") == SLUG
+    assert daemon.delivery.sent == []
+
+
+def test_a_mic_that_dies_mid_doubt_leaves_the_offer_for_next_time(build, tmp_path):
+    class DyingRecorder(StubRecorder):
+        async def record(self, destination, *, stop=None, on_open=None):
+            if self.takes >= 1:
+                self.error = AudioUnavailable("no device")
+            return await super().record(destination, stop=stop, on_open=on_open)
+
+    daemon = build(["dale, mergealo"], recorder=DyingRecorder())
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert daemon.store.get_alias("s1") is None
+    assert daemon.delivery.sent == []
+
+
+# --- and the four that are not doubtful at all ------------------------------
+
+
+def test_a_bare_yes_is_never_asked_about(build, tmp_path):
+    daemon = build(["dale", "mergealo"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert asked_which(daemon) is False
+    assert daemon.store.get_alias("s1") == SLUG
+
+
+def test_a_yes_repeating_the_offered_name_is_never_asked_about(build, tmp_path):
+    """Verbatim from the log, and verified by hand: agreement, not news."""
+    daemon = build(
+        ["sí llama la fecha actual", "mergealo"],
+        summarizer=NamingSummarizer(slug="fecha actual"),
+    )
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert asked_which(daemon) is False
+    assert daemon.store.get_alias("s1") == "fecha actual"
+
+
+def test_a_phrase_that_says_it_is_a_name_is_never_asked_about(build, tmp_path):
+    daemon = build(["dale, llamala índice de migración", "mergealo"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert asked_which(daemon) is False
+    assert daemon.store.get_alias("s1") == "indice de migracion"
+
+
+def test_a_yes_and_a_whole_sentence_is_never_asked_about(build, tmp_path):
+    daemon = build(["dale, mergealo cuando pasen los tests"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert asked_which(daemon) is False
+    assert daemon.store.get_alias("s1") == SLUG
+    assert daemon.delivery.sent == [("text", TTY, "mergealo cuando pasen los tests")]
+
+
+def test_no_and_silence_are_never_asked_about(build, tmp_path):
+    declined = build(["no", "mergealo"])
+    queue_stop(declined, tmp_path)
+    announce(declined)
+
+    quiet = build([""])
+    queue_stop(quiet, tmp_path, name="q")
+    announce(quiet)
+
+    assert asked_which(declined) is False
+    assert asked_which(quiet) is False
+    assert declined.store.get_alias("s1") is None
+    assert quiet.store.get_alias("s1") is None
+
+
+def test_a_long_phrase_with_no_yes_is_never_asked_about(build, tmp_path):
+    daemon = build(["mergealo cuando pasen los tests"])
+    queue_stop(daemon, tmp_path)
+
+    announce(daemon)
+
+    assert asked_which(daemon) is False
+    assert daemon.delivery.sent == [("text", TTY, "mergealo cuando pasen los tests")]
+
+
 def test_a_name_you_dictate_wins_over_the_one_offered(build, tmp_path):
     daemon = build(["mejor, índice de migración", "mergealo"])
     queue_stop(daemon, tmp_path)

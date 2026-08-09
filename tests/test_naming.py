@@ -72,6 +72,22 @@ def test_the_lead_in_is_not_part_of_the_name(spoken, expected):
 
 @pytest.mark.parametrize(
     "spoken",
+    ["llamala índice", "llama la fecha actual", "ponele el de los hooks", "nombrala x"],
+)
+def test_a_phrase_can_say_outright_that_it_is_a_name(spoken):
+    assert naming.says_it_is_a_name(spoken) is True
+
+
+@pytest.mark.parametrize(
+    "spoken",
+    ["mergealo", "índice de migración", "mergealo cuando pasen los tests", ""],
+)
+def test_and_when_it_does_not_say_so_it_is_doubtful(spoken):
+    assert naming.says_it_is_a_name(spoken) is False
+
+
+@pytest.mark.parametrize(
+    "spoken",
     [
         "mergealo cuando pasen los tests",
         "llamala cuando termine el deploy de staging",

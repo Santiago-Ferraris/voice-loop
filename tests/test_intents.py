@@ -303,6 +303,36 @@ def test_asking_for_a_beat_is_neither_an_answer_nor_a_refusal(said):
     assert parse(said).kind == KIND_WAIT
 
 
+# --- "¿es el nombre, o te lo mando a la ventana?" ---------------------------
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["el nombre", "es el nombre", "nombre", "así está bien", "llamala así",
+     "sí", "dale", "ese nombre"],
+)
+def test_answering_that_it_was_the_name(said):
+    assert intents.name_or_window(said) == intents.ANSWER_NAME
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["a la ventana", "para la ventana", "mandalo", "mandale",
+     "mandalo a la ventana", "no", "es la respuesta"],
+)
+def test_answering_that_it_was_for_the_window(said):
+    """"mandalo" is a confirmation everywhere else; here it is the other half."""
+    assert intents.name_or_window(said) == intents.ANSWER_WINDOW
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["mejor corré los tests primero", "no sé", "", "el índice viejo"],
+)
+def test_answering_something_else_entirely(said):
+    assert intents.name_or_window(said) is None
+
+
 # --- the ones that only *might* have been for voice-loop --------------------
 
 

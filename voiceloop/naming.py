@@ -29,13 +29,22 @@ MIN_WORDS = 1
 MAX_WORDS = 4
 MAX_CHARS = 40
 
+# "llamala …", "ponele …" — an instruction to name, which is worth nothing
+# inside the name and everything outside it: a phrase that opens with one of
+# these says what it is, and never has to be asked about.
+NAMING_VERBS = frozenset(
+    {
+        "llama", "llamala", "llamalo", "llamale", "ponele", "poneme", "ponle",
+        "decile", "nombrala", "nombralo",
+    }
+)
+
 # Said before the name in an offer ("la llamo…", "ponele…"), and worth nothing
 # inside it.
-LEADING_NOISE = frozenset(
+LEADING_NOISE = NAMING_VERBS | frozenset(
     {
         "la", "el", "lo", "las", "los", "una", "un", "que", "se", "sea", "es",
-        "llama", "llamala", "llamalo", "llamale", "ponele", "poneme", "ponle",
-        "decile", "nombrala", "nombralo", "mejor", "aa", "eh", "este", "esta",
+        "mejor", "aa", "eh", "este", "esta",
     }
 )
 
@@ -64,6 +73,16 @@ def slugify(text: str) -> str:
     going through the hyphen rule in `announce`.
     """
     return " ".join(_words(text)[:MAX_WORDS])[:MAX_CHARS].strip()
+
+
+def says_it_is_a_name(text: str) -> bool:
+    """Does the phrase itself say it is a name? "llamala índice" leaves no doubt.
+
+    Which is what makes "dale, mergealo" doubtful: no verb, and both readings —
+    a name for the window and an answer for it — are ordinary Spanish.
+    """
+    words = [word for word in fold(text).split(" ") if word]
+    return bool(words) and words[0] in NAMING_VERBS
 
 
 def dictated(text: str) -> str:

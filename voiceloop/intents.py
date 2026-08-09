@@ -150,6 +150,27 @@ SYSTEM_WORDS = frozenset({
 
 MAX_SYSTEMWARD_WORDS = 6
 
+# The two halves of "¿es el nombre, o te lo mando a la ventana?". Checked in
+# this order because "mandalo" is a confirmation everywhere else in this file
+# and here it means the opposite half — you are not confirming the name, you
+# are telling me where the phrase was going.
+ANSWER_NAME = "name"
+ANSWER_WINDOW = "window"
+
+FOR_THE_WINDOW_PHRASES = frozenset({
+    "a la ventana", "para la ventana", "la ventana", "mandalo a la ventana",
+    "mandala a la ventana", "es para la ventana", "mandalo", "mandala",
+    "mandale", "mandaselo", "a la sesion", "para la sesion", "es la respuesta",
+    "es para la ventana no", "es un mensaje", "es mi respuesta",
+})
+
+AS_THE_NAME_PHRASES = frozenset({
+    "el nombre", "es el nombre", "nombre", "un nombre", "es un nombre",
+    "el nombre si", "si el nombre", "ese nombre", "ponele ese nombre",
+    "llamala asi", "llamalo asi", "asi", "asi esta bien", "es el nombre si",
+    "es el nombre de la ventana", "el de la ventana",
+})
+
 EXPLAIN_VERBS = (
     "explicame", "explicamela", "explicamelo", "explica", "explicar",
     "contame", "detallame", "ampliame", "que es", "de que se trata",
@@ -315,6 +336,30 @@ def confirmation_tail(text: str) -> str | None:
     while rest and rest[0] in CONFIRM_LEAD:
         rest.pop(0)
     return _phrase(rest)
+
+
+def name_or_window(text: str) -> str | None:
+    """Which half of "¿es el nombre, o te lo mando a la ventana?" was answered.
+
+    `None` is neither — a fresh utterance, which the caller treats the way a
+    read-back treats one anywhere else: it replaces what was being asked about.
+    A bare "sí" takes the first half, because that is the half the question
+    opens with; a bare "no" takes the second.
+    """
+    folded = fold(text)
+    if not folded:
+        return None
+    bare = _phrase([token for token in folded.split() if token not in ("por", "favor", "porfa")])
+    if folded in FOR_THE_WINDOW_PHRASES or bare in FOR_THE_WINDOW_PHRASES:
+        return ANSWER_WINDOW
+    if folded in AS_THE_NAME_PHRASES or bare in AS_THE_NAME_PHRASES:
+        return ANSWER_NAME
+    kind = parse(text).kind
+    if kind == KIND_CONFIRM:
+        return ANSWER_NAME
+    if kind == KIND_CANCEL:
+        return ANSWER_WINDOW
+    return None
 
 
 def looks_systemward(text: str) -> bool:
