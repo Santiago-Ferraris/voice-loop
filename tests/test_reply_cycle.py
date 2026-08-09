@@ -93,6 +93,22 @@ HOTKEYS = {
 }
 
 
+EXPRESSION = {
+    "tool": "AskUserQuestion",
+    "tool_input": {
+        "questions": [
+            {
+                "question": "¿Cómo mando el atajo?",
+                "options": [
+                    {"label": "Usá el modo A / B con el flag nuevo"},
+                    {"label": "Dejalo como está"},
+                ],
+            }
+        ]
+    },
+}
+
+
 class StubRecorder:
     """A mic that always captures something, unless told otherwise."""
 
@@ -233,6 +249,16 @@ def test_a_spoken_keyword_picks_the_option_too(build):
     answer(daemon, item)
 
     assert daemon.delivery.sent == [("choice", TTY, 2)]
+
+
+def test_a_keyword_from_the_half_that_is_never_spoken_still_picks_it(build):
+    """Options are read short; the *full* label is still what is matched."""
+    daemon = build(["flag"])
+    item = queue(daemon, EXPRESSION)
+
+    answer(daemon, item)
+
+    assert daemon.delivery.sent == [("choice", TTY, 1)]
 
 
 def test_several_options_at_once_on_a_multi_select_menu(build):
