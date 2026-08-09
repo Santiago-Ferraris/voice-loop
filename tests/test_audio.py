@@ -230,6 +230,25 @@ def test_saying_nothing_is_a_normal_outcome_not_an_error(tmp_path):
     assert recording.usable is False
 
 
+def test_one_take_can_be_given_a_shorter_window_than_the_recorder_has(tmp_path):
+    """The heads-up mic: two words for an answer, so four seconds is generous."""
+    subject, _ = recorder([OPEN_LINE], speech_timeout=30)
+
+    recording = run(subject, tmp_path / "r.wav", speech_timeout=0.2)
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    assert recording.seconds < 5
+
+
+def test_the_recorder_keeps_its_own_window_when_no_override_is_given(tmp_path):
+    subject, _ = recorder([OPEN_LINE], speech_timeout=0.2)
+
+    recording = run(subject, tmp_path / "r.wav", speech_timeout=None)
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    assert recording.seconds < 5
+
+
 def test_the_toggle_closes_the_mic_and_counts_as_speech(tmp_path):
     subject, _ = recorder([OPEN_LINE], speech_timeout=30)
     stop = asyncio.Event()
