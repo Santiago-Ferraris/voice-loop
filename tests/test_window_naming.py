@@ -21,8 +21,7 @@ from voiceloop.store import Store
 from voiceloop.stt.mock import MockStt
 from voiceloop.summarize import Summarizer, Summary
 
-from conftest import FakeSpeaker, write_roster
-from test_reply_cycle import TTY, RecordingDelivery, StubRecorder
+from conftest import TTY, FakeSpeaker, RecordingDelivery, StubRecorder, write_roster
 
 SLUG = "tests event processor"
 SUMMARY = "terminó los tests del event processor"
@@ -309,12 +308,10 @@ def test_a_mic_that_dies_mid_doubt_leaves_the_offer_for_next_time(build, tmp_pat
     class DyingRecorder(StubRecorder):
         dies_after = 2  # the heads-up, the offer, and then the doubt
 
-        async def record(self, destination, *, stop=None, on_open=None, speech_timeout=None):
+        async def record(self, destination, **kwargs):
             if self.takes >= self.dies_after:
                 self.error = AudioUnavailable("no device")
-            return await super().record(
-                destination, stop=stop, on_open=on_open, speech_timeout=speech_timeout
-            )
+            return await super().record(destination, **kwargs)
 
     daemon = build(["dale, mergealo"], recorder=DyingRecorder())
     queue_stop(daemon, tmp_path)

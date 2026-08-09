@@ -87,6 +87,62 @@ about: an ignored window waits in `pendings`, silently, until you ask for it. Se
 | Summaries | `gpt-4o-mini`. The proposed name for an unnamed window rides the same request — one call, two fields |
 | Names | Offered once per window, never twice. Confirmed names are what you hear *and* vocabulary for the recognizer |
 
+### Understanding you, not the phrasing you were supposed to use
+
+The phrase lists in `intents.py` are exact and instant, and they resolve almost everything —
+but they only know the wordings somebody thought to write down. Measured against sixteen
+natural ways of saying things this user says daily, **fourteen fell through**: `"give it to
+me"`, `"later"`, `"skip it"`, `"show me"`, `"status"`, `"dale contame"`, `"ok dame"`, `"not
+now"`, `"push it back"`, `"what's pending"`, `"tell me"`, `"read it"`, `"hold on"`, `"what do
+I have"`. Every one arrived as *text* — which means every one was typed into a Claude session.
+
+So classification is a hybrid. The lists answer what they know, offline and instantly;
+whatever falls through goes to `gpt-4o-mini` on a two-second leash. Three things keep that
+honest:
+
+- **"Not a command" is an answer.** A classifier that always picks something turns every
+  dictated sentence into a random command, so the prompt is built around refusing, and
+  `"mergealo cuando pasen los tests"` is expected to come back as an empty list.
+- **It degrades to what it replaced.** No key, no network, bad JSON — all of them fall back to
+  the lexicon's own verdict. It is an improvement, never a dependency (`understanding.provider:
+  none` turns it off entirely).
+- **It returns a list.** "Ok dámelo, y también abrí una ventana nueva y hacé X" is three
+  things, and they run in the order you said them. A failure in one is spoken and the rest
+  still run; anything on the destructive list still gets read back first.
+
+**A near miss never reaches the model.** It is asked about by name — *"Entendí: dame al
+pendiente. ¿Querés los pendientes?"* — and a yes runs the command, while a no, silence, or
+anything else drops it. It is never delivered.
+
+How close it has to be depends on how much is at stake, because **recognizer confidence does
+not detect this failure and never will**. Measured out loud on a machine somebody was working
+on:
+
+| said | heard | confidence |
+|---|---|---|
+| "contame" | `'contain'` | **0.96** |
+| "dámelo" | `'chamelo'` / `'jamelo'` | 0.75 |
+| "dame los pendientes" | `'dame los pendins'` | 0.70 |
+
+`'contain'` was typed into a working window and the user asked what it was. The recognizer was
+*right* — it heard a sound that genuinely resembles "contain" — so the error is semantic and
+the score was 0.96. So the policy is inverted: not "deliver unless the recognizer was unsure",
+but **"deliver only when this is plausibly something you would dictate"**. A phrase long enough
+to be an instruction has to look *a lot* like a command (0.8) before we doubt it; one or two
+words has only to look *somewhat* like one (0.7), because nobody dictates two words to Claude.
+A yes in front — "dale, mergealo" — is stripped before comparing, or every instruction that
+opens with "dale" would be asked about forever.
+
+### The vocabulary writes itself
+
+`keyterms` is what stops the recognizer inventing domain words — without it *"mergealo"* comes
+back as *"MGalo"* — and a hand-kept list is wrong the week after you write it. So most of it is
+derived: Claude already stores every prompt you have typed under `~/.claude/projects/*/*.jsonl`,
+and counting the words in **your own** messages, minus ordinary Spanish, produces the real list
+(`pr`, `test`, `issue`, `draft`, `stage`, `mergeado`, `lambda`…). Recomputed in the background
+every `vocabulary.refresh_hours`, and merged with your `keyterms` and the names of the windows
+open right now.
+
 ### Getting spanglish right
 
 The design target is code-switched speech — Spanish sentences with English technical terms —
@@ -271,15 +327,30 @@ editing it is another reason to re-run the installer.
 
 ## Answering out loud
 
-The mic opens by itself after every announcement, and by hotkey whenever you want it. It is a
-**toggle**, not push-to-talk: it closes on its own after a beat of silence, or when you press
-the key again. Say nothing and the item simply stays in `pendings` — the queue moves on.
+**The mic is not a window you have to catch.** It opens *with* the chime, stays open under
+every word of whatever is being said, and keeps listening for `announce.mic_grace_seconds`
+(ten) after the last one. Start talking late and it waits for you to finish; start talking
+early and you are talking over it, which is allowed. Say nothing and the item simply stays in
+`pendings` — the queue moves on. It closes with a chime of its own (`mic_close_chime`), which
+is the only way to know it is no longer listening.
 
-**The heads-up mic is shorter** (`announce.alert_mic_timeout_seconds`, four seconds) because it
-is asking a question with two words for an answer. Everything below works in it — it is a
-microphone, not a menu — with one difference: a **sentence** is read back rather than delivered.
-Nothing has been said about that window yet, so a sentence there is as likely to be a word to
-somebody in the room as an answer for a window you have not heard about.
+So the announcement chime no longer means "your turn now". It means *"I am about to say
+something, and you can talk to me"*.
+
+**Talking over it** depends on where the sound is coming out, which voice-loop reads off the
+system rather than asking you to configure:
+
+- **Headphones** (bluetooth, the jack, anything whose name says headset) — the mic cannot hear
+  `say` at all, so your first syllable kills the sentence mid-word and it listens instead.
+- **Speakers** — the mic *does* hear `say`, so nothing is interrupted (it would shut itself up
+  every time it opened its mouth) and our own words are subtracted from the transcript instead.
+  We know exactly what `say` was given, so recognising it coming back is a string comparison.
+  See `voiceloop/echo.py` for the three rules that keep it from eating what you actually said.
+
+Everything below works in the heads-up mic — it is a microphone, not a menu — with one
+difference: a **sentence** is read back rather than delivered. Nothing has been said about that
+window yet, so a sentence there is as likely to be a word to somebody in the room as an answer
+for a window you have not heard about.
 
 | You say | What happens |
 |---|---|
@@ -294,6 +365,9 @@ somebody in the room as an answer for a window you have not heard about.
 | "salteá" | Leaves it where it is and moves on |
 | "dale" / "no" | Confirms or cancels a read-back. On a heads-up, "dale" means "dámelo". Anywhere else it is just a word, and gets typed |
 | "dame los pendientes" / "cuál queda" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
+| "abrí una ventana nueva y hacé X" | New tab in the window you already have, running `windows.new_tab_command`, then X typed into it |
+| "decile a inbox realtime que espere" | Types into the window with that name, whichever one you are on |
+| "dámelo, y también abrí una ventana y hacé X" | Several things in one breath, in the order you said them. One that fails does not cancel the rest |
 | "estado" / "cómo venimos" | Windows open, how many are working, how many are waiting on you |
 | "qué dijiste" / "no te entendí" | Says the last thing it said again |
 | "esperá" / "un segundo" | Holds the mic. Not an answer and not a refusal — nothing is typed, nothing is dropped |

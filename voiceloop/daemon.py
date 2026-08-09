@@ -54,14 +54,18 @@ from typing import Any, Sequence
 from . import (
     __version__,
     announce as announce_mod,
+    classify as classify_mod,
     delivery as delivery_mod,
+    echo,
     envfile,
     intents,
     iterm,
     naming,
+    output as output_mod,
     preflight,
     roster as roster_mod,
     spool,
+    vocabulary,
 )
 from .audio import AudioUnavailable, MicConsentPending, Recorder
 from .config import Config, ConfigError, load as load_config
@@ -85,6 +89,9 @@ from .tts import Speaker
 INGEST_INTERVAL = 0.25
 ANNOUNCE_INTERVAL = 0.2
 MILESTONE_INTERVAL = 1.0
+# The vocabulary is derived from months of transcripts; checking whether it is
+# due costs a stat, and recomputing it is minutes-old-at-worst either way.
+VOCABULARY_INTERVAL = 300.0
 # Windows close all the time and say nothing about it. Often enough that
 # `pendings` never lists a dead one, rarely enough to be a few JSON reads.
 RECONCILE_INTERVAL = 5.0
@@ -150,6 +157,8 @@ class Daemon:
         recorder: Recorder | None = None,
         stt: Any = None,
         delivery: Delivery | None = None,
+        output: output_mod.OutputProbe | None = None,
+        classifier: classify_mod.Classifier | None = None,
     ):
         self.config = config
         self.state_dir = config.state_dir
@@ -178,7 +187,20 @@ class Daemon:
         self.mic_enabled = bool(config.get("microphone.enabled", True))
         self.keep_recordings = bool(config.get("microphone.keep_recordings", False))
         self.mic_rounds = max(1, int(config.get("delivery.max_mic_rounds", 3)))
-        self.alert_mic_timeout = float(config.get("announce.alert_mic_timeout_seconds", 4))
+        # How long the mic stays open after the last word, not after the chime.
+        self.mic_grace = float(config.get("announce.mic_grace_seconds", 10))
+        self.output = output or output_mod.OutputProbe.from_config(config)
+        self.classifier = classifier or classify_mod.Classifier.from_config(config)
+        self.new_tab_command = str(config.get("windows.new_tab_command", "") or "")
+        self.vocabulary_enabled = bool(config.get("vocabulary.enabled", True))
+        self.vocabulary_pattern = str(
+            config.get("vocabulary.transcripts", vocabulary.DEFAULT_TRANSCRIPT_GLOB)
+        )
+        self.vocabulary_max_age = float(config.get("vocabulary.refresh_hours", 6)) * 3600
+        self.vocabulary_limit = int(config.get("vocabulary.limit", vocabulary.DEFAULT_LIMIT))
+        self.vocabulary_min_count = int(
+            config.get("vocabulary.min_count", vocabulary.DEFAULT_MIN_COUNT)
+        )
         self.plan_feedback_index = int(
             config.get("delivery.plan_menu.feedback_index", delivery_mod.PLAN_FEEDBACK)
         )
@@ -194,6 +216,9 @@ class Daemon:
         self._mic_stop: asyncio.Event | None = None
         self._mic_tasks: set[asyncio.Task] = set()
         self._switch_to: str | None = None
+        # What the rest of one breath asked for, run once the thing it asked
+        # for first has finished. See `_queue_actions`.
+        self._afterwards: list[classify_mod.Action] = []
         # Items a summary has already been started for. Once each: the fallback
         # is not stored, so "has no summary" stays true for an item the
         # provider could not answer about, and retrying it every 250 ms is a
@@ -224,6 +249,7 @@ class Daemon:
             asyncio.create_task(self._announce_loop(), name="announce"),
             asyncio.create_task(self._reconcile_loop(), name="reconcile"),
             asyncio.create_task(self._milestone_loop(), name="milestones"),
+            asyncio.create_task(self._vocabulary_loop(), name="vocabulary"),
         ]
         try:
             await self._stop.wait()
@@ -371,6 +397,14 @@ class Daemon:
             except Exception:  # noqa: BLE001 - never let the announcer die
                 log.exception("announce failed")
             await asyncio.sleep(ANNOUNCE_INTERVAL)
+
+    async def _vocabulary_loop(self) -> None:
+        while True:
+            try:
+                await self.refresh_vocabulary()
+            except Exception:  # noqa: BLE001
+                log.exception("vocabulary refresh failed")
+            await asyncio.sleep(VOCABULARY_INTERVAL)
 
     async def _milestone_loop(self) -> None:
         while True:
@@ -536,21 +570,22 @@ class Daemon:
                 notification_events=self.notification_events,
             )
             log.info("alert %s [%s] %s", item.type, name, alert.text)
-            await self.speaker.announce(alert)
+            if alert.silent or not self.can_listen() or not item.tty:
+                await self.speaker.announce(alert)
+                self.store.mark_pending(item.id)
+                if alert.silent:
+                    return
+                if not self.can_listen():
+                    # A heads-up only works because "dámelo" is available. With
+                    # no recognizer there is no way to ask, so the summary comes
+                    # anyway rather than leaving you with a name and no
+                    # recourse.
+                    await self._say_detail(item, session)
+                return
+            # The mic opens *with* the chime and outlives the sentence, so an
+            # answer that starts before the name is over is still an answer.
             self.store.mark_pending(item.id)
-            if alert.silent:
-                return
-            if not self.can_listen():
-                # A heads-up only works because "dámelo" is available. With no
-                # recognizer there is no way to ask, so the summary comes
-                # anyway rather than leaving you with a name and no recourse.
-                await self._say_detail(item, session)
-                return
-            if not item.tty:
-                # No window to answer in, and a mic opened on something you
-                # cannot answer is four seconds of nothing.
-                return
-            answer, carried = await self._ask_what_to_do(item, alert.text)
+            answer, carried = await self._ask_what_to_do(item, alert)
         else:
             self.store.mark_pending(item.id)
 
@@ -568,8 +603,12 @@ class Daemon:
             await self.speak_remaining()
         await self._follow_switch(depth)
 
-    async def _ask_what_to_do(self, item: Item, said: str) -> tuple[str, Transcript | None]:
-        """Four seconds of microphone on "Nuevo evento de X".
+    async def _ask_what_to_do(self, item: Item, alert) -> tuple[str, Transcript | None]:
+        """Say "Nuevo evento de X" into an open microphone, and take the answer.
+
+        The announcement is spoken from inside the take, not before it, so the
+        answer may have been said over the top of it. Every later round is a
+        plain mic with the same grace.
 
         Two words end it — "dámelo" or "después" — and saying nothing is the
         third answer: you were not there, the item stays in the queue, and
@@ -586,13 +625,51 @@ class Daemon:
         gate = delivery_mod.Gate(
             True, "No sé si eso era para mí", "¿Te lo mando a la ventana?"
         )
+        said = alert.text
         carried: Transcript | None = None
+        follow: Transcript | None = None
+        queued: list[classify_mod.Action] = []
+        rounds = 0
         async with self._mic_lock:
-            for _ in range(self.mic_rounds):
-                transcript = await self.listen(timeout=self.alert_mic_timeout)
-                if transcript is None:
-                    return ALERT_NONE, None
-                intent = intents.parse(transcript.text)
+            while queued or rounds < self.mic_rounds:
+                if not queued:
+                    if rounds == 0:
+                        transcript = await self.say_and_listen(announcement=alert)
+                    elif follow is not None:
+                        transcript, follow = follow, None
+                    else:
+                        transcript = await self.listen(timeout=self.mic_grace)
+                    rounds += 1
+                    if transcript is None:
+                        return ALERT_NONE, None
+                    plan = await self.classify(transcript)
+                    queued = list(plan.actions)
+                    guess = plan.guess
+                else:
+                    guess = None
+                more_rounds = rounds < self.mic_rounds
+                action = queued.pop(0)
+                intent = action.as_intent()
+
+                if guess is not None and carried is None:
+                    # Not "was that for the window?" — it was plainly for me,
+                    # and only the recognizer disagrees. Ask by name, before
+                    # anything is acted on.
+                    question = announce_mod.speakable(
+                        announce_mod.near_miss_question(transcript.text, guess.kind),
+                        self.phonetic,
+                    )
+                    answer = await self._say_then(question, listening=more_rounds)
+                    if answer is not None and intents.parse(answer.text).kind == (
+                        intents.KIND_CONFIRM
+                    ):
+                        queued = [guess]
+                        follow = None
+                        guess = None
+                        continue
+                    follow = answer
+                    queued = []
+                    continue
 
                 if carried is not None:
                     if intent.kind == intents.KIND_CONFIRM:
@@ -603,46 +680,68 @@ class Daemon:
                     carried = None  # a new utterance replaces the old one
 
                 if intent.kind in (intents.KIND_GIVE, intents.KIND_CONFIRM):
+                    # Whatever else the same breath asked for runs once the
+                    # summary and its own microphone are done with.
+                    self._queue_actions(queued)
                     return ALERT_GIVE, None
                 if intent.kind == intents.KIND_LATER:
                     self.store.defer(item.id)
                     log.info("deferred %s [%s]", item.id[:8], item.display_name)
+                    self._queue_actions(queued)
                     return ALERT_LATER, None
                 if intent.kind in (
                     intents.KIND_SILENCE,
                     intents.KIND_SKIP,
                     intents.KIND_CANCEL,
                 ):
+                    self._queue_actions(queued)
                     return ALERT_NONE, None
                 if intent.kind == intents.KIND_REPEAT:
-                    await self.speaker.speak(said)
+                    follow = await self._say_then(said, listening=more_rounds and not queued)
                     continue
                 if intent.kind == intents.KIND_WAIT:
-                    await self.speaker.speak("Dale, espero.")
+                    follow = await self._say_then(
+                        "Dale, espero.", listening=more_rounds and not queued
+                    )
                     continue
                 if intent.kind == intents.KIND_SHOW:
                     if item.tty:
-                        await asyncio.to_thread(self.delivery.focus, item.tty)
+                        await self._safely(self.delivery.focus, item.tty)
+                    continue
+                if intent.kind in (intents.KIND_OPEN, intents.KIND_TELL):
+                    await self._perform_side(action)
                     continue
                 if intent.kind == intents.KIND_STATUS:
-                    await self.speak_status()
+                    follow = await self._speak_status_and_listen(
+                        listening=more_rounds and not queued
+                    )
                     continue
                 if intent.kind == intents.KIND_PENDINGS:
                     chosen = await self.speak_pendings()
                     if chosen is None:
                         continue
+                    self._queue_actions(queued)
                     if chosen.id == item.id:
                         return ALERT_GIVE, None
                     # Served once this cycle has unwound; see `_follow_switch`.
                     self._switch_to = chosen.id
                     return ALERT_NONE, None
 
-                carried = transcript
-                await self.speaker.speak(self._readback_sentence(gate, transcript.text))
+                carried = dataclasses.replace(transcript, text=intent.text or transcript.text)
+                follow = await self._say_then(
+                    self._readback_sentence(gate, carried.text), listening=more_rounds
+                )
         return ALERT_NONE, None
 
-    async def _say_detail(self, item: Item, session) -> tuple[Item, str, str]:
-        """Speak what that window wants. Returns (the item as it is now, text, slug)."""
+    async def _say_detail(
+        self, item: Item, session, *, listening: bool = False
+    ) -> tuple[Item, str, str, Transcript | None]:
+        """Speak what that window wants.
+
+        Returns (the item as it is now, what was said, the name to offer, and —
+        when `listening` — whatever was said back into the mic that was open
+        the whole time it was talking).
+        """
         # Re-read: the summary was very likely written by the background
         # prefetch after this item came off the queue.
         current = self.store.get(item.id) or item
@@ -651,16 +750,27 @@ class Daemon:
             current, summary=summary, phonetic=self.phonetic, naming_offer=slug
         )
         log.info("detail [%s] %s", current.display_name, text)
-        await self.speaker.speak(text)
-        return current, text, slug
+        if not listening:
+            await self.speaker.speak(text)
+            return current, text, slug, None
+        heard = await self.say_and_listen(text=text)
+        return current, text, slug, heard
 
     async def _give(self, item: Item, session) -> str:
-        """"dámelo": what that window wants, and the mic to answer it with."""
-        current, text, slug = await self._say_detail(item, session)
+        """"dámelo": what that window wants, said into an already-open mic.
+
+        The summary and the naming offer are one sentence, and the answer to
+        them is routinely started before that sentence is over — so the take
+        that carries it is the one that ran underneath.
+        """
+        current, text, slug, heard = await self._say_detail(item, session, listening=True)
         # The naming answer comes first and gets its own take: it was the last
         # thing asked, and whatever is not a name is handed straight on to the
         # window's own reply cycle rather than thrown away.
-        overheard = await self._settle_name(current, slug) if slug else None
+        if slug:
+            overheard = await self._settle_name(current, slug, first=heard)
+        else:
+            overheard = heard
         return await self.reply_cycle(current, text, first=overheard)
 
     async def speak_remaining(self) -> str:
@@ -721,7 +831,9 @@ class Daemon:
             self.store.set_slug(item.id, result.slug)
         return result.text, result.slug
 
-    async def _settle_name(self, item: Item, slug: str) -> Transcript | None:
+    async def _settle_name(
+        self, item: Item, slug: str, *, first: Transcript | None = None
+    ) -> Transcript | None:
         """Take one answer to "¿la llamo …?". Returns anything meant elsewhere.
 
         Three outcomes, and the third is the one that matters: "dale" saves the
@@ -740,8 +852,11 @@ class Daemon:
         Either way the offer is recorded as made. Being asked to name the same
         window at every announcement is worse than the autogenerated name.
         """
-        async with self._mic_lock:
-            transcript = await self.listen()
+        if first is not None:
+            transcript = first
+        else:
+            async with self._mic_lock:
+                transcript = await self.listen()
         if transcript is None:
             # The mic is broken, not the offer refused. Ask again next time.
             return None
@@ -812,9 +927,10 @@ class Daemon:
         gate = delivery_mod.Gate(
             True, "No sé si eso era el nombre", "¿Es el nombre, o te lo mando a la ventana?"
         )
-        await self.speaker.speak(self._readback_sentence(gate, named))
         async with self._mic_lock:
-            answer = await self.listen()
+            answer = await self.say_and_listen(
+                text=self._readback_sentence(gate, named)
+            )
         if answer is None:
             # The mic broke mid-question. Nothing is stored and nothing is
             # sent: the offer comes back the next time this window blocks.
@@ -845,14 +961,20 @@ class Daemon:
         return bool(self.mic_enabled and self.stt is not None)
 
     def keyterms(self) -> list[str]:
-        """Config vocabulary plus the names of the windows that exist right now.
+        """Everything the recognizer should have heard of before you say it.
 
-        A session name only transcribes if the recognizer has been told it
-        exists, and the names change every time you open a window — so they are
-        collected per request rather than baked into the engine.
+        Three sources, and only the first is hand-kept: the `keyterms` list in
+        the config, the vocabulary extracted from your own Claude transcripts
+        (see `vocabulary.py` — this is where `mergeado` and `lambda` come
+        from), and the names of the windows that exist *right now*. The last
+        one is why this is collected per request rather than baked into the
+        engine: a session name only transcribes if the recognizer has been told
+        it exists, and the names change every time you open a tab.
         """
         configured = self.config.get("keyterms") or []
         terms = [str(term) for term in configured] if isinstance(configured, (list, tuple)) else []
+        if self.vocabulary_enabled:
+            terms.extend(vocabulary.load(self.state_dir))
         try:
             sessions = roster_mod.load(self.roster_dir)
         except OSError:
@@ -863,34 +985,130 @@ class Daemon:
         terms.extend(self.store.aliases())
         return terms
 
-    async def listen(self, *, timeout: float | None = None) -> Transcript | None:
-        """One take: chime, record, transcribe. `None` means the mic itself failed.
+    async def refresh_vocabulary(self, *, force: bool = False) -> list[str]:
+        """Recompute the extracted vocabulary if it is stale. Off the loop.
 
-        `timeout` shortens the wait for you to start talking — the heads-up mic
-        uses it, since "dámelo" or "después" is two words and four seconds.
-
-        The take starts by taking the floor, so the whole sequence is exactly
-        this and nothing may interleave with it: **announcement finished ->
-        floor -> mic open -> "speak now" chime -> floor released -> record**.
-        Opening under a voice recorded the announcement and left the cue queued
-        behind it, and the `mic_timeout_seconds` window — which only starts once
-        `on_open` has returned — was spent on audio nobody could answer into.
+        Never fatal and never blocking: a machine with no transcripts, or a
+        read that fails halfway, leaves the config list and the window names
+        doing exactly what they did before this existed.
         """
+        if not self.vocabulary_enabled:
+            return []
+        now = time.time()
+        if not force and vocabulary.age_seconds(self.state_dir, now=now) < self.vocabulary_max_age:
+            return []
+        try:
+            return await asyncio.to_thread(
+                vocabulary.refresh,
+                self.state_dir,
+                now=now,
+                pattern=self.vocabulary_pattern,
+                min_count=self.vocabulary_min_count,
+                limit=self.vocabulary_limit,
+            )
+        except Exception:  # noqa: BLE001 - vocabulary is a nicety, not a dependency
+            log.exception("could not refresh the vocabulary")
+            return []
+
+    async def listen(self, *, timeout: float | None = None) -> Transcript | None:
+        """One take with nothing to say first: chime, record, transcribe.
+
+        `None` means the mic itself failed. The take starts by taking the
+        floor, so the whole sequence is exactly this and nothing may interleave
+        with it: **floor -> mic open -> "speak now" chime -> floor released ->
+        record**. Opening under a voice recorded the announcement and left the
+        cue queued behind it.
+        """
+        return await self._take(timeout=timeout)
+
+    async def say_and_listen(
+        self,
+        *,
+        announcement=None,
+        text: str = "",
+        grace: float | None = None,
+    ) -> Transcript | None:
+        """Speak with the microphone already open.
+
+        This is the whole of the v3 microphone. The chime no longer means
+        "your turn now" — it means "I am about to say something *and* you can
+        talk to me". Capture starts before the first syllable, runs under the
+        entire sentence, and stays open `grace` seconds of silence afterwards.
+        Start speaking late and the take waits for you to finish; start
+        speaking early — over us, on headphones — and the sentence stops
+        mid-word.
+
+        The old shape opened a four-second window *after* the announcement,
+        which is three chances a morning to miss somebody who was still drawing
+        breath.
+        """
+        return await self._take(
+            announcement=announcement,
+            text=text,
+            timeout=self.mic_grace if grace is None else grace,
+        )
+
+    async def _take(
+        self,
+        *,
+        announcement=None,
+        text: str = "",
+        timeout: float | None = None,
+    ) -> Transcript | None:
+        speaking = announcement is not None or bool((text or "").strip())
         if not self.can_listen():
+            # No recognizer: there is still something to say, and saying it is
+            # the part that must not depend on being able to hear an answer.
+            if announcement is not None:
+                await self.speaker.announce(announcement)
+            elif text:
+                await self.speaker.speak(text)
             return None
-        mic_dir = self.state_dir / "mic"
-        path = mic_dir / f"{uuid.uuid4().hex}.wav"
+
+        said = announcement.text if announcement is not None else (text or "")
+        private = await self.headphones() if speaking else False
+        path = self.state_dir / "mic" / f"{uuid.uuid4().hex}.wav"
         stop = asyncio.Event()
         self._mic_stop = stop
+        barged = asyncio.Event()
+
         try:
             # `__aexit__` runs before any handler below, so the floor is long
             # gone by the time one of them tries to speak.
             async with self.speaker.floor() as floor:
+
+                async def open_the_mic() -> None:
+                    """What is said while the take is already running."""
+                    if not speaking:
+                        await floor.cue(self.mic_open_chime)
+                        return
+                    watching = (
+                        asyncio.ensure_future(self._cut_the_voice(barged))
+                        if private
+                        else None
+                    )
+                    try:
+                        if announcement is not None:
+                            await floor.announce(announcement)
+                        else:
+                            await floor.play(self.mic_open_chime)
+                            await floor.say(text)
+                    finally:
+                        if watching is not None:
+                            watching.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await watching
+                        floor.release()
+
                 recording = await self.recorder.record(
                     path,
                     stop=stop,
-                    on_open=lambda: floor.cue(self.mic_open_chime),
+                    on_open=open_the_mic,
                     speech_timeout=timeout,
+                    # Barge-in only where our own voice cannot reach the mic.
+                    speech=barged if private else None,
+                    # On speakers everything heard under the voice is the voice.
+                    arm_after_open=speaking and not private,
                 )
         except MicConsentPending as exc:
             # The one mic failure with a fix only the user can perform — and
@@ -904,6 +1122,8 @@ class Daemon:
             return None
         finally:
             self._mic_stop = None
+        # Always, and always a different sound from the one that opened it:
+        # a mic that closes in silence is a mic you cannot tell is still open.
         await self.speaker.chime(self.mic_close_chime)
 
         if not recording.usable:
@@ -919,7 +1139,253 @@ class Daemon:
         finally:
             self._discard(path)
         log.info("heard %r (confidence=%s)", transcript.text, transcript.confidence)
-        return transcript
+        return self._without_echo(transcript, said)
+
+    def _without_echo(self, transcript: Transcript, said: str) -> Transcript:
+        """Take our own voice out of what came back.
+
+        On speakers the take contains the announcement, word for word, and a
+        recognizer has no way to know it was not you. We do: we know exactly
+        what `say` was given.
+        """
+        if not said or not transcript.text.strip():
+            return transcript
+        kept = echo.strip_echo(transcript.text, said)
+        if kept == transcript.text:
+            return transcript
+        log.info("echo filtered: %r -> %r", transcript.text, kept)
+        return dataclasses.replace(transcript, text=kept)
+
+    def _settle_guess(self, guess, intent, transcript, menu):
+        """What the answer to "¿Querés los pendientes?" turned the utterance into.
+
+        A yes replaces it with the command it was nearly saying. Anything else
+        replaces the utterance outright — a correction is a new thing said, not
+        a refusal — and silence resolves to nothing at all, which is the whole
+        point: a phrase we were unsure about is never typed anywhere.
+        """
+        if intent.kind == intents.KIND_CONFIRM:
+            log.info("doubt settled: %r -> %s", transcript.text, guess.kind)
+            del menu
+            return guess.as_intent(), transcript, None
+        if intent.kind in (intents.KIND_SILENCE, intents.KIND_CANCEL):
+            # "no" answers the question, and there is nothing behind it: what
+            # we were unsure about is dropped, never sent on to a window.
+            return None, transcript, None
+        return intent, transcript, None
+
+    async def classify(self, transcript: Transcript, *, menu=None) -> classify_mod.Plan:
+        """What one utterance asked for — lexicon first, model only if it missed.
+
+        The order is the whole design. Anything the phrase lists resolve is
+        resolved here, instantly and offline; only what they have never heard
+        of costs a round trip. And a phrase that is *nearly* a control word
+        never reaches the model at all: a transcript we already distrust is not
+        made trustworthy by a second opinion on its wording — it is asked about.
+        """
+        labels = menu.labels if menu else ()
+        intent = intents.parse(
+            transcript.text, labels, multi=bool(menu and menu.multi_select)
+        )
+        if intent.kind != intents.KIND_TEXT:
+            return classify_mod.Plan.of(intent)
+
+        near = intents.nearest_control(transcript.text)
+        if near is not None:
+            return classify_mod.Plan.of(
+                intent,
+                classify_mod.SOURCE_DOUBTFUL,
+                guess=classify_mod.Action(kind=near.kind),
+            )
+
+        actions = await asyncio.to_thread(
+            self.classifier.classify, transcript.text, self.window_names()
+        )
+        if actions is None:
+            # No key, no network, or nothing usable came back. Exactly what the
+            # lexicon alone would have done, which is the point of the leash.
+            return classify_mod.Plan.of(intent, classify_mod.SOURCE_UNAVAILABLE)
+        if not actions:
+            # Asked, and told this is not a command — which is a real answer,
+            # and the one that keeps dictation from becoming a random command.
+            return classify_mod.Plan.of(intent, classify_mod.SOURCE_LLM)
+        resolved = tuple(
+            action
+            if action.kind != intents.KIND_TEXT or action.text
+            else dataclasses.replace(action, text=transcript.text)
+            for action in actions
+        )
+        log.info(
+            "classified %r as %s",
+            transcript.text,
+            ", ".join(action.kind for action in resolved),
+        )
+        if self._unsure(transcript) and resolved[0].kind != intents.KIND_TEXT:
+            # Measured on the real thing: "dámelo" came back as "jamelo" at
+            # 0.75 and "dame los pendientes" as "dame los pendins" at 0.70. A
+            # model can read through that, and often should — but a command
+            # built on words the recognizer itself doubted is asked about, not
+            # run. Dictation is exempt: it has its own gate downstream.
+            return classify_mod.Plan.of(
+                intent, classify_mod.SOURCE_DOUBTFUL, guess=resolved[0]
+            )
+        return classify_mod.Plan(resolved, classify_mod.SOURCE_LLM)
+
+    def _unsure(self, transcript: Transcript) -> bool:
+        """Did the recognizer itself say it was not sure? Inclusive of the line.
+
+        The delivery gate uses the same number to decide whether to read a
+        phrase back before typing it, and the boundary is `<=` here because
+        0.75 *is* what a bad take measured at.
+        """
+        confidence = transcript.confidence
+        return confidence is not None and confidence <= self.gate.threshold
+
+    def window_names(self) -> list[str]:
+        """Every window that can be addressed by name, for "decile a X que…"."""
+        names: list[str] = []
+        try:
+            sessions = roster_mod.load(self.roster_dir, interactive_only=True)
+        except OSError:
+            sessions = {}
+        for session in sessions.values():
+            alias = self.store.get_alias(session.session_id)
+            name = alias or session.name
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def window_named(self, spoken: str) -> tuple[str, str]:
+        """(session id, tty) of the window you named out loud, or ("", "").
+
+        Matched on the folded name, and then on a name that merely contains
+        what you said: window names are two to four words and nobody says all
+        of them — "decile a inbox que espere" is about `inbox realtime`.
+        """
+        wanted = intents.fold(spoken)
+        if not wanted:
+            return "", ""
+        try:
+            sessions = roster_mod.load(self.roster_dir, interactive_only=True)
+        except OSError:
+            sessions = {}
+        partial: tuple[str, str] | None = None
+        for session in sessions.values():
+            alias = self.store.get_alias(session.session_id)
+            name = intents.fold(alias or session.name)
+            if not name:
+                continue
+            found = (session.session_id, self.store.tty_for(session.session_id))
+            if name == wanted:
+                return found
+            if partial is None and (wanted in name or name in wanted):
+                partial = found
+        return partial or ("", "")
+
+    # -- everything one breath asked for, in order --------------------------
+
+    def _queue_actions(self, actions: Sequence[classify_mod.Action]) -> None:
+        """Park what is left of a compound phrase until the first part is done.
+
+        "Ok dámelo, y también abrí una ventana nueva y hacé X" is three things,
+        and the first of them holds the microphone for a whole reply cycle. So
+        the rest wait here rather than running inside it, and are drained the
+        moment that cycle unwinds — still in the order they were said.
+        """
+        for action in actions:
+            self._afterwards.append(action)
+
+    async def _drain_actions(self) -> None:
+        """Run what the rest of the phrase asked for. A failure stops nothing.
+
+        Deliberately: "abrí una ventana y decile a inbox que espere" with a
+        window that has since closed should still open the window. Aborting the
+        rest of a sentence because one part of it failed is how one dead tty
+        swallows everything else you said.
+        """
+        pending, self._afterwards = self._afterwards, []
+        for action in pending:
+            await self._perform_side(action)
+
+    async def _perform_side(self, action: classify_mod.Action) -> bool:
+        """One action that is not an answer to the window in front of you."""
+        if action.kind == intents.KIND_OPEN:
+            return await self._open_window(action.text)
+        if action.kind == intents.KIND_TELL:
+            return await self._tell_window(action.target, action.text)
+        if action.kind == intents.KIND_SHOW:
+            session_id, tty = self.window_named(action.target or action.text)
+            del session_id
+            return bool(tty) and bool(await self._safely(self.delivery.focus, tty))
+        if action.kind == intents.KIND_STATUS:
+            await self.speak_status()
+            return True
+        if action.kind == intents.KIND_PENDINGS:
+            await self.speak_pendings()
+            return True
+        log.info("nothing to do for a queued %s", action.kind)
+        return False
+
+    async def _open_window(self, text: str) -> bool:
+        opened = await self._safely(
+            self.delivery.open_tab, self.new_tab_command, text
+        )
+        if not opened:
+            await self.speaker.speak("No pude abrir la ventana.")
+            return False
+        log.info("opened a tab%s", f" and sent {text!r}" if text else "")
+        return True
+
+    async def _tell_window(self, target: str, text: str) -> bool:
+        if not text:
+            return False
+        session_id, tty = self.window_named(target)
+        del session_id
+        if not tty:
+            spoken = announce_mod.speakable(target, self.phonetic)
+            await self.speaker.speak(
+                f"No encontré la ventana {spoken}." if spoken else "No sé a qué ventana."
+            )
+            return False
+        if await self._safely(self.delivery.send_text, tty, text) is None:
+            await self.speaker.speak("No pude escribir en esa ventana.")
+            return False
+        log.info("told %s: %r", tty, text)
+        return True
+
+    async def _safely(self, call, *args):
+        """Run a blocking call off the loop. `None` means it failed, loudly logged.
+
+        Every action of a compound phrase goes through here, because one that
+        raises must not take the rest of the sentence with it.
+        """
+        try:
+            return await asyncio.to_thread(call, *args)
+        except Exception:  # noqa: BLE001 - one failed action, not a failed phrase
+            log.exception("action failed: %s%r", getattr(call, "__name__", call), args)
+            return None
+
+    async def _say_then(self, text: str, *, listening: bool) -> Transcript | None:
+        """Say something in the middle of a cycle, with the mic open if it is worth it.
+
+        On the last round there is nobody left to answer — the cycle ends the
+        moment this returns — so opening a microphone on it would be a take
+        spent on a question already closed.
+        """
+        if not listening:
+            await self.speaker.speak(text)
+            return None
+        return await self.say_and_listen(text=text)
+
+    async def headphones(self) -> bool:
+        """Is the voice going somewhere the microphone cannot hear it?"""
+        return await asyncio.to_thread(self.output.private)
+
+    async def _cut_the_voice(self, barged: asyncio.Event) -> None:
+        """Stop talking the instant you start. Headphones only — see `output.py`."""
+        await barged.wait()
+        if await self.speaker.interrupt():
+            log.info("barge-in: stopped talking")
 
     def _discard(self, path: Path) -> None:
         if self.keep_recordings:
@@ -965,7 +1431,10 @@ class Daemon:
             else:
                 # Back in line, reachable from `pendings`, never dropped.
                 self.store.mark_pending(item.id)
-            return outcome
+        # Outside the lock: whatever else that breath asked for may want to
+        # talk, and the cycle it belonged to is over.
+        await self._drain_actions()
+        return outcome
 
     async def _converse(
         self, item: Item, announced: str, *, first: Transcript | None = None
@@ -974,9 +1443,10 @@ class Daemon:
         for position, menu in enumerate(menus or [None]):
             if position:
                 # The payload had more than one question; Claude shows the next
-                # one the moment the previous is answered.
-                await self.speaker.speak(
-                    announce_mod.speakable(
+                # one the moment the previous is answered. Read with the mic
+                # open, so an answer given over the options still lands.
+                first = await self.say_and_listen(
+                    text=announce_mod.speakable(
                         announce_mod.describe_question(
                             menu.prompt,
                             menu.labels,
@@ -987,6 +1457,8 @@ class Daemon:
                         self.phonetic,
                     )
                 )
+                if first is None:
+                    return REPLY_FAILED
             # Only the question that was actually open when it was said.
             outcome = await self._answer_one(item, menu, announced, first=first)
             first = None
@@ -1000,36 +1472,79 @@ class Daemon:
         self, item: Item, menu, announced: str, *, first: Transcript | None = None
     ) -> str:
         pending_action = None
-        for _ in range(self.mic_rounds):
-            if first is not None:
-                transcript, first = first, None
+        pending_guess: intents.NearMiss | None = None
+        queued: list[classify_mod.Action] = []
+        rounds = 0
+        while queued or rounds < self.mic_rounds:
+            if not queued:
+                if first is not None:
+                    transcript, first = first, None
+                else:
+                    transcript = await self.listen()
+                rounds += 1
+                if transcript is None:
+                    return REPLY_FAILED
+                plan = await self.classify(transcript, menu=menu)
+                queued = list(plan.actions)
+                guess = plan.guess
             else:
-                transcript = await self.listen()
-            if transcript is None:
-                return REPLY_FAILED
-            intent = intents.parse(
-                transcript.text,
-                menu.labels if menu else (),
-                multi=bool(menu and menu.multi_select),
-            )
+                guess = None
+            more_rounds = rounds < self.mic_rounds
+            action = queued.pop(0)
+            intent = action.as_intent()
+
+            if pending_guess is not None:
+                intent, transcript, pending_guess = self._settle_guess(
+                    pending_guess, intent, transcript, menu
+                )
+                if intent is None:
+                    # Neither a yes nor anything else worth acting on. The
+                    # doubtful phrase is dropped rather than delivered.
+                    return REPLY_PENDING
+            elif guess is not None:
+                # Before anything is dispatched: a command built out of words
+                # the recognizer doubted is asked about, never run.
+                pending_guess = guess
+                self._queue_actions(queued)
+                queued = []
+                first = await self._say_then(
+                    announce_mod.speakable(
+                        announce_mod.near_miss_question(transcript.text, guess.kind),
+                        self.phonetic,
+                    ),
+                    listening=more_rounds,
+                )
+                continue
 
             if intent.kind == intents.KIND_LATER:
                 # Same instruction as at the heads-up: not now, and not first.
                 self.store.defer(item.id)
+                self._queue_actions(queued)
                 return REPLY_PENDING
             if intent.kind in (intents.KIND_SILENCE, intents.KIND_SKIP):
+                self._queue_actions(queued)
                 return REPLY_PENDING
             if intent.kind == intents.KIND_REPEAT:
-                await self.speaker.speak(announced or "No tengo nada que repetir.")
+                first = await self._say_then(
+                    announced or "No tengo nada que repetir.",
+                    listening=more_rounds and not queued,
+                )
                 continue
             if intent.kind == intents.KIND_SHOW:
-                await asyncio.to_thread(self.delivery.focus, item.tty)
+                await self._safely(self.delivery.focus, item.tty)
+                continue
+            if intent.kind in (intents.KIND_OPEN, intents.KIND_TELL):
+                await self._perform_side(action)
                 continue
             if intent.kind == intents.KIND_WAIT:
-                await self.speaker.speak("Dale, espero.")
+                first = await self._say_then(
+                    "Dale, espero.", listening=more_rounds and not queued
+                )
                 continue
             if intent.kind == intents.KIND_STATUS:
-                await self.speak_status()
+                first = await self._speak_status_and_listen(
+                    listening=more_rounds and not queued
+                )
                 continue
             if intent.kind == intents.KIND_PENDINGS:
                 chosen = await self.speak_pendings()
@@ -1037,34 +1552,44 @@ class Daemon:
                     # Unwind first: this item's mic lock is in the way, and
                     # leaving it half-answered is what `pending` is for.
                     self._switch_to = chosen.id
+                    self._queue_actions(queued)
                     return REPLY_PENDING
                 continue
             if intent.kind == intents.KIND_EXPLAIN and menu is not None:
-                await self.speaker.speak(
-                    announce_mod.speakable(menu.describe(intent.index), self.phonetic)
+                first = await self._say_then(
+                    announce_mod.speakable(menu.describe(intent.index), self.phonetic),
+                    listening=more_rounds and not queued,
                 )
                 continue
 
             if pending_action is not None:
                 if intent.kind == intents.KIND_CONFIRM:
                     await self._perform(item, pending_action)
+                    self._queue_actions(queued)
                     return REPLY_DELIVERED
                 if intent.kind == intents.KIND_CANCEL:
                     await self.speaker.speak("Listo, no mando nada.")
+                    self._queue_actions(queued)
                     return REPLY_PENDING
                 pending_action = None  # a new utterance replaces the old one
 
-            action, gate = self._plan_action(item, menu, intent, transcript)
-            if action is None:
-                await self.speaker.speak(gate.reason)
-                continue
-            if gate.required:
-                pending_action = action
-                await self.speaker.speak(
-                    self._readback_sentence(gate, self._readback(action, menu))
+            planned, gate = self._plan_action(item, menu, intent, transcript)
+            if planned is None:
+                first = await self._say_then(
+                    gate.reason, listening=more_rounds and not queued
                 )
                 continue
-            await self._perform(item, action)
+            if gate.required:
+                pending_action = planned
+                self._queue_actions(queued)
+                queued = []
+                first = await self._say_then(
+                    self._readback_sentence(gate, self._readback(planned, menu)),
+                    listening=more_rounds,
+                )
+                continue
+            await self._perform(item, planned)
+            self._queue_actions(queued)
             return REPLY_DELIVERED
         return REPLY_PENDING
 
@@ -1130,17 +1655,13 @@ class Daemon:
 
     # -- asking voice-loop itself -------------------------------------------
 
-    async def speak_status(self) -> str:
-        """How the whole board looks, in one breath.
-
-        Answerable from any mode, busy included: "what is going on" is the
-        question you ask precisely when you have not been listening.
-        """
+    def status_sentence(self) -> str:
+        """How the whole board looks, in one breath."""
         try:
             sessions = roster_mod.load(self.roster_dir, interactive_only=True)
         except OSError:
             sessions = {}
-        text = announce_mod.describe_status(
+        return announce_mod.describe_status(
             windows=len(sessions),
             working=sum(1 for s in sessions.values() if s.status == roster_mod.STATUS_BUSY),
             waiting=self.store.open_count(),
@@ -1148,8 +1669,23 @@ class Daemon:
             paused=self.paused,
             busy=self.busy,
         )
+
+    async def speak_status(self) -> str:
+        """Answerable from any mode, busy included: "what is going on" is the
+        question you ask precisely when you have not been listening.
+        """
+        text = self.status_sentence()
+        # Logged because from outside the machine a spoken answer and no answer
+        # at all look identical, and this is the one command whose whole output
+        # is a sentence nobody can grep for afterwards.
+        log.info("status: %s", text)
         await self.speaker.speak(announce_mod.speakable(text, self.phonetic))
         return text
+
+    async def _speak_status_and_listen(self, *, listening: bool = True) -> Transcript | None:
+        """The same answer, with the mic open under it — you usually ask twice."""
+        text = announce_mod.speakable(self.status_sentence(), self.phonetic)
+        return await self._say_then(text, listening=listening)
 
     async def speak_pendings(self) -> Item | None:
         """Read the queue out in order, then take a pick — by number or by name.
@@ -1174,13 +1710,16 @@ class Daemon:
             )
             for index, item in enumerate(items)
         ]
-        await self.speaker.speak(
-            announce_mod.speakable(announce_mod.describe_pendings(entries), self.phonetic)
+        spoken = announce_mod.speakable(
+            announce_mod.describe_pendings(entries), self.phonetic
         )
+        log.info("pendings: %d item(s) — %s", len(items), spoken)
         if not items:
+            await self.speaker.speak(spoken)
             return None
 
-        transcript = await self.listen()
+        # The list is long and the pick is usually said over the top of it.
+        transcript = await self.say_and_listen(text=spoken)
         if transcript is None:
             return None
         intent = intents.parse(transcript.text, names)
@@ -1198,6 +1737,7 @@ class Daemon:
         acted on once that cycle has unwound — bounded, because a chain of
         switches is still one hotkey press away from being restarted by hand.
         """
+        await self._drain_actions()
         target, self._switch_to = self._switch_to, None
         if target is None:
             return
@@ -1298,46 +1838,93 @@ class Daemon:
         task.add_done_callback(self._mic_tasks.discard)
 
     async def _hotkey_listen(self) -> None:
-        """A mic you opened yourself answers whatever spoke last — or asks me.
+        """A mic you opened yourself. With nothing in flight, you are talking to me.
 
-        The take comes first, before deciding what it was for: "estado" and
-        "dame los pendientes" are questions for voice-loop, and in busy mode
-        this hotkey is the only way to ask them. Anything else is handed to the
-        last window that spoke, so nothing has to be said twice.
+        The take comes first, before deciding what it was for, because in busy
+        mode this hotkey is the only way to ask anything at all. Then the
+        phrase is walked in the order it was said: everything that is voice-
+        loop's own business — the queue, the board, opening a window, telling a
+        window by name — happens here and now, and the first thing that needs a
+        window in front of you is handed to whichever one spoke last.
+
+        With **nothing** in flight there is no such window, and a sentence is
+        not typed into the last one out of hopefulness: it says so. Naming the
+        window is how you reach one — "decile a inbox realtime que…".
         """
         try:
             item = self.store.last_announced()
+            chosen = None
+            handled = False
+            for_the_window: classify_mod.Action | None = None
             async with self._mic_lock:
                 transcript = await self.listen()
                 if transcript is None:
                     return
-                intent = intents.parse(transcript.text)
-                chosen = None
-                if intent.kind == intents.KIND_STATUS:
-                    await self.speak_status()
-                    return
-                if intent.kind == intents.KIND_PENDINGS:
-                    chosen = await self.speak_pendings()
+                plan = await self.classify(transcript)
+                for position, action in enumerate(plan.actions):
+                    if action.kind == intents.KIND_PENDINGS:
+                        handled = True
+                        chosen = await self.speak_pendings()
+                        if chosen is not None:
+                            self._queue_actions(plan.actions[position + 1 :])
+                            break
+                        continue
+                    if self._is_assistant_action(action):
+                        handled = True
+                        await self._perform_side(action)
+                        continue
+                    if action.kind == intents.KIND_SILENCE:
+                        continue
+                    for_the_window = action
+                    self._queue_actions(plan.actions[position + 1 :])
+                    break
             if chosen is not None:
                 # `_announce` follows any further switch from here itself.
                 await self._announce(chosen, self._session_for(chosen), heads_up=False)
                 return
-            if intent.kind == intents.KIND_PENDINGS:
+            if for_the_window is None:
+                await self._drain_actions()
+                if not handled:
+                    # Nothing was said. In busy mode nothing has been announced
+                    # at all, so this says nothing about the queue beyond how
+                    # much of it there is.
+                    await self.speaker.speak(self._how_much_is_waiting())
                 return
             if item is None or not item.tty:
-                # In busy mode nothing has been announced at all, so "nothing
-                # was said last" is routine and says nothing about the queue.
-                piled_up = announce_mod.pendings_count(self.store.open_count())
+                # A sentence with no window in front of it. It is *not* typed
+                # into whichever one spoke last hours ago — naming the window
+                # is how you reach one: "decile a inbox realtime que…".
+                await self._drain_actions()
                 await self.speaker.speak(
-                    f"{piled_up}." if piled_up else "No hay nada pendiente."
+                    f"{self._how_much_is_waiting()} Decime a cuál le hablo."
                 )
                 return
-            outcome = await self.reply_cycle(item, item.summary or "", first=transcript)
+            outcome = await self.reply_cycle(
+                item,
+                item.summary or "",
+                first=dataclasses.replace(
+                    transcript, text=for_the_window.text or transcript.text
+                ),
+            )
             if outcome == REPLY_DELIVERED:
                 await self.speak_remaining()
             await self._follow_switch(0)
         except Exception:  # noqa: BLE001 - a background task must not die silently
             log.exception("hotkey mic failed")
+
+    def _how_much_is_waiting(self) -> str:
+        piled_up = announce_mod.pendings_count(self.store.open_count())
+        return f"{piled_up}." if piled_up else "No hay nada pendiente."
+
+    def _is_assistant_action(self, action: classify_mod.Action) -> bool:
+        """Is this voice-loop's own business, or does it need a window in front of you?
+
+        `show` is the one that is both: "mostrame" is about the window that
+        just spoke, and "mostrame inbox realtime" is about a window by name.
+        """
+        if action.kind in (intents.KIND_STATUS, intents.KIND_OPEN, intents.KIND_TELL):
+            return True
+        return action.kind == intents.KIND_SHOW and bool(action.target)
 
     async def cmd_busy_toggle(self, args: dict) -> dict:
         """Silence, and on the way out, how much of it there was.

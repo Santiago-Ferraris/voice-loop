@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Mapping, Sequence
 
 KIND_TEXT = "text"
@@ -38,6 +39,10 @@ KIND_STATUS = "status"
 KIND_WAIT = "wait"
 KIND_GIVE = "give"
 KIND_LATER = "later"
+# The two the lexicon never produces: they only ever arrive from the
+# classifier, because there is no fixed phrase for "open a window and do X".
+KIND_OPEN = "open"
+KIND_TELL = "tell"
 
 NUMBERS: Mapping[str, int] = {
     "uno": 1, "una": 1, "un": 1, "primero": 1, "primera": 1, "primer": 1,
@@ -403,6 +408,117 @@ def looks_systemward(text: str) -> bool:
     if words[0] not in QUESTION_WORDS:
         return False
     return any(word in SYSTEM_WORDS for word in words)
+
+
+# Under this many words, nothing anybody dictates to a coding session: an
+# instruction is a sentence, and one or two words is a command said wrong.
+MIN_DICTATION_WORDS = 3
+
+
+def _without_the_yes(folded: str) -> str:
+    """"dale mergealo" -> "mergealo". What was said, minus agreeing to say it."""
+    tokens = folded.split()
+    while len(tokens) > 1 and tokens[0] in CONFIRM_LEAD:
+        tokens.pop(0)
+    return " ".join(tokens)
+
+
+def plausible_dictation(text: str) -> bool:
+    """Could this really have been meant as an instruction for a window?
+
+    The inverted policy, in one predicate. Not "deliver unless the recognizer
+    was unsure" — it was sure about `'contain'`, and right — but "how convinced
+    are we that this is content rather than a command we misheard".
+    """
+    return len(fold(text).split()) >= MIN_DICTATION_WORDS
+
+
+@dataclass(frozen=True)
+class NearMiss:
+    """A control phrase the recognizer very nearly gave us."""
+
+    kind: str
+    phrase: str
+    ratio: float
+
+
+# Every set matched whole, in one place, so a near miss can be looked for
+# against exactly the same vocabulary an exact match is.
+CONTROL_SETS: tuple[tuple[frozenset, str], ...] = (
+    (GIVE_PHRASES, KIND_GIVE),
+    (LATER_PHRASES, KIND_LATER),
+    (CONFIRM_PHRASES, KIND_CONFIRM),
+    (CANCEL_PHRASES, KIND_CANCEL),
+    (REPEAT_PHRASES, KIND_REPEAT),
+    (SKIP_PHRASES, KIND_SKIP),
+    (WAIT_PHRASES, KIND_WAIT),
+    (SHOW_PHRASES, KIND_SHOW),
+    (PENDINGS_PHRASES, KIND_PENDINGS),
+    (STATUS_PHRASES, KIND_STATUS),
+)
+
+# How close a phrase has to be to a command before we ask whether it was one.
+#
+# Graded, because how much is at stake changes with length. A phrase long
+# enough to be a real instruction has to look *a lot* like a command before we
+# doubt it — "cerrá la ventana" is 0.74 similar to "mostrame la ventana" and is
+# not it. But a phrase too short to be dictation is a different question: it
+# was almost certainly a command, and the only doubt is which one.
+#
+# Measured out loud on a machine somebody was working on, all at confidence the
+# recognizer was happy with:
+#
+#   "contame"             -> 'contain'             0.71 against "contame"
+#   "dámelo"              -> 'chamelo'             0.77 against "damelo"
+#   "dámelo"              -> 'jamelo'              0.83 against "damelo"
+#   "dame los pendientes" -> 'dame los pendins'    0.91
+#
+# `'contain'` was typed into a working window and the user asked what it was.
+# No confidence threshold catches that one — the recognizer was *right*, it
+# heard a sound that really does resemble "contain", so the error is semantic
+# and the score was 0.96. What catches it is that "contain" is not a plausible
+# thing to dictate to a coding session, and it looks like something that is.
+NEAR_MISS_RATIO = 0.8
+SHORT_NEAR_MISS_RATIO = 0.7
+
+# A near miss is a short phrase said wrong. A long one is a sentence that
+# happens to rhyme with something, and asking about every sentence was rejected
+# out loud — the point of asking is that it is rare enough to be worth it.
+MAX_NEAR_MISS_WORDS = 5
+
+
+def nearest_control(text: str) -> NearMiss | None:
+    """The command this almost was, when it is not a command at all.
+
+    "dame al pendiente" is what Deepgram heard for "dame los pendientes", and
+    the whole cost of the miss was paid downstream: it matched nothing, so it
+    was a sentence, so it was typed into somebody's Claude session. Asking
+    costs one round. Not asking costs a turn nobody meant to take, in a window
+    that was already waiting on an answer.
+
+    `None` for anything that matched exactly (there is nothing to ask about)
+    and for anything long enough to be a real instruction.
+    """
+    folded = fold(text)
+    if not folded or len(folded.split()) > MAX_NEAR_MISS_WORDS:
+        return None
+    # A yes in front of something is not part of the something. Without this,
+    # "dale, mergealo" is three quarters the same string as "dale damelo" —
+    # for no better reason than that both open with "dale" — and a perfectly
+    # ordinary instruction gets asked about every time it is said.
+    subject = _without_the_yes(folded)
+    floor = NEAR_MISS_RATIO if plausible_dictation(subject) else SHORT_NEAR_MISS_RATIO
+    best: NearMiss | None = None
+    for phrases, kind in CONTROL_SETS:
+        if folded in phrases or subject in phrases:
+            return None
+        for phrase in phrases:
+            score = SequenceMatcher(None, subject, phrase, autojunk=False).ratio()
+            if score < floor:
+                continue
+            if best is None or score > best.ratio:
+                best = NearMiss(kind=kind, phrase=phrase, ratio=score)
+    return best
 
 
 def parse(

@@ -323,6 +323,27 @@ class Store:
         ).fetchall()
         return [_row_to_item(row) for row in rows]
 
+    def tty_for(self, session_id: str) -> str:
+        """The last tty this session was seen on — "" if it never was.
+
+        A window is addressed by name out loud ("decile a inbox realtime
+        que…"), and the roster does not carry a tty, so the only handle on one
+        is whatever its last event reported. Resolved rows count: a window you
+        answered an hour ago is still the same window.
+        """
+        if not session_id:
+            return ""
+        row = self._conn.execute(
+            """
+            SELECT tty FROM events
+             WHERE session_id = ? AND tty != ''
+             ORDER BY ts DESC, rowid DESC
+             LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        return row["tty"] if row else ""
+
     def open_count(self) -> int:
         placeholders = ",".join("?" for _ in OPEN_STATES)
         row = self._conn.execute(

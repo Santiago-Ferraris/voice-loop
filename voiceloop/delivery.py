@@ -261,3 +261,7 @@ class Delivery:
 
     def focus(self, tty: str) -> bool:
         return iterm.focus(tty, self.runner)
+
+    def open_tab(self, command: str = "", text: str = "") -> bool:
+        """The one write that does not go into somebody else's window."""
+        return iterm.open_tab(command, text, runner=self.runner)

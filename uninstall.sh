@@ -25,7 +25,9 @@ SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 CONFIG_DIR="${VOICE_LOOP_CONFIG_DIR:-$HOME/.config/voice-loop}"
 RUNTIME="${VOICE_LOOP_RUNTIME_DIR:-$HOME/.local/share/voice-loop}"
 LAUNCHCTL="${VOICE_LOOP_LAUNCHCTL:-launchctl}"
-PLIST_LABEL=com.voiceloop.daemon
+# See install.sh: `launchctl` ignores $HOME, so the label is what keeps a test
+# run from booting out the agent of whoever is using the machine.
+PLIST_LABEL="${VOICE_LOOP_LABEL:-com.voiceloop.daemon}"
 PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 
 if command -v "$LAUNCHCTL" >/dev/null 2>&1; then

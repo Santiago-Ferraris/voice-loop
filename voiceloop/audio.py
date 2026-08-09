@@ -96,13 +96,38 @@ class Recording:
 
 
 class SilenceTracker:
-    """Turns `silencedetect` chatter into two booleans: opened, and cut off."""
+    """Turns `silencedetect` chatter into two booleans: opened, and cut off.
 
-    def __init__(self, *, min_speech_seconds: float = 0.6):
+    `armed` is the third state, and it exists for the microphone that is open
+    while we are talking. On speakers everything `silencedetect` reports during
+    the announcement is our own voice, so the take must not end on it — and the
+    pause the moment `say` stops is not you finishing a sentence, it is the
+    sentence we just finished. `arm()` draws the line: whatever was heard
+    before it is remembered (`ever_heard`, so the audio is still worth
+    transcribing) but cannot cut, and the first cut after it has to be preceded
+    by real speech.
+    """
+
+    def __init__(self, *, min_speech_seconds: float = 0.6, armed: bool = True):
         self.min_speech_seconds = min_speech_seconds
         self.heard_speech = False
+        self.ever_heard = False
         self.opened = False
         self.cut_off = False
+        self.armed = armed
+        # After a late arming, leading silence is not measured against the
+        # start of the take any more — the timestamps are already far past it.
+        # Nothing cuts until a `silence_end` proves somebody started talking.
+        self._needs_speech_first = not armed
+
+    def arm(self) -> None:
+        """Everything heard so far was ours. Start listening for you."""
+        if self.armed:
+            return
+        self.armed = True
+        self.heard_speech = False
+        self.cut_off = False
+        self._needs_speech_first = True
 
     def feed(self, line: str) -> None:
         text = (line or "").strip()
@@ -113,6 +138,7 @@ class SilenceTracker:
             return
         if _SILENCE_END.search(text):
             # Silence ended, so something was said in between.
+            self.ever_heard = True
             self.heard_speech = True
             return
         match = _SILENCE_START.search(text)
@@ -122,11 +148,15 @@ class SilenceTracker:
             started_at = float(match.group(1))
         except ValueError:
             return
-        if not self.heard_speech and started_at < self.min_speech_seconds:
+        if not self.heard_speech and (
+            self._needs_speech_first or started_at < self.min_speech_seconds
+        ):
             # Leading silence: the mic is open and you have not started yet.
             return
+        self.ever_heard = True
         self.heard_speech = True
-        self.cut_off = True
+        if self.armed:
+            self.cut_off = True
 
 
 def split_stream(buffer: str) -> tuple[list[str], str]:
@@ -229,18 +259,30 @@ class Recorder:
         stop: asyncio.Event | None = None,
         on_open: Callable[[], Awaitable[None]] | None = None,
         speech_timeout: float | None = None,
+        speech: asyncio.Event | None = None,
+        arm_after_open: bool = False,
     ) -> Recording:
         """Capture until silence, the toggle, the timeout, or `max_seconds`.
 
         `speech_timeout` overrides how long this one take waits for you to
-        start. The heads-up mic uses a short one: it is asking a question with
-        two words for an answer, and if you have not started in four seconds
-        you are not there.
+        start — and, since `on_open` is awaited before the clock starts, it is
+        also how long the mic stays open *after* whatever `on_open` said.
+
+        `speech` is set the first time the recorder hears a voice, which is
+        what barge-in waits on: on headphones the first syllable stops the
+        sentence being spoken.
+
+        `arm_after_open` is the speakers case. Everything heard while `on_open`
+        was talking is our own announcement, so it must not end the take; the
+        audio is kept — the echo is filtered out of the transcript, not out of
+        the recording — but the cutoff only starts counting once we stop.
         """
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
-        tracker = SilenceTracker(min_speech_seconds=self.min_speech_seconds)
+        tracker = SilenceTracker(
+            min_speech_seconds=self.min_speech_seconds, armed=not arm_after_open
+        )
 
         try:
             process = await self.spawn(self.argv(path))
@@ -267,6 +309,8 @@ class Recorder:
                     tracker.feed(line)
                     if tracker.opened and not opened.is_set():
                         opened.set()
+                    if speech is not None and tracker.heard_speech and not speech.is_set():
+                        speech.set()
                     if tracker.cut_off:
                         cut.set()
                         return
@@ -276,7 +320,7 @@ class Recorder:
         pumping = asyncio.create_task(pump())
         try:
             reason = await self._wait_for_end(
-                process, opened, cut, stop, on_open, speech_timeout
+                process, opened, cut, stop, on_open, speech_timeout, tracker
             )
         finally:
             pumping.cancel()
@@ -285,7 +329,7 @@ class Recorder:
             await self._terminate(process)
 
         seconds = time.monotonic() - started
-        spoke = tracker.heard_speech if self.silence_detect else reason != REASON_TIMEOUT
+        spoke = tracker.ever_heard if self.silence_detect else reason != REASON_TIMEOUT
         if reason == REASON_TOGGLE:
             # You pressed the key to stop: assume you meant to say something.
             spoke = True
@@ -299,6 +343,7 @@ class Recorder:
         stop: asyncio.Event | None,
         on_open: Callable[[], Awaitable[None]] | None,
         speech_timeout: float | None = None,
+        tracker: SilenceTracker | None = None,
     ) -> str:
         try:
             await asyncio.wait_for(opened.wait(), timeout=self.open_timeout)
@@ -308,6 +353,10 @@ class Recorder:
             ) from None
         if on_open is not None:
             await on_open()
+        if tracker is not None:
+            # Whatever `on_open` said is behind us; from here it is you. Nothing
+            # to do when the take was armed from the start.
+            tracker.arm()
 
         waits = {
             asyncio.ensure_future(cut.wait()): REASON_SILENCE,

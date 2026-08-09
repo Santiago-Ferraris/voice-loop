@@ -310,3 +310,164 @@ def test_a_recording_with_audio_in_it_is_usable(tmp_path):
     path.write_bytes(b"\0" * (audio.MIN_USABLE_BYTES + 1))
 
     assert Recording(path=path, seconds=2.0, spoke=True, reason="silence").usable is True
+
+
+# --- the mic that is already open while we are talking ----------------------
+
+
+class GatedStderr:
+    """Two batches: what the mic hears while we talk, and what it hears after.
+
+    The first batch is handed over immediately, the way `silencedetect` reports
+    our own voice coming back off the speakers. The second waits on an event,
+    which the take's `on_open` sets when the sentence is over.
+    """
+
+    def __init__(self, lines, later, gate: asyncio.Event):
+        self.pending = "".join(f"{line}\n" for line in lines).encode("utf-8")
+        self.later = "".join(f"{line}\n" for line in later).encode("utf-8")
+        self.gate = gate
+        self.released = False
+
+    async def read(self, size: int = 1024) -> bytes:
+        if self.pending:
+            chunk, self.pending = self.pending[:size], self.pending[size:]
+            return chunk
+        if not self.released:
+            await self.gate.wait()
+            self.released = True
+            self.pending = self.later
+            return await self.read(size)
+        await asyncio.sleep(30)
+        return b""
+
+
+def gated_recorder(lines, later, gate, **kwargs) -> Recorder:
+    async def spawn(argv):
+        process = FakeProcess([])
+        process.stderr = GatedStderr(lines, later, gate)
+        return process
+
+    defaults = dict(open_timeout=2.0, speech_timeout=0.4, spawn=spawn)
+    defaults.update(kwargs)
+    return Recorder(**defaults)
+
+
+def test_our_own_voice_does_not_end_the_take_it_is_running_under(tmp_path):
+    """The speakers case: everything heard under the announcement is the announcement.
+
+    `silencedetect` reports our voice, and then the pause the moment `say`
+    stops — which is not you finishing a sentence, it is us finishing ours. A
+    take that ended on it would give the grace period away to the echo.
+    """
+    gate = asyncio.Event()
+    subject = gated_recorder(
+        [OPEN_LINE, silence_end(0.4), silence_start(2.0)],
+        [],
+        gate,
+        speech_timeout=0.3,
+    )
+
+    async def on_open():
+        await asyncio.sleep(0.05)
+        gate.set()
+
+    recording = asyncio.run(
+        subject.record(tmp_path / "r.wav", on_open=on_open, arm_after_open=True)
+    )
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    # Still worth transcribing: the echo filter is what takes our words out,
+    # not the recorder — and you may have spoken over the top of us.
+    assert recording.spoke is True
+
+
+def test_a_voice_that_starts_after_the_sentence_still_closes_the_mic(tmp_path):
+    gate = asyncio.Event()
+    subject = gated_recorder(
+        [OPEN_LINE, silence_end(0.4), silence_start(2.0)],
+        [silence_end(3.0), silence_start(5.0)],
+        gate,
+        speech_timeout=5.0,
+    )
+
+    async def on_open():
+        gate.set()
+
+    recording = asyncio.run(
+        subject.record(tmp_path / "r.wav", on_open=on_open, arm_after_open=True)
+    )
+
+    assert recording.reason == audio.REASON_SILENCE
+    assert recording.spoke is True
+
+
+def test_the_pause_our_own_voice_leaves_behind_is_not_you_stopping():
+    """Armed late, nothing cuts until real speech has been heard since.
+
+    Otherwise the `silence_start` that `say` leaves in its wake — reported at a
+    timestamp far past the beginning of the take, so the "you have not started
+    yet" rule does not catch it — reads as "they finished talking" the instant
+    the arming happens, and the grace period is over before it began.
+    """
+    tracker = SilenceTracker(min_speech_seconds=0.6, armed=False)
+    tracker.feed(silence_end(0.4))
+    tracker.arm()
+
+    tracker.feed(silence_start(9.0))
+
+    assert tracker.cut_off is False
+
+    tracker.feed(silence_end(11.0))
+    tracker.feed(silence_start(13.0))
+
+    assert tracker.cut_off is True
+
+
+def test_the_first_syllable_is_reported_while_the_take_is_still_running(tmp_path):
+    """What barge-in waits on: not the end of your sentence, the start of it."""
+    heard = asyncio.Event()
+    subject, _ = recorder([OPEN_LINE, silence_end(1.0), silence_start(2.5)])
+
+    async def scenario():
+        recording = await subject.record(tmp_path / "r.wav", speech=heard)
+        return recording
+
+    recording = asyncio.run(scenario())
+
+    assert heard.is_set() is True
+    assert recording.reason == audio.REASON_SILENCE
+
+
+def test_a_take_nobody_spoke_into_never_reports_speech(tmp_path):
+    heard = asyncio.Event()
+    subject, _ = recorder([OPEN_LINE, silence_start(0.1)], speech_timeout=0.2)
+
+    asyncio.run(subject.record(tmp_path / "r.wav", speech=heard))
+
+    assert heard.is_set() is False
+
+
+def test_arming_forgets_what_was_heard_but_not_that_something_was(tmp_path):
+    tracker = SilenceTracker(min_speech_seconds=0.6, armed=False)
+    tracker.feed(silence_end(0.4))
+    tracker.feed(silence_start(2.0))
+
+    assert tracker.cut_off is False
+    assert tracker.ever_heard is True
+
+    tracker.arm()
+
+    assert tracker.heard_speech is False
+    assert tracker.ever_heard is True
+    assert tracker.cut_off is False
+
+
+def test_a_tracker_armed_from_the_start_is_what_it_always_was():
+    tracker = SilenceTracker(min_speech_seconds=0.6)
+    tracker.feed(silence_end(1.0))
+    tracker.feed(silence_start(2.0))
+
+    assert tracker.cut_off is True
+    tracker.arm()  # idempotent: nothing to forget
+    assert tracker.cut_off is True

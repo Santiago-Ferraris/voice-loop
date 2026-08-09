@@ -304,3 +304,123 @@ def test_from_config_reads_voice_and_rate(config):
     assert speaker.voice == "Paulina"
     assert speaker.rate == 190
     assert speaker.chime_head == CHIME_HEAD_SECONDS
+
+
+# --- the floor that keeps talking, and the sentence you can cut off ---------
+
+
+class FakeChild:
+    """A `say` that runs until something kills it."""
+
+    def __init__(self):
+        self.terminated = False
+        self.done = asyncio.Event()
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.done.set()
+
+    async def wait(self) -> int:
+        await self.done.wait()
+        return 0
+
+
+class KillableRunner:
+    """A runner that hands its child over, the way `run_process` does."""
+
+    def __init__(self):
+        self.children: list[FakeChild] = []
+
+    async def __call__(self, argv, *, register=None):
+        child = FakeChild()
+        self.children.append(child)
+        if register is not None:
+            register(child)
+        try:
+            return await child.wait()
+        finally:
+            if register is not None:
+                register(None)
+
+
+def test_a_sentence_can_be_cut_off_mid_word():
+    runner = KillableRunner()
+    speaker = Speaker(voice="system", runner=runner)
+
+    async def scenario():
+        talking = asyncio.ensure_future(speaker.speak("una frase larga"))
+        while not runner.children:
+            await asyncio.sleep(0)
+        cut = await speaker.interrupt()
+        await talking
+        return cut
+
+    assert asyncio.run(scenario()) is True
+    assert runner.children[0].terminated is True
+    assert speaker.interruptions == 1
+
+
+def test_there_is_nothing_to_cut_off_when_nobody_is_talking():
+    speaker = Speaker(voice="system", runner=KillableRunner())
+
+    assert asyncio.run(speaker.interrupt()) is False
+    assert speaker.interruptions == 0
+
+
+def test_a_runner_that_cannot_hand_over_its_child_simply_cannot_be_cut_off():
+    """Every fake in the suite is one of these. Better than a silent no-op."""
+    speaker = Speaker(voice="system", runner=TimedRunner())
+
+    asyncio.run(speaker.speak("hola"))
+
+    assert asyncio.run(speaker.interrupt()) is False
+
+
+def test_the_floor_speaks_on_the_lock_it_is_already_holding(tmp_path):
+    """The mic's whole sequence: open, chime, and talk — without letting go.
+
+    Releasing between the chime and the voice would put the announcement back
+    in the queue behind whatever else wanted to talk, and the microphone would
+    be recording the wait.
+    """
+    runner = TimedRunner({"say": 0.05, "afplay": 0.05})
+    speaker = Speaker(voice="system", runner=runner, chime_head=0.0)
+    sound = chime_file(tmp_path)
+
+    async def scenario():
+        async with speaker.floor() as floor:
+            await floor.play(sound)
+            await floor.say("lo que quiere esa ventana")
+            assert floor.held is True
+            floor.release()
+
+    asyncio.run(scenario())
+
+    assert [span[0] for span in runner.spans] == ["afplay", "say"]
+
+
+def test_the_floor_announces_chime_and_voice_together(tmp_path):
+    runner = TimedRunner({"say": 0.05, "afplay": 0.2})
+    speaker = Speaker(voice="system", runner=runner, chime_head=0.0)
+
+    async def scenario():
+        async with speaker.floor() as floor:
+            await floor.announce(
+                Announcement(text="Nuevo evento de indice.", chime=chime_file(tmp_path))
+            )
+
+    asyncio.run(scenario())
+
+    chime, voice = runner.spans_of("afplay")[0], runner.spans_of("say")[0]
+    assert voice[1] < chime[2]  # the voice starts while the chime still rings
+
+
+def test_a_floor_already_let_go_of_falls_back_to_taking_the_lock(tmp_path):
+    speaker = Speaker(voice="system", runner=TimedRunner(), chime_head=0.0)
+
+    async def scenario():
+        async with speaker.floor() as floor:
+            floor.release()
+            return await floor.say("igual se dice")
+
+    assert asyncio.run(scenario()) is True
