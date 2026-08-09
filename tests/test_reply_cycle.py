@@ -23,6 +23,7 @@ from voiceloop.milestones import MilestoneWatcher
 from voiceloop.store import (
     STATE_DELIVERED,
     STATE_PENDING,
+    STATE_QUEUED,
     STATE_RESOLVED,
     Store,
 )
@@ -120,9 +121,12 @@ class StubRecorder:
         self.spoke = spoke
         self.error = error
         self.takes = 0
+        # How long each take was given, in order — the heads-up mic gets less.
+        self.windows: list = []
 
-    async def record(self, destination, *, stop=None, on_open=None):
+    async def record(self, destination, *, stop=None, on_open=None, speech_timeout=None):
         self.takes += 1
+        self.windows.append(speech_timeout)
         if self.error is not None:
             raise self.error
         path = Path(destination)
@@ -140,9 +144,11 @@ class TimedRecorder(StubRecorder):
         super().__init__(**kwargs)
         self.started_at: float | None = None
 
-    async def record(self, destination, *, stop=None, on_open=None):
+    async def record(self, destination, *, stop=None, on_open=None, speech_timeout=None):
         self.started_at = time.monotonic()
-        return await super().record(destination, stop=stop, on_open=on_open)
+        return await super().record(
+            destination, stop=stop, on_open=on_open, speech_timeout=speech_timeout
+        )
 
 
 class RecordingDelivery:
@@ -213,8 +219,8 @@ def build(config, tmp_path):
             subject.store.close()
 
 
-def queue(daemon: Daemon, payload=None, *, kind="menu", session="session-1") -> str:
-    event = Event.new(kind, session, tty=TTY, payload=payload or {})
+def queue(daemon: Daemon, payload=None, *, kind="menu", session="session-1", ts=None) -> str:
+    event = Event.new(kind, session, tty=TTY, payload=payload or {}, **({"ts": ts} if ts else {}))
     daemon.store.ingest(event)
     return event.id
 
@@ -302,12 +308,12 @@ def test_free_text_on_a_question_goes_to_the_row_past_the_options(build):
 
 def test_an_option_is_read_short_and_answered_by_what_was_heard(build):
     """Shortening the labels must not put the answer out of reach."""
-    daemon = build(["probalo sin hotkeys primero"])
+    daemon = build(["dámelo", "probalo sin hotkeys primero"])
     queue(daemon, HOTKEYS)
 
     asyncio.run(daemon.announce_next())
 
-    assert "Recomendado" not in daemon.speaker.texts[0]
+    assert "Recomendado" not in daemon.speaker.spoken[0]
     assert daemon.delivery.sent == [("choice", TTY, 1)]
 
 
@@ -620,23 +626,122 @@ def test_names_you_gave_a_window_yourself_are_vocabulary_too(build):
 
 
 def test_announcing_an_item_opens_the_mic_on_it_and_delivers_the_answer(build):
-    """The whole phase: announce, listen, transcribe, route, type."""
-    daemon = build(["la dos"])
+    """The whole phase: heads-up, "dámelo", listen, transcribe, route, type."""
+    daemon = build(["dámelo", "la dos"])
     queue(daemon, QUESTION)
 
     assert asyncio.run(daemon.announce_next()) is True
 
-    assert daemon.speaker.texts == [
-        "indice: ¿Qué base uso? Opciones: uno: SQLite, dos: Postgres."
-    ]
-    assert daemon.recorder.takes == 1
+    assert daemon.speaker.texts == ["Nuevo evento de indice."]
+    assert daemon.speaker.spoken[0] == "¿Qué base uso? Opciones: uno: SQLite, dos: Postgres."
+    assert daemon.recorder.takes == 2
     assert daemon.delivery.sent == [("choice", TTY, 2)]
 
 
-def test_what_is_left_is_said_when_the_cycle_closes_not_when_it_opens(build):
-    """You answer, *then* you hear how many are left — the announcement is not it."""
-    daemon = build(["la dos"])
+def test_the_heads_up_says_which_window_and_not_what_it_wants(build):
+    """The regression the whole flow is about: a name, and then a mic."""
+    daemon = build([], recorder=StubRecorder(spoke=False))
     queue(daemon, QUESTION)
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.speaker.texts == ["Nuevo evento de indice."]
+    assert daemon.speaker.spoken == []
+    assert daemon.recorder.takes == 1
+    assert daemon.delivery.sent == []
+
+
+def test_the_heads_up_mic_is_shorter_than_the_one_you_answer_in(build):
+    daemon = build(["dámelo", "la dos"])
+    queue(daemon, QUESTION)
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.recorder.windows == [daemon.alert_mic_timeout, None]
+    assert daemon.alert_mic_timeout == 4
+
+
+def test_three_windows_blocking_at_once_get_three_heads_ups(build):
+    """One after another, each with its own mic. Nothing is grouped."""
+    daemon = build([], recorder=StubRecorder(spoke=False))
+    for index, session in enumerate(("session-1", "session-2", "session-3")):
+        write_roster(daemon.roster_dir, sessionId=session, name=f"win-{index}")
+        queue(daemon, QUESTION, session=session)
+
+    async def drain():
+        while await daemon.announce_next():
+            pass
+
+    asyncio.run(drain())
+
+    assert daemon.speaker.texts == [
+        "Nuevo evento de win 0.",
+        "Nuevo evento de win 1.",
+        "Nuevo evento de win 2.",
+    ]
+    assert daemon.recorder.takes == 3
+
+
+def test_asking_for_it_reads_it_out_and_opens_the_mic_to_answer(build):
+    daemon = build(["dámelo", "mergealo"])
+    queue(daemon, kind="stop")
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+
+
+def test_after_is_the_back_of_the_line_and_says_nothing_about_the_item(build):
+    daemon = build(["después"])
+    first = queue(daemon, kind="stop", ts=1000)
+    write_roster(daemon.roster_dir, sessionId="session-2", name="beta")
+    second = queue(daemon, QUESTION, session="session-2", ts=1001)
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.speaker.spoken == []  # not one word about what it wanted
+    assert daemon.delivery.sent == []
+    assert [item.id for item in daemon.store.pendings()] == [second, first]
+
+
+def test_saying_nothing_leaves_it_in_the_queue_and_closes_the_mic(build):
+    """No reminder, ever: it waits there until you ask for it."""
+    daemon = build([], recorder=StubRecorder(spoke=False))
+    item = queue(daemon, kind="stop")
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.store.get(item).state == STATE_PENDING
+    assert daemon.store.get(item).deferred_at is None
+    assert daemon.recorder.takes == 1
+    assert asyncio.run(daemon.announce_next()) is False  # and it is not announced again
+
+
+def test_a_sentence_at_the_heads_up_is_asked_about_not_delivered(build):
+    """Nothing has been read out yet, so a sentence here may not be for anyone."""
+    daemon = build(["mergealo cuando pasen los tests", "no"])
+    queue(daemon, kind="stop")
+
+    asyncio.run(daemon.announce_next())
+
+    assert any("¿Te lo mando a la ventana?" in said for said in daemon.speaker.spoken)
+    assert daemon.delivery.sent == []
+
+
+def test_and_it_goes_through_once_you_say_it_was(build):
+    daemon = build(["mergealo cuando pasen los tests", "dale"])
+    queue(daemon, kind="stop")
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.delivery.sent == [("text", TTY, "mergealo cuando pasen los tests")]
+
+
+def test_what_is_left_is_said_when_the_cycle_closes_not_when_it_opens(build):
+    """You answer, *then* you hear how many are left — the heads-up is not it."""
+    daemon = build(["dámelo", "la dos"])
+    queue(daemon, QUESTION)
+    write_roster(daemon.roster_dir, sessionId="session-2", name="beta")
     queue(daemon, QUESTION, session="session-2")
 
     asyncio.run(daemon.announce_next())
@@ -646,7 +751,7 @@ def test_what_is_left_is_said_when_the_cycle_closes_not_when_it_opens(build):
 
 
 def test_an_empty_queue_counts_down_to_nothing(build):
-    daemon = build(["la dos"])
+    daemon = build(["dámelo", "la dos"])
     queue(daemon, QUESTION)
 
     asyncio.run(daemon.announce_next())
@@ -657,6 +762,7 @@ def test_an_empty_queue_counts_down_to_nothing(build):
 def test_nothing_is_counted_down_when_nobody_answered(build):
     daemon = build([], recorder=StubRecorder(spoke=False))
     queue(daemon, QUESTION)
+    write_roster(daemon.roster_dir, sessionId="session-2", name="beta")
     queue(daemon, QUESTION, session="session-2")
 
     asyncio.run(daemon.announce_next())
@@ -665,7 +771,7 @@ def test_nothing_is_counted_down_when_nobody_answered(build):
 
 
 def test_the_mic_chimes_open_and_closed_around_the_take(build):
-    daemon = build(["la dos"])
+    daemon = build([], recorder=StubRecorder(spoke=False))
     queue(daemon, QUESTION)
 
     asyncio.run(daemon.announce_next())
@@ -702,16 +808,18 @@ def test_the_mic_does_not_open_under_a_voice_that_is_still_talking(build, tmp_pa
     assert [span[0] for span in runner.spans] == ["say", "afplay"]
 
 
-def test_busy_mode_chimes_and_does_not_open_the_mic(build):
+def test_busy_mode_is_silent_and_lets_the_queue_pile_up(build):
+    """Not "a chime instead of the words" — that was the same interruption."""
     daemon = build(["la dos"])
     daemon.busy = True
     queue(daemon, QUESTION)
 
-    assert asyncio.run(daemon.announce_next()) is True
+    assert asyncio.run(daemon.announce_next()) is False
 
-    assert daemon.speaker.texts == []
+    assert daemon.speaker.said == []
+    assert daemon.speaker.chimes == []
     assert daemon.recorder.takes == 0
-    assert daemon.store.get(daemon.store.pendings()[0].id).state == STATE_PENDING
+    assert daemon.store.get(daemon.store.pendings()[0].id).state == STATE_QUEUED
 
 
 def test_a_milestone_never_opens_the_mic(build):

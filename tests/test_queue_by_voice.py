@@ -160,14 +160,16 @@ def test_a_missing_summary_is_computed_while_reading_the_list(build, tmp_path):
 # --- picking one off it ----------------------------------------------------
 
 
-def test_a_window_picked_by_number_is_re_announced_and_gets_the_mic(build):
+def test_a_window_picked_by_number_is_served_at_once_without_asking_twice(build):
+    """You picked it by name off the list; being asked "dámelo" now is absurd."""
     daemon = build(["dame los pendientes", "la dos", "mergealo"])
     waiting(daemon, "s1", "alpha", ts=1000, summary="espera tu aprobación")
     waiting(daemon, "s2", "beta", ts=2000, summary="terminó el backfill")
 
     hotkey(daemon)
 
-    assert daemon.speaker.texts[-1].startswith("beta:")
+    assert daemon.speaker.spoken[-1] == "terminó el backfill."
+    assert daemon.speaker.texts == []  # no second heads-up for the one you asked for
     assert daemon.delivery.sent == [("text", TTY, "mergealo")]
 
 
@@ -178,7 +180,7 @@ def test_a_window_picked_by_name_is_the_one_served(build):
 
     hotkey(daemon)
 
-    assert daemon.speaker.texts[-1].startswith("alpha:")
+    assert "espera tu aprobación." in daemon.speaker.spoken
 
 
 def test_picking_nothing_leaves_the_queue_alone(build):
@@ -196,12 +198,12 @@ def test_the_list_can_be_asked_for_in_the_middle_of_answering(build):
     daemon = build(["dame los pendientes", "la dos", "mergealo"])
     first = waiting(daemon, "s1", "alpha", ts=1000, summary="espera tu aprobación")
     waiting(daemon, "s2", "beta", ts=2000, summary="terminó el backfill")
-    daemon.store.requeue(first)  # alpha is the one being answered
+    daemon.store.requeue(first)  # alpha is the one being announced
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.speaker.texts[0].startswith("alpha:")
-    assert daemon.speaker.texts[-1].startswith("beta:")
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
+    assert "terminó el backfill." in daemon.speaker.spoken
     assert daemon.delivery.sent == [("text", TTY, "mergealo")]
     assert daemon.store.get(first).state == STATE_PENDING
 

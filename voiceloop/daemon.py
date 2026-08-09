@@ -1,30 +1,37 @@
 """The daemon — the only process that owns state, and the only one that talks.
 
-Three cooperating loops:
+Four cooperating loops:
 
-* **ingest** (250 ms) drains the spool into SQLite. Cheap, and the only thing
-  that has to keep up with fifteen sessions firing hooks at once.
-* **announce** walks the queue in FIFO order and speaks the first item that is
-  actually ready. "Ready" is where the subagent gate lives: a turn that ended
-  with background agents still running is skipped — silently, keeping its
-  place — until they finish.
+* **ingest** (250 ms) drains the spool into SQLite, and starts a summary for
+  whatever just arrived. Cheap, and the only thing that has to keep up with
+  fifteen sessions firing hooks at once.
+* **announce** walks the queue in FIFO order and announces the first item that
+  is actually ready. "Ready" is where the subagent gate lives: a turn that
+  ended with background agents still running is skipped — silently, keeping
+  its place — until they finish.
+* **reconcile** (5 s) drops whatever belongs to a window that has closed.
 * **milestones** (optional) polls external phase files for chime-only events.
 
 Everything slow runs off the loop: transcript parsing, the summary call, the
 transcription call and every AppleScript go through `to_thread`, and speech is
 serialized behind the speaker's own lock.
 
-The announce loop does not end at the announcement. Speaking an item opens the
-microphone on it and stays there until the item is answered, skipped, or heard
-nothing — so the queue is strictly one conversation at a time, which is the
-only way fifteen windows can talk to one pair of ears. Everything that can end
-a reply cycle puts the item back in `pendings`; nothing is ever dropped for
-having been ignored.
+**The announcement is a heads-up, not a report.** A window that blocks gets a
+chime and its name — "Nuevo evento de inbox realtime" — and then four seconds
+of microphone, and that is the entire interruption. "dámelo" gets you the
+summary and the mic to answer it with; "después" sends it to the back of the
+line; saying nothing leaves it in the queue and closes the mic. Nothing is ever
+announced twice and nothing is ever reminded about: an ignored window waits in
+`pendings` until you ask for it, silently, for as long as that takes.
 
-Two modes sit on top. **Paused** stops announcing entirely. **Busy** keeps the
-queue moving but chimes instead of speaking, and does not open the mic — the
-hotkey still does, because "I am heads-down" and "I cannot answer" are
-different things.
+Everything that can end a cycle leaves the item in `pendings`; nothing is ever
+dropped for having been ignored. The one thing that *is* dropped is an event
+whose window has closed — there is nobody left to answer it.
+
+Two modes sit on top. **Paused** stops announcing entirely. **Busy** is
+silence: no chime, no voice, no microphone, and the queue simply grows; on the
+way out it tells you how much did. The hotkey keeps working in busy, because
+"I am in a meeting" and "I cannot answer you" are different things.
 """
 
 from __future__ import annotations
@@ -78,6 +85,9 @@ from .tts import Speaker
 INGEST_INTERVAL = 0.25
 ANNOUNCE_INTERVAL = 0.2
 MILESTONE_INTERVAL = 1.0
+# Windows close all the time and say nothing about it. Often enough that
+# `pendings` never lists a dead one, rarely enough to be a few JSON reads.
+RECONCILE_INTERVAL = 5.0
 
 RESOLVED_BY_MILESTONE = "milestone"
 RESOLVED_BY_BACKGROUND = "background-session"
@@ -102,6 +112,12 @@ MAX_SWITCHES = 5
 REPLY_DELIVERED = "delivered"
 REPLY_PENDING = "pending"
 REPLY_FAILED = "failed"
+
+# And this is what the four seconds after a heads-up came back with.
+ALERT_GIVE = "give"          # "dámelo": read it out and open the mic on it
+ALERT_LATER = "later"        # "después": to the back of the line
+ALERT_ANSWER = "answer"      # a sentence, confirmed: it was the answer already
+ALERT_NONE = "none"          # silence, "salteá", or a question asked and answered
 
 log = logging.getLogger("voiceloop")
 
@@ -162,6 +178,7 @@ class Daemon:
         self.mic_enabled = bool(config.get("microphone.enabled", True))
         self.keep_recordings = bool(config.get("microphone.keep_recordings", False))
         self.mic_rounds = max(1, int(config.get("delivery.max_mic_rounds", 3)))
+        self.alert_mic_timeout = float(config.get("announce.alert_mic_timeout_seconds", 4))
         self.plan_feedback_index = int(
             config.get("delivery.plan_menu.feedback_index", delivery_mod.PLAN_FEEDBACK)
         )
@@ -177,6 +194,11 @@ class Daemon:
         self._mic_stop: asyncio.Event | None = None
         self._mic_tasks: set[asyncio.Task] = set()
         self._switch_to: str | None = None
+        # Items a summary has already been started for. Once each: the fallback
+        # is not stored, so "has no summary" stays true for an item the
+        # provider could not answer about, and retrying it every 250 ms is a
+        # loop rather than a retry.
+        self._summarised: set[str] = set()
 
     @staticmethod
     def _build_stt(config: Config):
@@ -200,6 +222,7 @@ class Daemon:
         tasks = [
             asyncio.create_task(self._ingest_loop(), name="ingest"),
             asyncio.create_task(self._announce_loop(), name="announce"),
+            asyncio.create_task(self._reconcile_loop(), name="reconcile"),
             asyncio.create_task(self._milestone_loop(), name="milestones"),
         ]
         try:
@@ -222,13 +245,35 @@ class Daemon:
     def reconcile(self) -> None:
         """Startup housekeeping against the roster and any half-done announce."""
         recovered = self.store.recover_in_flight()
-        try:
-            live = set(roster_mod.load(self.roster_dir).keys())
-        except OSError:
-            live = set()
-        gone = self.store.resolve_sessions_missing(live, RESOLVED_BY_GONE) if live else 0
+        gone = self.sweep_gone()
         if recovered or gone:
             log.info("reconciled: %d requeued, %d resolved as gone", recovered, gone)
+
+    def _live_sessions(self) -> dict:
+        try:
+            return roster_mod.load(self.roster_dir)
+        except OSError:
+            return {}
+
+    def sweep_gone(self) -> int:
+        """Resolve everything whose window has closed — live, not only at startup.
+
+        A tab that closed, by hand or otherwise, takes its events with it: there
+        is nobody left to answer them, so announcing one is talking to an empty
+        room and listing one in `pendings` is an errand you can never run. Run
+        before announcing, before reading the list, and on a timer, because a
+        window can close at any of those moments and says nothing when it does.
+
+        An empty roster is not "everything is gone", it is "I cannot tell" —
+        that is the one case where nothing is dropped.
+        """
+        live = self._live_sessions()
+        if not live:
+            return 0
+        gone = self.store.resolve_sessions_missing(live.keys(), RESOLVED_BY_GONE)
+        if gone:
+            log.info("dropped %d item(s) whose window is gone", gone)
+        return gone
 
     # -- loops -------------------------------------------------------------
 
@@ -236,9 +281,18 @@ class Daemon:
         while True:
             try:
                 self.ingest_once()
+                self.prefetch_summaries()
             except Exception:  # noqa: BLE001 - a bad event must not kill ingest
                 log.exception("ingest failed")
             await asyncio.sleep(INGEST_INTERVAL)
+
+    async def _reconcile_loop(self) -> None:
+        while True:
+            await asyncio.sleep(RECONCILE_INTERVAL)
+            try:
+                self.sweep_gone()
+            except Exception:  # noqa: BLE001
+                log.exception("reconcile failed")
 
     def ingest_once(self) -> int:
         count = 0
@@ -257,6 +311,40 @@ class Daemon:
             spool.discard([path])
             count += 1
         return count
+
+    def prefetch_summaries(self) -> int:
+        """Start a summary for anything waiting without one, in the background.
+
+        The heads-up says a name and stops, so "dámelo" is the moment the
+        summary is needed — and computing it *then* is five seconds of silence
+        in the middle of a sentence you started. It is computed when the item
+        arrives instead, off the loop, and read out of the row later. A window
+        you never ask about costs one call it would have cost anyway the first
+        time you did.
+
+        Once per item, deliberately: a provider that is down returns the
+        fallback, which is not stored, so "has no summary" stays true and a
+        retry here would be a loop.
+        """
+        started = 0
+        for item in self.store.pendings():
+            if item.type != TYPE_STOP or item.summary or not item.transcript_path:
+                continue
+            if item.id in self._summarised:
+                continue
+            self._summarised.add(item.id)
+            self._spawn(self._prefetch_one(item.id))
+            started += 1
+        return started
+
+    async def _prefetch_one(self, item_id: str) -> None:
+        item = self.store.get(item_id)
+        if item is None or item.summary:
+            return
+        try:
+            await self._summary_and_slug(item, self._session_for(item))
+        except Exception:  # noqa: BLE001 - a background task must not die silently
+            log.exception("could not pre-summarise %s", item_id[:8])
 
     def _muted(self, event: Event) -> bool:
         """Dropped on arrival, not announced quietly.
@@ -303,10 +391,23 @@ class Daemon:
     # -- announcing --------------------------------------------------------
 
     async def announce_next(self) -> bool:
-        if self.paused:
+        """Announce the first item that is ready. Busy is silence, not a chime.
+
+        Busy stops here rather than further down: an item that is never
+        announced stays `queued`, so nothing is missed and nothing is heard —
+        the whole meeting arrives at once when you come back out.
+        """
+        if self.paused or self.busy:
             return False
+        live = self._live_sessions()
         for item in self.store.queued_items():
-            session = self._session_for(item)
+            session = live.get(item.session_id) if item.session_id else None
+            if item.session_id and live and session is None:
+                # That window is closed. Announcing it is talking to a room
+                # with nobody in it — and the answer would have nowhere to go.
+                self.store.resolve(item.id, RESOLVED_BY_GONE)
+                log.info("dropped %s: window %s is gone", item.id[:8], item.session_id[:8])
+                continue
             if session is not None and not session.is_interactive:
                 # Background agents have no window to answer in.
                 self.store.resolve(item.id, RESOLVED_BY_BACKGROUND)
@@ -403,44 +504,151 @@ class Daemon:
         filled = await asyncio.gather(*(self._summary_for(item) for item in stale))
         return {item.id: text for item, text in zip(stale, filled) if text}
 
-    async def _announce(self, item: Item, session, *, depth: int = 0) -> None:
+    async def _announce(
+        self, item: Item, session, *, depth: int = 0, heads_up: bool = True
+    ) -> None:
+        """Chime, name the window, and take one short answer about what to do.
+
+        `heads_up=False` serves an item you asked for by name — picked off the
+        pendings list, or handed to the hotkey. You already know which one it
+        is and you have already said you want it; announcing it again and
+        waiting for "dámelo" would be making you ask twice.
+        """
         self.store.mark_announcing(item.id)
         name = self._name_for(item, session)
         self.store.set_name(item.id, name)
-        summary, slug = await self._summary_and_slug(item, session)
-
-        announcement = announce_mod.build(
-            item,
-            name=name,
-            summary=summary,
-            phonetic=self.phonetic,
-            blocking_chime=self.blocking_chime,
-            milestone_chime=self.milestone_chime,
-            notification_events=self.notification_events,
-            naming_offer=slug,
-        )
-        if self.busy:
-            # Busy mode: you still get the chime, you just do not get talked at.
-            announcement = dataclasses.replace(announcement, speak=False)
-        log.info("announce %s [%s] %s", item.type, name, announcement.text)
-        await self.speaker.announce(announcement)
 
         if item.type == TYPE_MILESTONE:
             # Chime only — there is nothing for the user to answer.
+            await self.speaker.announce(
+                announce_mod.alert(item, name=name, milestone_chime=self.milestone_chime)
+            )
             self.store.resolve(item.id, RESOLVED_BY_MILESTONE)
             return
 
-        self.store.mark_pending(item.id)
-        if self.busy or announcement.silent:
+        answer, carried = ALERT_GIVE, None
+        if heads_up:
+            alert = announce_mod.alert(
+                item,
+                name=name,
+                phonetic=self.phonetic,
+                blocking_chime=self.blocking_chime,
+                notification_events=self.notification_events,
+            )
+            log.info("alert %s [%s] %s", item.type, name, alert.text)
+            await self.speaker.announce(alert)
+            self.store.mark_pending(item.id)
+            if alert.silent or not self.can_listen() or not item.tty:
+                # No tty is no window to answer in, and a microphone opened on
+                # something you cannot answer is four seconds of nothing.
+                return
+            answer, carried = await self._ask_what_to_do(item, alert.text)
+        else:
+            self.store.mark_pending(item.id)
+
+        if answer == ALERT_ANSWER:
+            outcome = await self.reply_cycle(item, "", first=carried)
+        elif answer == ALERT_GIVE:
+            outcome = await self._give(item, session)
+        else:
+            # "después", "salteá", silence, or a question that has been
+            # answered: the item is in `pendings` and nothing else is owed.
+            await self._follow_switch(depth)
             return
-        # The naming answer comes first and gets its own take: it was the last
-        # thing asked, and whatever is not a name is handed straight on to the
-        # window's own reply cycle rather than thrown away.
-        overheard = await self._settle_name(item, slug) if slug else None
-        outcome = await self.reply_cycle(item, announcement.text, first=overheard)
+
         if outcome == REPLY_DELIVERED:
             await self.speak_remaining()
         await self._follow_switch(depth)
+
+    async def _ask_what_to_do(self, item: Item, said: str) -> tuple[str, Transcript | None]:
+        """Four seconds of microphone on "Nuevo evento de X".
+
+        Two words end it — "dámelo" or "después" — and saying nothing is the
+        third answer: you were not there, the item stays in the queue, and
+        nothing will bring it up again until you ask. Every other control
+        phrase works too, because the mic being open is not a promise about
+        what you may say into it: "estado", "pendientes", "mostrame".
+
+        A **sentence** is the one thing that is not acted on. Nothing has been
+        read out yet, so a sentence here is as likely to be a word to somebody
+        in the room as an answer for a window nobody has heard about — and
+        typing it into somebody's session is the failure this whole read-back
+        machinery exists to avoid. So it is read back and asked about.
+        """
+        gate = delivery_mod.Gate(
+            True, "No sé si eso era para mí", "¿Te lo mando a la ventana?"
+        )
+        carried: Transcript | None = None
+        async with self._mic_lock:
+            for _ in range(self.mic_rounds):
+                transcript = await self.listen(timeout=self.alert_mic_timeout)
+                if transcript is None:
+                    return ALERT_NONE, None
+                intent = intents.parse(transcript.text)
+
+                if carried is not None:
+                    if intent.kind == intents.KIND_CONFIRM:
+                        return ALERT_ANSWER, carried
+                    if intent.kind == intents.KIND_CANCEL:
+                        await self.speaker.speak("Listo, no mando nada.")
+                        return ALERT_NONE, None
+                    carried = None  # a new utterance replaces the old one
+
+                if intent.kind in (intents.KIND_GIVE, intents.KIND_CONFIRM):
+                    return ALERT_GIVE, None
+                if intent.kind == intents.KIND_LATER:
+                    self.store.defer(item.id)
+                    log.info("deferred %s [%s]", item.id[:8], item.display_name)
+                    return ALERT_LATER, None
+                if intent.kind in (
+                    intents.KIND_SILENCE,
+                    intents.KIND_SKIP,
+                    intents.KIND_CANCEL,
+                ):
+                    return ALERT_NONE, None
+                if intent.kind == intents.KIND_REPEAT:
+                    await self.speaker.speak(said)
+                    continue
+                if intent.kind == intents.KIND_WAIT:
+                    await self.speaker.speak("Dale, espero.")
+                    continue
+                if intent.kind == intents.KIND_SHOW:
+                    if item.tty:
+                        await asyncio.to_thread(self.delivery.focus, item.tty)
+                    continue
+                if intent.kind == intents.KIND_STATUS:
+                    await self.speak_status()
+                    continue
+                if intent.kind == intents.KIND_PENDINGS:
+                    chosen = await self.speak_pendings()
+                    if chosen is None:
+                        continue
+                    if chosen.id == item.id:
+                        return ALERT_GIVE, None
+                    # Served once this cycle has unwound; see `_follow_switch`.
+                    self._switch_to = chosen.id
+                    return ALERT_NONE, None
+
+                carried = transcript
+                await self.speaker.speak(self._readback_sentence(gate, transcript.text))
+        return ALERT_NONE, None
+
+    async def _give(self, item: Item, session) -> str:
+        """"dámelo": what that window wants, and the mic to answer it with."""
+        # Re-read: the summary was very likely written by the background
+        # prefetch after this item came off the queue.
+        current = self.store.get(item.id) or item
+        summary, slug = await self._summary_and_slug(current, session)
+        text = announce_mod.detail(
+            current, summary=summary, phonetic=self.phonetic, naming_offer=slug
+        )
+        log.info("detail [%s] %s", current.display_name, text)
+        await self.speaker.speak(text)
+        # The naming answer comes first and gets its own take: it was the last
+        # thing asked, and whatever is not a name is handed straight on to the
+        # window's own reply cycle rather than thrown away.
+        overheard = await self._settle_name(current, slug) if slug else None
+        return await self.reply_cycle(current, text, first=overheard)
 
     async def speak_remaining(self) -> str:
         """"Quedan dos" — after you answer, which is the only moment it means it.
@@ -477,17 +685,27 @@ class Daemon:
         """(summary, name to offer). One request for both, or no request at all.
 
         The name and the summary come out of the same paragraph, so asking for
-        them separately would read the same transcript twice and pay twice. An
-        item that already has a summary is not re-summarised just to get a name
-        offered — a replay costs nothing, and the offer comes back next time
-        this window blocks.
+        them separately would read the same transcript twice and pay twice.
+        Both are stored, and that is what makes the offer survive the wait: the
+        summary is normally computed the moment the item arrives, and by the
+        time you say "dámelo" — which may be an hour and a "después" later —
+        recomputing the pair just to have a name to offer would be a second
+        call for an answer that is already in the row.
+
+        An item that was summarised without a name proposal keeps the
+        announcement and loses the offer; it comes back next time that window
+        blocks.
         """
-        if not self._wants_a_name(item, session) or item.summary:
+        wants_a_name = self._wants_a_name(item, session)
+        if item.summary:
+            return item.summary, (item.slug or "") if wants_a_name else ""
+        if not wants_a_name:
             return await self._summary_for(item), ""
         tail = await asyncio.to_thread(tail_text, item.transcript_path)
         result = await asyncio.to_thread(self.summarizer.summarize_and_name, tail)
         if result.text != FALLBACK_SUMMARY:
             self.store.set_summary(item.id, result.text)
+            self.store.set_slug(item.id, result.slug)
         return result.text, result.slug
 
     async def _settle_name(self, item: Item, slug: str) -> Transcript | None:
@@ -632,8 +850,11 @@ class Daemon:
         terms.extend(self.store.aliases())
         return terms
 
-    async def listen(self) -> Transcript | None:
+    async def listen(self, *, timeout: float | None = None) -> Transcript | None:
         """One take: chime, record, transcribe. `None` means the mic itself failed.
+
+        `timeout` shortens the wait for you to start talking — the heads-up mic
+        uses it, since "dámelo" or "después" is two words and four seconds.
 
         The take starts by taking the floor, so the whole sequence is exactly
         this and nothing may interleave with it: **announcement finished ->
@@ -653,7 +874,10 @@ class Daemon:
             # gone by the time one of them tries to speak.
             async with self.speaker.floor() as floor:
                 recording = await self.recorder.record(
-                    path, stop=stop, on_open=lambda: floor.cue(self.mic_open_chime)
+                    path,
+                    stop=stop,
+                    on_open=lambda: floor.cue(self.mic_open_chime),
+                    speech_timeout=timeout,
                 )
         except MicConsentPending as exc:
             # The one mic failure with a fix only the user can perform — and
@@ -776,6 +1000,10 @@ class Daemon:
                 multi=bool(menu and menu.multi_select),
             )
 
+            if intent.kind == intents.KIND_LATER:
+                # Same instruction as at the heads-up: not now, and not first.
+                self.store.defer(item.id)
+                return REPLY_PENDING
             if intent.kind in (intents.KIND_SILENCE, intents.KIND_SKIP):
                 return REPLY_PENDING
             if intent.kind == intents.KIND_REPEAT:
@@ -916,8 +1144,11 @@ class Daemon:
         The pick is what makes this more than a report: the window you choose is
         re-announced and gets the microphone, exactly as if it had just blocked.
         Summaries missing from superseded items are filled in here (issue #3) —
-        a list of names with nothing after them answers nothing.
+        a list of names with nothing after them answers nothing. Windows that
+        have closed since are dropped first: a list you cannot act on any more
+        is worse than a short one.
         """
+        self.sweep_gone()
         items = self.store.pendings()
         recomputed = await self.summarize_missing(items)
         now = time.time()
@@ -963,7 +1194,10 @@ class Daemon:
         item = self.store.get(target)
         if item is None:
             return
-        await self._announce(item, self._session_for(item), depth=depth + 1)
+        # You picked it by name off the list; you do not have to ask twice.
+        await self._announce(
+            item, self._session_for(item), depth=depth + 1, heads_up=False
+        )
 
     # -- control surface ---------------------------------------------------
 
@@ -1001,6 +1235,8 @@ class Daemon:
         return self.stt.name if self.stt.available else f"{self.stt.name} (no key)"
 
     async def cmd_pendings(self, args: dict) -> list[dict]:
+        # A window that has closed since is not pending on anybody.
+        self.sweep_gone()
         items = self.store.pendings()
         recomputed = await self.summarize_missing(items)
         listed = []
@@ -1071,12 +1307,17 @@ class Daemon:
                     chosen = await self.speak_pendings()
             if chosen is not None:
                 # `_announce` follows any further switch from here itself.
-                await self._announce(chosen, self._session_for(chosen))
+                await self._announce(chosen, self._session_for(chosen), heads_up=False)
                 return
             if intent.kind == intents.KIND_PENDINGS:
                 return
             if item is None or not item.tty:
-                await self.speaker.speak("No hay nada pendiente.")
+                # In busy mode nothing has been announced at all, so "nothing
+                # was said last" is routine and says nothing about the queue.
+                piled_up = announce_mod.pendings_count(self.store.open_count())
+                await self.speaker.speak(
+                    f"{piled_up}." if piled_up else "No hay nada pendiente."
+                )
                 return
             outcome = await self.reply_cycle(item, item.summary or "", first=transcript)
             if outcome == REPLY_DELIVERED:
@@ -1086,11 +1327,27 @@ class Daemon:
             log.exception("hotkey mic failed")
 
     async def cmd_busy_toggle(self, args: dict) -> dict:
-        """Chime instead of speak. The mic hotkey keeps working — by design."""
+        """Silence, and on the way out, how much of it there was.
+
+        Busy is no longer "chime instead of speak": a chime every time is the
+        same interruption with the words taken out. Nothing arrives at all —
+        no chime, no voice, no microphone — and the queue simply grows.
+
+        Which leaves the toggle as the only thing that can say which mode you
+        are in, so it does, in one word. It used to answer with a chime whose
+        two directions sound identical, and the honest answer to "am I in busy
+        mode?" was to go and read the logs. The mic hotkey keeps working in
+        busy — that is how you ask for the queue in a meeting.
+        """
         self.busy = not self.busy
         self.store.kv_set(KV_BUSY, self.busy)
         log.info("busy mode %s", "on" if self.busy else "off")
         await self.speaker.chime(self.busy_chime)
+        if self.busy:
+            await self.speaker.speak("Ocupado.")
+        else:
+            piled_up = announce_mod.pendings_count(self.store.open_count())
+            await self.speaker.speak(f"Te escucho. {piled_up}." if piled_up else "Te escucho.")
         return {"busy": self.busy}
 
     async def cmd_selfcheck(self, args: dict) -> list[dict]:

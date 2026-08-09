@@ -76,6 +76,17 @@ def stop_event(session="session-1", **kwargs) -> Event:
     return Event.new("stop", session, **kwargs)
 
 
+def prefetch(daemon: Daemon) -> None:
+    """Run what the ingest loop starts in the background: summarise on arrival."""
+
+    async def body():
+        daemon.prefetch_summaries()
+        for task in list(daemon._mic_tasks):
+            await task
+
+    asyncio.run(body())
+
+
 # --- ingest ---------------------------------------------------------------
 
 
@@ -111,13 +122,14 @@ def test_ingest_quarantines_what_it_cannot_parse(daemon, config):
 # --- announcing -----------------------------------------------------------
 
 
-def test_a_stop_is_announced_with_name_and_summary(daemon, tmp_path):
+def test_a_stop_is_announced_by_name_and_nothing_else(daemon, tmp_path):
+    """The heads-up: which window wants you. What it wants is what you ask for."""
     write_roster(daemon.roster_path, sessionId="s1", name="index-migration")
     daemon.store.ingest(stop_event("s1", transcript_path=transcript(tmp_path, "s1")))
 
     assert asyncio.run(daemon.announce_next()) is True
 
-    assert daemon.speaker.texts == ["index migration: quiere que revises el diff."]
+    assert daemon.speaker.texts == ["Nuevo evento de index migration."]
     assert daemon.store.get_alias("s1") is None
     assert daemon.store.pendings()[0].state == STATE_PENDING
 
@@ -127,18 +139,64 @@ def test_the_summary_is_built_from_the_transcript_tail(daemon, tmp_path):
     path = transcript(tmp_path, "s1", tail="Terminé el backfill. ¿Sigo con staging?")
     daemon.store.ingest(stop_event("s1", transcript_path=path))
 
-    asyncio.run(daemon.announce_next())
+    prefetch(daemon)
 
     assert daemon.summarizer.seen == ["Terminé el backfill. ¿Sigo con staging?"]
+
+
+def test_the_summary_is_ready_before_anybody_asks_for_it(daemon, tmp_path):
+    """"dámelo" has to answer at once; a five-second call at that moment is a hang."""
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    event = stop_event("s1", transcript_path=transcript(tmp_path, "s1"))
+    daemon.store.ingest(event)
+
+    prefetch(daemon)
+
+    assert daemon.store.get(event.id).summary == "quiere que revises el diff"
+
+
+def test_announcing_costs_nothing_because_the_summary_is_already_there(daemon, tmp_path):
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    daemon.store.ingest(stop_event("s1", transcript_path=transcript(tmp_path, "s1")))
+    prefetch(daemon)
+
+    asyncio.run(daemon.announce_next())
+
+    assert len(daemon.summarizer.seen) == 1
+
+
+def test_a_summary_is_attempted_once_and_not_on_every_pass(daemon, tmp_path):
+    """The fallback is not stored, so "no summary" stays true — and would loop."""
+    daemon.summarizer = Summarizer(api_key=None)
+    daemon.summarizer.seen = []
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    daemon.store.ingest(stop_event("s1", transcript_path=transcript(tmp_path, "s1")))
+
+    for _ in range(3):
+        prefetch(daemon)
+
+    assert daemon.store.pendings()[0].summary is None
+
+
+def test_nothing_without_a_transcript_is_pre_summarised(daemon):
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    daemon.store.ingest(stop_event("s1"))
+    daemon.store.ingest(Event.new("menu", "s1", payload={}))
+
+    prefetch(daemon)
+
+    assert daemon.summarizer.seen == []
 
 
 def test_the_summary_is_stored_so_a_replay_does_not_pay_twice(daemon, tmp_path):
     write_roster(daemon.roster_path, sessionId="s1", name="alpha")
     event = stop_event("s1", transcript_path=transcript(tmp_path, "s1"))
     daemon.store.ingest(event)
+    prefetch(daemon)
     asyncio.run(daemon.announce_next())
 
     daemon.store.requeue(event.id)
+    prefetch(daemon)
     asyncio.run(daemon.announce_next())
 
     assert len(daemon.summarizer.seen) == 1
@@ -159,9 +217,9 @@ def test_the_queue_is_announced_in_order_and_never_counts_down_up_front(daemon, 
     asyncio.run(drain())
 
     assert daemon.speaker.texts == [
-        "alpha: quiere que revises el diff.",
-        "beta: quiere que revises el diff.",
-        "gamma: quiere que revises el diff.",
+        "Nuevo evento de alpha.",
+        "Nuevo evento de beta.",
+        "Nuevo evento de gamma.",
     ]
 
 
@@ -192,9 +250,9 @@ def test_the_refreshed_turn_is_what_replay_speaks(daemon, tmp_path):
         stop_event("s1", ts=1005, transcript_path=transcript(tmp_path, "s1", tail="¿migro ya?"))
     )
     asyncio.run(daemon.dispatch("replay", {}))
-    asyncio.run(daemon.announce_next())
+    prefetch(daemon)
 
-    assert "quiere que decidas la migración" in daemon.speaker.texts[-1]
+    assert daemon.store.pendings()[0].summary == "quiere que decidas la migración"
 
 
 def test_nothing_to_announce_returns_false(daemon):
@@ -237,7 +295,7 @@ def test_the_gated_item_is_announced_once_the_agent_finishes(daemon, tmp_path):
     transcript(tmp_path, "s1", launched=True, done=True)
 
     assert asyncio.run(daemon.announce_next()) is True
-    assert daemon.speaker.texts == ["alpha: quiere que revises el diff."]
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
 
 
 def test_a_gated_item_does_not_block_the_rest_of_the_queue(daemon, tmp_path):
@@ -252,7 +310,7 @@ def test_a_gated_item_does_not_block_the_rest_of_the_queue(daemon, tmp_path):
 
     assert asyncio.run(daemon.announce_next()) is True
 
-    assert [item.text.split(":")[0] for item in daemon.speaker.said] == ["beta"]
+    assert [item.text for item in daemon.speaker.said] == ["Nuevo evento de beta."]
     assert daemon.store.queued_items()[0].session_id == "s1"
 
 
@@ -275,7 +333,7 @@ def test_a_missing_transcript_does_not_gate(daemon):
     daemon.store.ingest(stop_event("s1", transcript_path="/nonexistent.jsonl"))
 
     assert asyncio.run(daemon.announce_next()) is True
-    assert daemon.speaker.texts == [f"alpha: {FALLBACK_SUMMARY}."]
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
 
 
 def test_the_gate_result_is_cached_until_the_transcript_changes(daemon, tmp_path):
@@ -321,7 +379,7 @@ def test_a_session_missing_from_the_roster_is_still_announced(daemon, tmp_path):
     )
 
     assert asyncio.run(daemon.announce_next()) is True
-    assert daemon.speaker.texts == ["rescue: quiere que revises el diff."]
+    assert daemon.speaker.texts == ["Nuevo evento de rescue."]
 
 
 def test_an_alias_wins_over_the_roster_name(daemon, tmp_path):
@@ -331,7 +389,7 @@ def test_an_alias_wins_over_the_roster_name(daemon, tmp_path):
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.speaker.texts[0].startswith("el de la migración:")
+    assert daemon.speaker.texts[0] == "Nuevo evento de el de la migración."
 
 
 # --- menus, notifications, milestones -------------------------------------
@@ -356,7 +414,7 @@ def test_a_menu_is_read_without_calling_the_summariser(daemon):
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.speaker.texts == ["alpha: ¿Qué base uso? Opciones: uno: SQLite."]
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
     assert daemon.summarizer.seen == []
 
 
@@ -379,7 +437,7 @@ def test_a_notification_speaks_and_waits_for_you(daemon):
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.speaker.texts == ["alpha: necesita permiso."]
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
     assert daemon.store.get(event.id).state == STATE_PENDING
 
 
@@ -412,7 +470,7 @@ def test_a_permission_prompt_survives_the_mute(daemon, config):
     assert daemon.ingest_once() == 1
 
     asyncio.run(daemon.announce_next())
-    assert daemon.speaker.texts == ["alpha: Claude needs your permission to use Bash."]
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
 
 
 def test_an_idle_nudge_is_kept_when_the_events_are_on(daemon, config):
@@ -425,7 +483,7 @@ def test_an_idle_nudge_is_kept_when_the_events_are_on(daemon, config):
     assert daemon.ingest_once() == 1
 
     asyncio.run(daemon.announce_next())
-    assert daemon.speaker.texts == ["alpha: Claude is waiting for your input."]
+    assert daemon.speaker.texts == ["Nuevo evento de alpha."]
 
 
 def test_an_item_already_queued_when_the_mute_went_on_stays_silent(daemon):

@@ -31,7 +31,6 @@ from .events import (
     TYPE_MENU,
     TYPE_MILESTONE,
     TYPE_NOTIFICATION,
-    TYPE_STOP,
     is_idle_notification,
 )
 from .summarize import FALLBACK_SUMMARY
