@@ -538,9 +538,17 @@ class Daemon:
             log.info("alert %s [%s] %s", item.type, name, alert.text)
             await self.speaker.announce(alert)
             self.store.mark_pending(item.id)
-            if alert.silent or not self.can_listen() or not item.tty:
-                # No tty is no window to answer in, and a microphone opened on
-                # something you cannot answer is four seconds of nothing.
+            if alert.silent:
+                return
+            if not self.can_listen():
+                # A heads-up only works because "dámelo" is available. With no
+                # recognizer there is no way to ask, so the summary comes
+                # anyway rather than leaving you with a name and no recourse.
+                await self._say_detail(item, session)
+                return
+            if not item.tty:
+                # No window to answer in, and a mic opened on something you
+                # cannot answer is four seconds of nothing.
                 return
             answer, carried = await self._ask_what_to_do(item, alert.text)
         else:
@@ -633,8 +641,8 @@ class Daemon:
                 await self.speaker.speak(self._readback_sentence(gate, transcript.text))
         return ALERT_NONE, None
 
-    async def _give(self, item: Item, session) -> str:
-        """"dámelo": what that window wants, and the mic to answer it with."""
+    async def _say_detail(self, item: Item, session) -> tuple[Item, str, str]:
+        """Speak what that window wants. Returns (the item as it is now, text, slug)."""
         # Re-read: the summary was very likely written by the background
         # prefetch after this item came off the queue.
         current = self.store.get(item.id) or item
@@ -644,6 +652,11 @@ class Daemon:
         )
         log.info("detail [%s] %s", current.display_name, text)
         await self.speaker.speak(text)
+        return current, text, slug
+
+    async def _give(self, item: Item, session) -> str:
+        """"dámelo": what that window wants, and the mic to answer it with."""
+        current, text, slug = await self._say_detail(item, session)
         # The naming answer comes first and gets its own take: it was the last
         # thing asked, and whatever is not a name is handed straight on to the
         # window's own reply cycle rather than thrown away.

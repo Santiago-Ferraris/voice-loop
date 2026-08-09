@@ -496,5 +496,7 @@ def test_no_recognizer_means_no_question_nobody_could_answer(build, tmp_path):
 
     announce(daemon)
 
-    assert daemon.speaker.spoken == []
+    # The summary still comes — there is no "dámelo" to ask with — but nothing
+    # is asked, because there would be no way to answer it.
+    assert daemon.speaker.spoken == [SUMMARY + "."]
     assert daemon.store.alias_asked("s1") is False

@@ -956,3 +956,16 @@ def test_the_hotkey_still_opens_the_mic_in_busy_mode(build):
     asyncio.run(body())
 
     assert daemon.delivery.sent == [("choice", TTY, 2)]
+
+
+def test_without_a_recognizer_the_summary_comes_anyway(build):
+    """The heads-up only works because "dámelo" is available. With no mic it is not."""
+    daemon = build([])
+    daemon.stt = None
+    queue(daemon, kind="stop")
+
+    asyncio.run(daemon.announce_next())
+
+    assert daemon.speaker.texts == ["Nuevo evento de indice."]
+    assert daemon.speaker.spoken == ["terminó y te espera."]
+    assert daemon.recorder.takes == 0
