@@ -83,6 +83,32 @@ summaries:
   # announcement falls back to a fixed phrase — the queue never waits on the LLM.
   timeout_seconds: 5
 
+# The other half of understanding you: the phrase lists in `intents.py` are
+# exact and instant and resolve almost everything, and whatever they have never
+# heard of goes to `gpt-4o-mini` — which may also answer "that is not a command
+# at all", the answer that keeps dictation from becoming a random command. On a
+# short leash: one attempt, and every failure degrades to the lexicon alone.
+understanding:
+  # openai | none. With `none` the lexicon is all there is, which is exactly
+  # how the loop behaved before this existed.
+  provider: openai
+  model: gpt-4o-mini
+  # Aggressive on purpose: this sits between you finishing a sentence and
+  # anything happening, so a slow answer is worse than no answer.
+  timeout_seconds: 2
+  # Past this many words it is dictation, not a command, and asking costs a
+  # second of silence on every long sentence.
+  max_words: 40
+
+windows:
+  # What "abrí una ventana nueva" starts in the new tab — normally whatever
+  # launches Claude for you (`cd ~/code/thing && claude`). Empty means a plain
+  # shell. The tab is always created in the iTerm2 window you already have: a
+  # new *window* is somewhere else on the desktop, which is the thing you were
+  # trying not to go looking for. Anything you asked for in the same breath
+  # ("…y hacé el rebase") is typed in after it.
+  new_tab_command: ""
+
 text_to_speech:
   # macOS `say` — offline, zero latency. Use `system` to keep the system voice.
   voice: Paulina

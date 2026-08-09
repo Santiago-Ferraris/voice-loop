@@ -159,13 +159,15 @@ def _validate(data: Mapping[str, Any]) -> None:
             f"(expected one of {', '.join(sorted(STT_PROVIDERS))})"
         )
 
+    for section in ("summaries", "understanding"):
+        provider = (data.get(section) or {}).get("provider")
+        if provider is not None and provider not in SUMMARY_PROVIDERS:
+            raise ConfigError(
+                f"{section}.provider: unknown provider {provider!r} "
+                f"(expected one of {', '.join(sorted(SUMMARY_PROVIDERS))})"
+            )
+
     summaries = data.get("summaries") or {}
-    summary_provider = summaries.get("provider")
-    if summary_provider is not None and summary_provider not in SUMMARY_PROVIDERS:
-        raise ConfigError(
-            f"summaries.provider: unknown provider {summary_provider!r} "
-            f"(expected one of {', '.join(sorted(SUMMARY_PROVIDERS))})"
-        )
 
     max_words = summaries.get("max_words")
     if max_words is not None and (not isinstance(max_words, int) or max_words <= 0):

@@ -766,7 +766,7 @@ def test_the_hotkey_says_so_when_there_is_nothing_pending(build):
 
     asyncio.run(body())
 
-    assert "No hay nada pendiente." in daemon.speaker.spoken
+    assert any("No hay nada pendiente." in said for said in daemon.speaker.spoken)
 
 
 def test_the_hotkey_closes_a_mic_that_is_already_open(build):

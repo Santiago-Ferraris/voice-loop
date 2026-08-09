@@ -87,6 +87,35 @@ about: an ignored window waits in `pendings`, silently, until you ask for it. Se
 | Summaries | `gpt-4o-mini`. The proposed name for an unnamed window rides the same request — one call, two fields |
 | Names | Offered once per window, never twice. Confirmed names are what you hear *and* vocabulary for the recognizer |
 
+### Understanding you, not the phrasing you were supposed to use
+
+The phrase lists in `intents.py` are exact and instant, and they resolve almost everything —
+but they only know the wordings somebody thought to write down. Measured against sixteen
+natural ways of saying things this user says daily, **fourteen fell through**: `"give it to
+me"`, `"later"`, `"skip it"`, `"show me"`, `"status"`, `"dale contame"`, `"ok dame"`, `"not
+now"`, `"push it back"`, `"what's pending"`, `"tell me"`, `"read it"`, `"hold on"`, `"what do
+I have"`. Every one arrived as *text* — which means every one was typed into a Claude session.
+
+So classification is a hybrid. The lists answer what they know, offline and instantly;
+whatever falls through goes to `gpt-4o-mini` on a two-second leash. Three things keep that
+honest:
+
+- **"Not a command" is an answer.** A classifier that always picks something turns every
+  dictated sentence into a random command, so the prompt is built around refusing, and
+  `"mergealo cuando pasen los tests"` is expected to come back as an empty list.
+- **It degrades to what it replaced.** No key, no network, bad JSON — all of them fall back to
+  the lexicon's own verdict. It is an improvement, never a dependency (`understanding.provider:
+  none` turns it off entirely).
+- **It returns a list.** "Ok dámelo, y también abrí una ventana nueva y hacé X" is three
+  things, and they run in the order you said them. A failure in one is spoken and the rest
+  still run; anything on the destructive list still gets read back first.
+
+**A near miss never reaches the model.** "dame al pendiente" is what the recognizer heard for
+"dame los pendientes" — 0.89 similar to a phrase we know — and a transcript we already distrust
+is not made trustworthy by a second opinion on its wording. It is asked about by name:
+*"Entendí: dame al pendiente. ¿Querés los pendientes?"* A yes runs the command; a no, silence,
+or anything else drops it. It is never delivered.
+
 ### Getting spanglish right
 
 The design target is code-switched speech — Spanish sentences with English technical terms —
@@ -309,6 +338,9 @@ for a window you have not heard about.
 | "salteá" | Leaves it where it is and moves on |
 | "dale" / "no" | Confirms or cancels a read-back. On a heads-up, "dale" means "dámelo". Anywhere else it is just a word, and gets typed |
 | "dame los pendientes" / "cuál queda" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
+| "abrí una ventana nueva y hacé X" | New tab in the window you already have, running `windows.new_tab_command`, then X typed into it |
+| "decile a inbox realtime que espere" | Types into the window with that name, whichever one you are on |
+| "dámelo, y también abrí una ventana y hacé X" | Several things in one breath, in the order you said them. One that fails does not cancel the rest |
 | "estado" / "cómo venimos" | Windows open, how many are working, how many are waiting on you |
 | "qué dijiste" / "no te entendí" | Says the last thing it said again |
 | "esperá" / "un segundo" | Holds the mic. Not an answer and not a refusal — nothing is typed, nothing is dropped |

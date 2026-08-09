@@ -307,6 +307,7 @@ class RecordingDelivery:
         self._alive = alive
         self.sent: list[tuple] = []
         self.focused: list[str] = []
+        self.opened: list[tuple] = []
 
     def alive(self, tty: str) -> bool:
         return self._alive
@@ -333,6 +334,10 @@ class RecordingDelivery:
 
     def focus(self, tty):
         self.focused.append(tty)
+        return True
+
+    def open_tab(self, command="", text=""):
+        self.opened.append((command, text))
         return True
 
 

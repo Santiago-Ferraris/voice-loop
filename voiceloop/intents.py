@@ -39,6 +39,10 @@ KIND_STATUS = "status"
 KIND_WAIT = "wait"
 KIND_GIVE = "give"
 KIND_LATER = "later"
+# The two the lexicon never produces: they only ever arrive from the
+# classifier, because there is no fixed phrase for "open a window and do X".
+KIND_OPEN = "open"
+KIND_TELL = "tell"
 
 NUMBERS: Mapping[str, int] = {
     "uno": 1, "una": 1, "un": 1, "primero": 1, "primera": 1, "primer": 1,

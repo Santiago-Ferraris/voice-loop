@@ -160,6 +160,30 @@ end run
 """
 
 
+# item 1 = what to run in the new tab (may be empty), item 2 = what to type
+# after it (may be empty). A tab in the window you already have, never a new
+# window: a new window is somewhere else on the desktop, which is exactly what
+# you were trying not to go looking for.
+OPEN_TAB = """
+on run argv
+  set startup to item 1 of argv
+  set followUp to item 2 of argv
+  tell application "iTerm2"
+    if (count of windows) is 0 then
+      create window with default profile
+    else
+      tell current window to create tab with default profile
+    end if
+    tell current session of current tab of current window
+      if startup is not "" then write text startup
+      if followUp is not "" then write text followUp
+    end tell
+  end tell
+  return "opened"
+end run
+"""
+
+
 class AppleScriptError(RuntimeError):
     pass
 
@@ -255,6 +279,16 @@ def write_text(tty: str, text: str, *, newline: bool = True, runner: Runner | No
         _require_hit(run_script(WRITE_TEXT, [tty, text], runner), tty)
     if newline:
         send_keys(tty, [ENTER], runner)
+
+
+def open_tab(command: str = "", text: str = "", runner: Runner | None = None) -> bool:
+    """A new tab in the window you already have, optionally running something.
+
+    `command` is what starts there (`windows.new_tab_command` — normally the
+    thing that launches Claude); `text` is what gets typed into it afterwards,
+    which is the "y hacé X" half of "abrí una ventana nueva y hacé X".
+    """
+    return run_script(OPEN_TAB, [command or "", text or ""], runner) == "opened"
 
 
 def focus(tty: str, runner: Runner | None = None) -> bool:
