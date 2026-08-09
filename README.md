@@ -378,6 +378,12 @@ announcement and your answer must not have keystrokes delivered to whatever inhe
   free of the latency.
 - Milestones (a PR being created) only chime. If some other tool of yours already tracks a
   per-terminal phase in a file, point `integrations.milestone_file_watch` at it — off by default.
+- **The chime and the voice overlap on purpose.** A chime is an attack and then a tail that says
+  nothing — `Ping` rings for 1.5 s — and waiting for `afplay` to exit before starting `say` (which
+  takes ~0.5 s to open its mouth) put about two seconds of silence between the cue and the
+  sentence, every time. The voice now starts a quarter of a second in, under the tail. Two
+  *different* announcements never overlap: the lock is held across the pair, so the chime is also
+  waited out before the next item gets the speaker.
 
 ## Developing
 

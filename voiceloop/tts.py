@@ -7,15 +7,32 @@ quiet.
 Everything is serialized behind one lock. Two sessions finishing at the same
 instant must not talk over each other — that is the failure mode this whole
 project exists to avoid.
+
+Within a single announcement, though, the chime and the voice deliberately
+overlap. See `CHIME_HEAD_SECONDS`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
 SYSTEM_VOICE = "system"
+
+# How much of a chime has to have been heard before the voice starts.
+#
+# A chime is a sharp attack and then a long tail that carries nothing: `Ping`
+# rings for 1.50 s, `Glass` for 1.65 s, `Pop` for 1.63 s. Waiting for `afplay`
+# to exit meant waiting out that tail, and then paying `say`'s own ~0.5 s of
+# startup on top — about two seconds of silence between "something happened"
+# and what happened, on every single announcement.
+#
+# So the voice starts once the attack has been heard, and the tail rings under
+# the first syllables. Short enough that the chime is still a cue and not a
+# delay; long enough that it is unmistakably a chime first.
+CHIME_HEAD_SECONDS = 0.25
 SOUNDS_DIRS = ("/System/Library/Sounds", "/Library/Sounds")
 SOUND_SUFFIXES = (".aiff", ".aif", ".wav", ".m4a")
 
@@ -55,9 +72,11 @@ class Speaker:
         runner: Runner | None = None,
         say_binary: str = "say",
         play_binary: str = "afplay",
+        chime_head: float = CHIME_HEAD_SECONDS,
     ):
         self.voice = voice
         self.rate = rate
+        self.chime_head = max(0.0, float(chime_head))
         self._runner = runner or run_process
         self._say = say_binary
         self._play = play_binary
@@ -91,15 +110,18 @@ class Speaker:
         except Exception:  # noqa: BLE001 - a dead speaker must not stall the queue
             return -1
 
+    async def _play_sound(self, sound: Path) -> bool:
+        try:
+            return await self._run([self._play, str(sound)]) == 0
+        except OSError:
+            return False
+
     async def chime(self, name: str | None) -> bool:
         sound = resolve_sound(name)
         if sound is None:
             return False
         async with self._lock:
-            try:
-                return await self._run([self._play, str(sound)]) == 0
-            except OSError:
-                return False
+            return await self._play_sound(sound)
 
     async def speak(self, text: str) -> bool:
         if not (text or "").strip():
@@ -111,7 +133,29 @@ class Speaker:
                 return False
 
     async def announce(self, announcement) -> None:
-        """Chime, then speak — in that order, never overlapping another item."""
-        await self.chime(announcement.chime)
-        if not announcement.silent:
-            await self.speak(announcement.text)
+        """Chime, then speak over the end of it — never overlapping another item.
+
+        The overlap is strictly *inside* one announcement: the lock is held
+        across both, so two windows finishing at the same instant still take
+        turns, and the chime is waited out before the lock is handed on — an
+        `afplay` still ringing afterwards would land on the next item's voice.
+
+        A silent announcement is a milestone: a chime and nothing else, with
+        nothing to overlap it with.
+        """
+        if announcement.silent:
+            await self.chime(announcement.chime)
+            return
+        sound = resolve_sound(announcement.chime)
+        async with self._lock:
+            ringing = (
+                asyncio.ensure_future(self._play_sound(sound)) if sound is not None else None
+            )
+            try:
+                if ringing is not None:
+                    await asyncio.sleep(self.chime_head)
+                await self._run(self.say_argv(announcement.text))
+            finally:
+                if ringing is not None:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await ringing
