@@ -18,7 +18,13 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .delivery import PLAN_LABELS
-from .events import TYPE_MENU, TYPE_MILESTONE, TYPE_NOTIFICATION, TYPE_STOP
+from .events import (
+    TYPE_MENU,
+    TYPE_MILESTONE,
+    TYPE_NOTIFICATION,
+    TYPE_STOP,
+    is_idle_notification,
+)
 from .summarize import FALLBACK_SUMMARY
 
 NUMBER_WORDS = (
@@ -45,6 +51,11 @@ DANGLING_WORDS = frozenset({
     "u", "a", "al", "en", "con", "para", "por", "que", "sin", "su", "sus", "lo",
     "como", "desde", "sobre", "entre",
 })
+
+# Words that are only ever *between* two things: `fn + M / fn + B`. Whatever
+# they join is one unit out loud, and half of it is worse than none — the halves
+# are usually what tells one option from the next.
+SEPARATOR_WORDS = frozenset({"/", "+", "-", "–", "—", "→", "->", "|", "&", "y/o"})
 
 _INNER_HYPHEN = re.compile(r"(?<=\w)-(?=\w)")
 _WHITESPACE = re.compile(r"\s+")
@@ -172,6 +183,18 @@ def _menu_options(options: Any) -> list[str]:
     return labels
 
 
+def _cuts_an_expression(words: Sequence[str], cut: int) -> bool:
+    """True when stopping after `cut` words lands inside an `A / B` construction.
+
+    Either side counts: the word before the cut being a separator leaves the
+    label hanging on "fn +", and the word *after* it being one means the thing
+    just said was only half of `fn + M`.
+    """
+    if cut <= 0 or cut >= len(words):
+        return False
+    return words[cut - 1] in SEPARATOR_WORDS or words[cut] in SEPARATOR_WORDS
+
+
 def short_label(label: str) -> str:
     """A menu option the way four of them in a row have to sound.
 
@@ -179,14 +202,25 @@ def short_label(label: str) -> str:
     that takes five, and "(Recomendado)" is pure noise spoken. So asides go,
     what hangs off a dash goes, and what is left is cut to its first few words.
 
-    Nothing is lost by it: the *full* label is still what a spoken keyword is
-    matched against, and "explicame la dos" still reads the whole thing out.
+    Except where the cut would fall inside something joined by a separator.
+    `"fn + M / fn + B"` at five words is `"fn + M / fn"`, which is not a shorter
+    way of saying it — it is a different, wrong answer, and it drops exactly the
+    half that told this option from the next one. So the cut retreats to before
+    the construction starts; a label that is one construction end to end is said
+    whole, which for `fn + M / fn + B` is what it was always going to cost.
+
+    Nothing is lost either way: the *full* label is still what a spoken keyword
+    is matched against, and "explicame la dos" still reads the whole thing out.
     """
     core = normalize(_TRAILING_CLAUSE.sub("", normalize(_ASIDE.sub(" ", str(label or "")))))
-    words = core.split(" ")[:MAX_SPOKEN_LABEL_WORDS]
-    while words and words[-1].lower().strip(".,;:") in DANGLING_WORDS:
-        words.pop()
-    return " ".join(words) or normalize(str(label or ""))
+    words = core.split(" ")
+    cut = min(len(words), MAX_SPOKEN_LABEL_WORDS)
+    while cut > 0 and (
+        _cuts_an_expression(words, cut)
+        or words[cut - 1].lower().strip(".,;:") in DANGLING_WORDS
+    ):
+        cut -= 1
+    return " ".join(words[:cut]) or normalize(str(label or ""))
 
 
 def enumerate_options(labels: Sequence[str], *, multi_select: bool = False) -> str:
@@ -339,6 +373,19 @@ def name_question(slug: str, phonetic: Mapping[str, Any] | None = None) -> str:
     return f"¿La llamo {spoken}?" if spoken else ""
 
 
+def muted_notification(item, *, notification_events: bool) -> bool:
+    """An idle nudge, with `notification_events` off. Nothing about it happens.
+
+    The announcement is built anyway so the queue and the log still know what
+    arrived; it just never reaches a speaker, a chime, or the mic.
+    """
+    return (
+        item.type == TYPE_NOTIFICATION
+        and not notification_events
+        and is_idle_notification(item.payload.get("message"))
+    )
+
+
 def build(
     item,
     *,
@@ -376,7 +423,9 @@ def build(
     if offer:
         text = join_sentences([text, offer])
 
-    speak = True
-    if item.type == TYPE_NOTIFICATION and not notification_events:
-        speak = False
-    return Announcement(text=text, chime=blocking_chime, speak=speak)
+    if muted_notification(item, notification_events=notification_events):
+        # Not "chime instead of speaking": a chime every time is the same
+        # interruption with the words taken out, and the words were the only
+        # part that ever justified it.
+        return Announcement(text=text, chime=None, speak=False)
+    return Announcement(text=text, chime=blocking_chime)

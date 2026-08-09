@@ -34,6 +34,17 @@ PR_CREATE_MILESTONE = "PR created"
 
 _WHITESPACE = re.compile(r"\s+")
 
+# Claude's `Notification` hook fires for two different things and says which in
+# `message`: "Claude needs your permission to use Bash" is a window that cannot
+# move until you answer, and "Claude is waiting for your input" is a nudge that
+# repeats for as long as you leave a window alone — most often the one you are
+# already sitting in front of.
+#
+# Claude Code's own English wording, not the user's, which is what makes it
+# matchable at all. Narrow on purpose: this decides what gets *muted*, so a
+# message nobody recognises has to fall through as a block, not as noise.
+_IDLE_NOTIFICATION = re.compile(r"waiting for your input", re.IGNORECASE)
+
 
 class EventError(ValueError):
     """A spool payload that does not satisfy schema v1."""
@@ -48,6 +59,18 @@ def is_pr_create_command(command: Any) -> bool:
     if not isinstance(command, str):
         return False
     return "gh pr create" in _WHITESPACE.sub(" ", command).strip()
+
+
+def is_idle_notification(message: Any) -> bool:
+    """True for the nudge, false for the block — and false for anything new.
+
+    `announce.notification_events: false` turns on this classifier and nothing
+    else: only what reads as an idle nudge goes quiet. A permission prompt still
+    speaks, and so does a wording that has not been seen before, because an
+    unrecognised notification is far more likely to be a new kind of block than
+    a new kind of noise.
+    """
+    return isinstance(message, str) and bool(_IDLE_NOTIFICATION.search(message))
 
 
 def _require_str(raw: Mapping[str, Any], key: str) -> str:

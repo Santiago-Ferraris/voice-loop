@@ -9,11 +9,13 @@ gate and the real keystroke builders — with nothing but the two ends faked.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
 
 from voiceloop import iterm
+from voiceloop.announce import Announcement
 from voiceloop.audio import AudioUnavailable, MicConsentPending, Recording
 from voiceloop.daemon import REPLY_DELIVERED, REPLY_FAILED, REPLY_PENDING, Daemon
 from voiceloop.events import Event
@@ -25,8 +27,9 @@ from voiceloop.store import (
     Store,
 )
 from voiceloop.stt.mock import MockStt
+from voiceloop.tts import Speaker
 
-from conftest import FakeSpeaker, write_roster
+from conftest import FakeSpeaker, TimedRunner, chime_file, write_roster
 
 TTY = "/dev/ttys012"
 
@@ -90,6 +93,22 @@ HOTKEYS = {
 }
 
 
+EXPRESSION = {
+    "tool": "AskUserQuestion",
+    "tool_input": {
+        "questions": [
+            {
+                "question": "¿Cómo mando el atajo?",
+                "options": [
+                    {"label": "Usá el modo A / B con el flag nuevo"},
+                    {"label": "Dejalo como está"},
+                ],
+            }
+        ]
+    },
+}
+
+
 class StubRecorder:
     """A mic that always captures something, unless told otherwise."""
 
@@ -112,6 +131,18 @@ class StubRecorder:
         if on_open is not None:
             await on_open()
         return Recording(path=path, seconds=1.0, spoke=self.spoke, reason="silence")
+
+
+class TimedRecorder(StubRecorder):
+    """A mic that remembers when it was actually spawned."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.started_at: float | None = None
+
+    async def record(self, destination, *, stop=None, on_open=None):
+        self.started_at = time.monotonic()
+        return await super().record(destination, stop=stop, on_open=on_open)
 
 
 class RecordingDelivery:
@@ -157,12 +188,14 @@ def build(config, tmp_path):
     write_roster(roster, sessionId="session-1", name="indice", kind="interactive")
     made: list[Daemon] = []
 
-    def factory(replies, *, recorder=None, delivery=None, confidence=0.99, **kwargs):
+    def factory(
+        replies, *, recorder=None, delivery=None, speaker=None, confidence=0.99, **kwargs
+    ):
         engine = MockStt(replies=list(replies), confidence=confidence)
         subject = Daemon(
             config,
             store=Store(tmp_path / f"queue{len(made)}.db"),
-            speaker=FakeSpeaker(),
+            speaker=speaker or FakeSpeaker(),
             watcher=MilestoneWatcher(),
             roster_dir=roster,
             recorder=recorder or StubRecorder(),
@@ -216,6 +249,16 @@ def test_a_spoken_keyword_picks_the_option_too(build):
     answer(daemon, item)
 
     assert daemon.delivery.sent == [("choice", TTY, 2)]
+
+
+def test_a_keyword_from_the_half_that_is_never_spoken_still_picks_it(build):
+    """Options are read short; the *full* label is still what is matched."""
+    daemon = build(["flag"])
+    item = queue(daemon, EXPRESSION)
+
+    answer(daemon, item)
+
+    assert daemon.delivery.sent == [("choice", TTY, 1)]
 
 
 def test_several_options_at_once_on_a_multi_select_menu(build):
@@ -628,6 +671,35 @@ def test_the_mic_chimes_open_and_closed_around_the_take(build):
     asyncio.run(daemon.announce_next())
 
     assert daemon.speaker.chimes == ["Tink", "Pop"]
+
+
+def test_the_mic_does_not_open_under_a_voice_that_is_still_talking(build, tmp_path):
+    """The hotkey opens a mic from a task of its own — mid-announcement, if it can.
+
+    Which recorded the announcement into the take, and left the "speak now"
+    chime queued behind the very sentence it was supposed to follow: no cue,
+    and a window to answer in that was spent on audio nobody could talk over.
+    """
+    runner = TimedRunner({"say": 0.15})
+    speaker = Speaker(voice="system", runner=runner, chime_head=0.0)
+    recorder = TimedRecorder()
+    daemon = build(["la dos"], recorder=recorder, speaker=speaker)
+    daemon.mic_open_chime = chime_file(tmp_path, "tink")
+    daemon.mic_close_chime = None
+
+    async def scenario():
+        talking = asyncio.ensure_future(
+            speaker.announce(Announcement(text="otra ventana habla", chime=None))
+        )
+        await asyncio.sleep(0.01)  # the announcement has the floor
+        await daemon.listen()
+        await talking
+
+    asyncio.run(scenario())
+
+    voice, = runner.spans_of("say")
+    assert recorder.started_at >= voice[2]
+    assert [span[0] for span in runner.spans] == ["say", "afplay"]
 
 
 def test_busy_mode_chimes_and_does_not_open_the_mic(build):

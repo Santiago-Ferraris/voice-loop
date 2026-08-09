@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from voiceloop import announce
+from voiceloop import announce, events
 from voiceloop.store import STATE_QUEUED, Item
 
 PHONETIC = {
@@ -114,6 +114,40 @@ def test_menu_options_are_enumerated_as_words():
 )
 def test_a_label_is_shortened_before_it_is_spoken(label, spoken):
     assert announce.short_label(label) == spoken
+
+
+@pytest.mark.parametrize(
+    "label, spoken",
+    [
+        # One construction end to end: whole, or not at all.
+        ("fn + M / fn + B", "fn + M / fn + B"),
+        ("⌃⌘ + M / ⌃⌘ + B", "⌃⌘ + M / ⌃⌘ + B"),
+        ("⌥ + M / ⌥ + B", "⌥ + M / ⌥ + B"),
+        ("F6 / F7 directas", "F6 / F7 directas"),
+        # Long enough to cut, so the cut retreats to before the construction.
+        ("Usá el modo A / B con el flag nuevo", "Usá el modo"),
+        ("Configurar el atajo Enter -> Escape ahora", "Configurar el atajo"),
+        # The construction fits inside the cut: nothing to retreat from.
+        ("Mandar Enter -> Escape al terminar la sesión", "Mandar Enter -> Escape"),
+        # A separator glued to its words is one token, and cuts like one.
+        ("A/B testing con feature flags nuevos", "A/B testing con feature flags"),
+    ],
+)
+def test_a_label_is_never_cut_inside_an_expression(label, spoken):
+    """`"fn + M / fn"` is not a shorter way of saying it — it is a wrong answer."""
+    assert announce.short_label(label) == spoken
+
+
+def test_the_hotkey_menu_that_lost_half_of_every_option():
+    """The live one: every label cut just after the slash, all four indistinct."""
+    labels = ["fn + M / fn + B", "⌃⌘ + M / ⌃⌘ + B", "⌥ + M / ⌥ + B", "F6 / F7 directas"]
+
+    spoken = announce.enumerate_options(labels)
+
+    assert spoken == (
+        "Opciones: uno: fn + M / fn + B, dos: ⌃⌘ + M / ⌃⌘ + B, "
+        "tres: ⌥ + M / ⌥ + B, cuatro: F6 / F7 directas"
+    )
 
 
 def test_four_options_are_read_short_not_whole():
@@ -258,9 +292,10 @@ def test_a_notification_reads_its_message():
     assert result.chime == "Ping"
 
 
-def test_notifications_can_be_downgraded_to_a_chime():
+def test_muting_an_idle_nudge_takes_the_chime_with_it():
+    """Chime-only was the same interruption without the part that justified it."""
     result = announce.build(
-        item("notification", message="algo"),
+        item("notification", message="Claude is waiting for your input"),
         name="x",
         notification_events=False,
         blocking_chime="Ping",
@@ -268,7 +303,48 @@ def test_notifications_can_be_downgraded_to_a_chime():
 
     assert result.speak is False
     assert result.silent is True
+    assert result.chime is None
+
+
+def test_muting_the_nudges_does_not_mute_a_permission_prompt():
+    """The two arrive through the same hook and are not the same thing."""
+    result = announce.build(
+        item("notification", message="Claude needs your permission to use Bash"),
+        name="x",
+        notification_events=False,
+        blocking_chime="Ping",
+    )
+
+    assert result.speak is True
     assert result.chime == "Ping"
+
+
+def test_a_notification_nobody_recognises_is_treated_as_a_block():
+    result = announce.build(
+        item("notification", message="Claude tripped over something new"),
+        name="x",
+        notification_events=False,
+        blocking_chime="Ping",
+    )
+
+    assert result.speak is True
+    assert result.chime == "Ping"
+
+
+@pytest.mark.parametrize(
+    "message, idle",
+    [
+        ("Claude is waiting for your input", True),
+        ("Claude is waiting for your input.", True),
+        ("CLAUDE IS WAITING FOR YOUR INPUT", True),
+        ("Claude needs your permission to use Bash", False),
+        ("", False),
+        (None, False),
+        (42, False),
+    ],
+)
+def test_only_the_idle_wording_reads_as_a_nudge(message, idle):
+    assert events.is_idle_notification(message) is idle
 
 
 def test_a_long_notification_is_clipped():

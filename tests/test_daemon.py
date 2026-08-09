@@ -383,15 +383,64 @@ def test_a_notification_speaks_and_waits_for_you(daemon):
     assert daemon.store.get(event.id).state == STATE_PENDING
 
 
-def test_notifications_can_be_muted_to_a_chime(daemon):
+def test_a_muted_idle_nudge_never_reaches_the_queue(daemon, config):
+    """Not "announced silently": an item in the queue is a pendiente."""
+    daemon.notification_events = False
+    spool.write(
+        config.spool_dir,
+        Event.new("notification", "s1", payload={"message": "Claude is waiting for your input"}),
+    )
+
+    assert daemon.ingest_once() == 0
+
+    assert daemon.store.pendings() == []
+    assert spool.list_files(config.spool_dir) == []
+    assert asyncio.run(daemon.announce_next()) is False
+    assert daemon.speaker.said == []
+
+
+def test_a_permission_prompt_survives_the_mute(daemon, config):
     daemon.notification_events = False
     write_roster(daemon.roster_path, sessionId="s1", name="alpha")
-    daemon.store.ingest(Event.new("notification", "s1", payload={"message": "necesita permiso"}))
+    spool.write(
+        config.spool_dir,
+        Event.new(
+            "notification", "s1", payload={"message": "Claude needs your permission to use Bash"}
+        ),
+    )
+
+    assert daemon.ingest_once() == 1
+
+    asyncio.run(daemon.announce_next())
+    assert daemon.speaker.texts == ["alpha: Claude needs your permission to use Bash."]
+
+
+def test_an_idle_nudge_is_kept_when_the_events_are_on(daemon, config):
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    spool.write(
+        config.spool_dir,
+        Event.new("notification", "s1", payload={"message": "Claude is waiting for your input"}),
+    )
+
+    assert daemon.ingest_once() == 1
+
+    asyncio.run(daemon.announce_next())
+    assert daemon.speaker.texts == ["alpha: Claude is waiting for your input."]
+
+
+def test_an_item_already_queued_when_the_mute_went_on_stays_silent(daemon):
+    """The toggle is read at ingest, but a restart can find one already in line."""
+    write_roster(daemon.roster_path, sessionId="s1", name="alpha")
+    daemon.store.ingest(
+        Event.new("notification", "s1", payload={"message": "Claude is waiting for your input"})
+    )
+    daemon.notification_events = False
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.speaker.texts == []
-    assert daemon.speaker.said[0].chime == "Ping"
+    announcement, = daemon.speaker.said
+    assert announcement.silent is True
+    assert announcement.chime is None
 
 
 def test_activity_resolves_a_pending_item_end_to_end(daemon, config, tmp_path):

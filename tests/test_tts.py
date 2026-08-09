@@ -8,6 +8,8 @@ import pytest
 from voiceloop.announce import Announcement
 from voiceloop.tts import CHIME_HEAD_SECONDS, Speaker, resolve_sound
 
+from conftest import TimedRunner, chime_file
+
 
 class FakeRunner:
     """Records argv instead of spawning `say`/`afplay` (CI has neither)."""
@@ -27,31 +29,6 @@ class FakeRunner:
             await asyncio.sleep(self.delay)
         self.concurrent -= 1
         return self.returncode
-
-
-class TimedRunner:
-    """Records when each process started and finished, so overlap is measurable."""
-
-    def __init__(self, durations: dict[str, float] | None = None):
-        self.durations = durations or {}
-        self.spans: list[list] = []
-
-    async def __call__(self, argv):
-        index = len(self.spans)
-        self.spans.append([argv[0], time.monotonic(), None])
-        await asyncio.sleep(self.durations.get(argv[0], 0.0))
-        self.spans[index][2] = time.monotonic()
-        return 0
-
-    def spans_of(self, binary: str) -> list[list]:
-        """Every run of that binary, in the order they started."""
-        return [span for span in self.spans if span[0] == binary]
-
-
-def chime_file(tmp_path, name: str = "ping") -> str:
-    sound = tmp_path / f"{name}.aiff"
-    sound.write_bytes(b"fake audio")
-    return str(sound)
 
 
 def test_say_argv_carries_voice_and_rate():
@@ -235,6 +212,90 @@ def test_an_announcement_with_no_chime_waits_for_nothing(tmp_path):
     asyncio.run(speaker.announce(Announcement(text="hola", chime=None)))
 
     assert [span[0] for span in runner.spans] == ["say"]
+
+
+# --- the floor the microphone opens on --------------------------------------
+
+
+def test_the_floor_waits_out_the_announcement_it_follows(tmp_path):
+    """The mic may not open under a voice: `say` is played into the mic."""
+    runner = TimedRunner({"say": 0.1, "afplay": 0.02})
+    speaker = Speaker(voice="system", runner=runner, chime_head=0.0)
+    taken: list[float] = []
+
+    async def scenario():
+        async def open_mic():
+            await asyncio.sleep(0.01)  # after the announcement has the lock
+            async with speaker.floor():
+                taken.append(time.monotonic())
+
+        await asyncio.gather(
+            speaker.announce(Announcement(text="hola", chime=chime_file(tmp_path))),
+            open_mic(),
+        )
+
+    asyncio.run(scenario())
+
+    voice, = runner.spans_of("say")
+    assert taken[0] >= voice[2]
+
+
+def test_the_cue_plays_on_the_floor_instead_of_queueing_behind_it(tmp_path):
+    """The chime that says "speak now" cannot be the one thing waiting its turn."""
+    runner = TimedRunner({"say": 0.1, "afplay": 0.02})
+    speaker = Speaker(voice="system", runner=runner, chime_head=0.0)
+    cue = chime_file(tmp_path, "tink")
+
+    async def scenario():
+        async with speaker.floor() as floor:
+            # Someone else wants to talk, and must not get in first.
+            queued = asyncio.ensure_future(speaker.speak("otra ventana"))
+            await asyncio.sleep(0)
+            assert await floor.cue(cue) is True
+            assert floor.held is False
+            await queued
+
+    asyncio.run(scenario())
+
+    assert [span[0] for span in runner.spans] == ["afplay", "say"]
+
+
+def test_the_floor_is_handed_back_before_the_take_not_after(tmp_path):
+    """Held across a minute of recording, a busy-mode chime would sit behind it."""
+    speaker = Speaker(voice="system", runner=FakeRunner(), chime_head=0.0)
+    cue = chime_file(tmp_path)
+
+    async def scenario():
+        async with speaker.floor() as floor:
+            await floor.cue(cue)
+            assert speaker._lock.locked() is False
+
+    asyncio.run(scenario())
+
+
+def test_an_unresolvable_cue_still_hands_the_floor_back(tmp_path):
+    speaker = Speaker(voice="system", runner=FakeRunner(), chime_head=0.0)
+
+    async def scenario():
+        async with speaker.floor() as floor:
+            assert await floor.cue("NoSuchSound") is False
+        assert speaker._lock.locked() is False
+
+    asyncio.run(scenario())
+
+
+def test_the_floor_is_released_when_the_mic_blows_up(tmp_path):
+    """A take that raises must not leave the daemon permanently mute."""
+    speaker = Speaker(voice="system", runner=FakeRunner(), chime_head=0.0)
+
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            async with speaker.floor():
+                raise RuntimeError("ffmpeg is gone")
+        assert speaker._lock.locked() is False
+        assert await speaker.speak("y sigo hablando") is True
+
+    asyncio.run(scenario())
 
 
 def test_from_config_reads_voice_and_rate(config):
