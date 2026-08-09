@@ -67,7 +67,7 @@ from . import (
     spool,
     vocabulary,
 )
-from .audio import AudioUnavailable, MicConsentPending, Recorder
+from .audio import REASON_TIMEOUT, AudioUnavailable, MicConsentPending, Recorder
 from .config import Config, ConfigError, load as load_config
 from .control import ControlError, ControlServer, DaemonAlreadyRunning
 from .delivery import Delivery, GatePolicy
@@ -1127,9 +1127,16 @@ class Daemon:
         await self.speaker.chime(self.mic_close_chime)
 
         if not recording.usable:
-            log.info("mic heard nothing (%s, %.1fs)", recording.reason, recording.seconds)
+            # "Nothing" is now a statement about the audio, not about the clock:
+            # a take only gets here empty or measurably silent.
+            log.info("mic heard nothing (%s)", recording.summary)
             self._discard(path)
             return Transcript(text="", provider=getattr(self.stt, "name", ""))
+        if recording.reason == REASON_TIMEOUT:
+            # The window closed on its own with audio inside it — the take that
+            # used to be thrown away as "heard nothing". The measured level is
+            # here so a mic problem can be told apart from a quiet room.
+            log.info("mic ran out of time with audio in it (%s)", recording.summary)
         try:
             transcript = await asyncio.to_thread(self.stt.transcribe, path, self.keyterms())
         except SttError as exc:
