@@ -386,6 +386,34 @@ def test_saying_something_else_during_a_read_back_replaces_it(build):
     assert daemon.delivery.sent == [("text", TTY, "mejor corré los tests")]
 
 
+def test_a_question_that_might_have_been_for_voice_loop_is_read_back(build):
+    """Asking costs a round; typing it into somebody's session costs the session."""
+    daemon = build(["cuántas ventanas quedan abiertas", "no"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_PENDING
+    assert daemon.delivery.sent == []
+    assert any("¿Te lo mando a la ventana?" in said for said in daemon.speaker.spoken)
+
+
+def test_and_it_goes_through_if_you_say_it_was_for_the_window(build):
+    daemon = build(["cuántas ventanas quedan abiertas", "dale"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert daemon.delivery.sent == [("text", TTY, "cuántas ventanas quedan abiertas")]
+
+
+def test_an_ordinary_question_for_the_window_is_not_second_guessed(build):
+    """The read-back is for doubt, not for questions — this is not confirm-everything."""
+    daemon = build(["qué base te parece mejor"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert daemon.delivery.sent == [("text", TTY, "qué base te parece mejor")]
+    assert daemon.speaker.spoken == []
+
+
 # --- the conversational bits -----------------------------------------------
 
 
@@ -400,6 +428,26 @@ def test_asking_for_a_repeat_says_it_again_and_keeps_listening(build):
     assert outcome == REPLY_DELIVERED
     assert "indice: terminó y te espera." in daemon.speaker.spoken
     assert daemon.delivery.sent == [("text", TTY, "dale, mergealo")]
+
+
+def test_asking_which_one_is_left_reads_the_queue_instead_of_typing_it(build):
+    """Verbatim from the first real run: "cuál queda" was typed into the window."""
+    daemon = build(["cuál queda"])
+    daemon.stt.default = ""
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_PENDING
+    assert daemon.delivery.sent == []
+    assert any("pendiente" in said for said in daemon.speaker.spoken)
+
+
+def test_asking_for_a_beat_holds_the_mic_instead_of_answering(build):
+    daemon = build(["esperá", "mergealo"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert daemon.delivery.sent == [("text", TTY, "mergealo")]
+    assert "Dale, espero." in daemon.speaker.spoken
 
 
 def test_mostrame_focuses_the_window_without_answering_it(build):

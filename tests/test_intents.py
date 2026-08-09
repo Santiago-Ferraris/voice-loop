@@ -23,6 +23,7 @@ from voiceloop.intents import (
     KIND_SILENCE,
     KIND_SKIP,
     KIND_TEXT,
+    KIND_WAIT,
 )
 
 OPTIONS = ["SQLite", "Postgres", "Ninguna de las dos"]
@@ -274,6 +275,63 @@ def test_asking_for_the_queue(said):
 )
 def test_asking_how_things_are_going(said):
     assert parse(said).kind == KIND_STATUS
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["cuál queda", "cuántas quedan", "cuántos faltan", "cuál me queda", "qué queda",
+     "Cuál queda?"],
+)
+def test_asking_which_one_is_left_asks_the_queue(said):
+    """Verbatim from the first real run, where it was typed into the window."""
+    assert parse(said).kind == KIND_PENDINGS
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["qué dijiste", "qué me dijiste", "cómo dijiste", "no te entendí", "una vez más"],
+)
+def test_asking_what_was_said_is_a_repeat(said):
+    assert parse(said).kind == KIND_REPEAT
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["esperá", "esperame", "un segundo", "momento", "dame un segundo", "aguantame"],
+)
+def test_asking_for_a_beat_is_neither_an_answer_nor_a_refusal(said):
+    assert parse(said).kind == KIND_WAIT
+
+
+# --- the ones that only *might* have been for voice-loop --------------------
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "cuántas ventanas quedan abiertas",
+        "qué sesión te falta",
+        "cuál ventana está esperando",
+        "qué dijiste de la cola",
+    ],
+)
+def test_a_short_question_about_the_queue_is_flagged(said):
+    assert intents.looks_systemward(said) is True
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "qué base uso",  # a question, but about the work
+        "cuántos tests corriste",
+        "mergealo cuando pasen los tests",
+        "qué te parece si dejamos la ventana de la izquierda para después",  # too long
+        "",
+    ],
+)
+def test_everything_else_is_not(said):
+    """A read-back on every sentence was rejected out loud; this stays narrow."""
+    assert intents.looks_systemward(said) is False
 
 
 def test_a_sentence_that_merely_mentions_pendings_is_still_dictation():

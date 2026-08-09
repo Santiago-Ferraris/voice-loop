@@ -688,6 +688,9 @@ class Daemon:
             if intent.kind == intents.KIND_SHOW:
                 await asyncio.to_thread(self.delivery.focus, item.tty)
                 continue
+            if intent.kind == intents.KIND_WAIT:
+                await self.speaker.speak("Dale, espero.")
+                continue
             if intent.kind == intents.KIND_STATUS:
                 await self.speak_status()
                 continue
@@ -722,7 +725,8 @@ class Daemon:
                 pending_action = action
                 await self.speaker.speak(
                     announce_mod.speakable(
-                        f"{gate.reason}. Dijiste: {self._readback(action, menu)}. ¿Lo mando?",
+                        f"{gate.reason}. Dijiste: {self._readback(action, menu)}. "
+                        f"{gate.question}",
                         self.phonetic,
                     )
                 )
@@ -748,6 +752,13 @@ class Daemon:
 
         text = intent.text
         gate = self.gate.check(text, transcript.confidence)
+        if not gate.required and intents.looks_systemward(text):
+            # A question about the queue that no control phrase caught. Asking
+            # costs one round; typing "cuál queda" into a session costs the
+            # session — which is what happened on the first real run.
+            gate = delivery_mod.Gate(
+                True, "No sé si eso era para mí", "¿Te lo mando a la ventana?"
+            )
         if menu is not None:
             return ("menu_text", (menu.free_text_index, text)), gate
         return ("text", text), gate

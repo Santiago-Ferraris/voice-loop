@@ -87,6 +87,10 @@ class Menu:
 class Gate:
     required: bool
     reason: str = ""
+    # What the read-back ends on. "¿Lo mando?" is the question when the doubt
+    # is about the words; when the doubt is about who you were talking to, the
+    # question has to say so.
+    question: str = "¿Lo mando?"
 
 
 @dataclass
