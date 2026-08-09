@@ -431,3 +431,119 @@ def test_display_name_falls_back_to_the_session_id(store):
     store.ingest(event)
 
     assert store.get(event.id).display_name == "abcdef12"
+
+
+# --- "después": the back of the line ---------------------------------------
+
+
+def test_a_deferred_item_goes_behind_everything_else(store):
+    first = stop("s1", ts=1000)
+    second = stop("s2", ts=1001)
+    store.ingest(first)
+    store.ingest(second)
+
+    store.defer(first.id, now=2000)
+
+    assert [item.id for item in store.queued_items()] == [second.id, first.id]
+    assert [item.id for item in store.pendings()] == [second.id, first.id]
+
+
+def test_deferring_does_not_rewrite_how_long_it_has_been_waiting(store):
+    """`pendings` says "hace diez minutos" off `ts`. Moving it must not reset that."""
+    event = stop("s1", ts=1000)
+    store.ingest(event)
+
+    store.defer(event.id, now=9999)
+
+    item = store.get(event.id)
+    assert item.ts == 1000
+    assert item.deferred_at == 9999
+
+
+def test_deferring_twice_puts_it_behind_the_one_deferred_first(store):
+    first = stop("s1", ts=1000)
+    second = stop("s2", ts=1001)
+    store.ingest(first)
+    store.ingest(second)
+
+    store.defer(first.id, now=2000)
+    store.defer(second.id, now=2001)
+
+    assert [item.id for item in store.queued_items()] == [first.id, second.id]
+
+
+def test_a_resolved_item_cannot_be_deferred_back_into_the_queue(store):
+    event = stop("s1")
+    store.ingest(event)
+    store.resolve(event.id, "skip")
+
+    store.defer(event.id)
+
+    assert store.get(event.id).deferred_at is None
+
+
+# --- the proposed name, kept with the summary ------------------------------
+
+
+def test_a_slug_is_stored_alongside_the_item(store):
+    event = stop()
+    store.ingest(event)
+
+    store.set_slug(event.id, "tests event processor")
+
+    assert store.get(event.id).slug == "tests event processor"
+
+
+def test_an_empty_slug_is_stored_as_nothing_at_all(store):
+    event = stop()
+    store.ingest(event)
+    store.set_slug(event.id, "")
+
+    assert store.get(event.id).slug is None
+
+
+def test_superseding_drops_the_proposal_with_the_summary(store):
+    """Both described a turn that is no longer the last one."""
+    event = stop("s1", ts=1000)
+    store.ingest(event)
+    store.set_summary(event.id, "terminó los tests")
+    store.set_slug(event.id, "tests worker")
+
+    store.ingest(stop("s1", ts=1005))
+
+    item = store.pendings()[0]
+    assert item.summary is None
+    assert item.slug is None
+
+
+# --- upgrading a database that already has a queue in it -------------------
+
+
+def test_columns_added_after_the_first_release_are_added_in_place(tmp_path):
+    """The daemon upgrades over a live queue.db; CREATE TABLE IF NOT EXISTS does not."""
+    import sqlite3
+
+    path = tmp_path / "queue.db"
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(
+        """
+        CREATE TABLE events (
+            id TEXT PRIMARY KEY, ts INTEGER NOT NULL, type TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '', tty TEXT NOT NULL DEFAULT '',
+            cwd TEXT NOT NULL DEFAULT '', transcript_path TEXT NOT NULL DEFAULT '',
+            name TEXT, state TEXT NOT NULL, summary TEXT,
+            payload TEXT NOT NULL DEFAULT '{}', announced_at INTEGER,
+            resolved_at INTEGER, resolved_by TEXT
+        );
+        INSERT INTO events (id, ts, type, state) VALUES ('old-1', 1000, 'stop', 'queued');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    with Store(path) as store:
+        store.defer("old-1", now=2000)
+
+        item = store.get("old-1")
+        assert item.slug is None
+        assert item.deferred_at == 2000
