@@ -1033,10 +1033,12 @@ class Daemon:
         This is the whole of the v3 microphone. The chime no longer means
         "your turn now" — it means "I am about to say something *and* you can
         talk to me". Capture starts before the first syllable, runs under the
-        entire sentence, and stays open `grace` seconds of silence afterwards.
-        Start speaking late and the take waits for you to finish; start
-        speaking early — over us, on headphones — and the sentence stops
-        mid-word.
+        entire sentence, and waits `grace` seconds afterwards for you to start.
+        Start speaking late and the take waits for you; start speaking early —
+        over us, on headphones — and the sentence stops mid-word.
+
+        `grace` is time to start, not time to talk: once you have said a word
+        the take ends when you stop, not on this clock.
 
         The old shape opened a four-second window *after* the announcement,
         which is three chances a morning to miss somebody who was still drawing
@@ -1107,8 +1109,12 @@ class Daemon:
                     speech_timeout=timeout,
                     # Barge-in only where our own voice cannot reach the mic.
                     speech=barged if private else None,
-                    # On speakers everything heard under the voice is the voice.
-                    arm_after_open=speaking and not private,
+                    # On speakers everything the mic hears while `on_open` is
+                    # running is us — the sentence, and the cue chime of a mic
+                    # that had nothing to say. Neither is you starting to talk,
+                    # and now that the cutoff waits for you to *stop*, counting
+                    # the chime would end the take three seconds after it rang.
+                    arm_after_open=not private,
                 )
         except MicConsentPending as exc:
             # The one mic failure with a fix only the user can perform — and

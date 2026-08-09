@@ -6,7 +6,7 @@ us with the `silencedetect` filter, so rev 1 needs nothing else. Rev 2 replaces
 that filter with Deepgram's server-side endpointing over a streaming socket —
 the cutoff moves, the rest of this module does not.
 
-Three things the recorder has to get right:
+Things the recorder has to get right:
 
 * **Opening the device is slow.** avfoundation takes over a second to hand over
   the first sample. The "speak now" chime must fire when capture actually
@@ -25,6 +25,16 @@ Three things the recorder has to get right:
   silence, so it never reports speech either, and every take ends on the
   timeout looking empty while holding a full sentence. What a take holds is
   decided by measuring the file (`measure`), never by how the take ended.
+* **The window is not a countdown.** `speech_timeout` is how long the mic waits
+  for you to *start*; once you have started, what ends the take is you
+  stopping. A fixed ceiling means an eight-second answer leaves you two seconds
+  to finish it, and `max_seconds` goes back to being what it says it is — the
+  safety net, not the way takes normally end.
+* **A threshold in dB is a guess about a room.** So the cutoff does not use
+  one: ffmpeg hands the same capture over a pipe as raw PCM, `VoiceGate`
+  measures the room in the first half second of the take and treats anything
+  `margin_db` above *that* as a voice. It is the only thing that survives a
+  different room, a different input gain, or new headphones.
 
 Termination is SIGTERM, which makes ffmpeg finalize the WAV header before
 exiting — the file is playable, and its non-zero exit status is expected.
@@ -63,6 +73,35 @@ LEVEL_WINDOW_SECONDS = 0.03
 # How much audio above the threshold makes a take worth transcribing. Matched
 # to MIN_USABLE_BYTES: a third of a second is the shortest thing worth a word.
 MIN_SIGNAL_SECONDS = 0.3
+
+# --- the relative cutoff ----------------------------------------------------
+# How long you have to stop talking for the take to be over. Long enough to
+# think mid-sentence, short enough that the mic is not still there when you
+# have moved on.
+DEFAULT_MIN_SILENCE_SECONDS = 3.0
+# The room, read off the start of the take: long enough to average out a
+# keystroke, short enough to be over before anybody answers a question.
+CALIBRATION_SECONDS = 0.5
+# How far above the room a window has to sit to be a voice. Measured on the
+# desk this was written at: room -49 dB, voice -29 dB. Ten leaves the voice
+# clear by ten and still ignores the chair.
+FLOOR_MARGIN_DB = 10.0
+# Outside these a measured floor is not a room. Below: digital silence and the
+# dither around it, where floor + margin would make the dither into speech.
+# Above: a room nothing could clear. Either way the configured absolute
+# threshold is the better guess.
+FLOOR_MIN_DB = -80.0
+FLOOR_MAX_DB = -20.0
+# The floor is the quietest stretch, and within a stretch the quiet part of it:
+# a percentile, so one thump does not raise the room by 15 dB.
+QUIET_PERCENTILE = 0.75
+# A single window over the threshold is a chair creaking, not a word.
+MIN_ACTIVE_SECONDS = 0.12
+# How long after ffmpeg should have stopped itself we stop waiting for it.
+MAX_DURATION_SLACK = 2.0
+# An ffmpeg that exits this far into its own `-t` reached the cap; anything
+# earlier is a capture that died and says so as `exited`.
+CAP_REACHED_FRACTION = 0.9
 
 REASON_SILENCE = "silence"
 REASON_TOGGLE = "toggle"
@@ -274,6 +313,153 @@ class SilenceTracker:
             self.cut_off = True
 
 
+class VoiceGate:
+    """Voice activity measured against the room, not against a number in dB.
+
+    `silencedetect` compares the signal to an absolute threshold, and that
+    threshold is a guess about a room. Set it for a quiet one and a noisy one
+    never falls under it: no `silence_start` ever, therefore no cutoff, and
+    every take runs to the ceiling. Set it for the noisy one and a whisper is
+    silence. What actually survives a different room, a different input gain or
+    new headphones is the *distance* between the room and a voice — twenty-odd
+    dB, wherever the pair of them happen to sit — so that is what is measured.
+
+    The room is read off the take itself: the quietest `calibration_seconds`
+    block seen before the first word, at `QUIET_PERCENTILE` within the block so
+    one thump does not raise it. Anything `margin_db` above that, for longer
+    than a creak, is you. When the measured floor is not a room at all — digital
+    silence, or a floor nothing could clear — the configured absolute threshold
+    is used instead, because a wrong measurement is worse than a guess.
+
+    Everything is timed off the samples, never the clock: the cutoff lands
+    `min_silence_seconds` after your last word *in the audio*, which is the same
+    number whether ffmpeg delivered it early or late.
+    """
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = SAMPLE_RATE,
+        min_silence_seconds: float = DEFAULT_MIN_SILENCE_SECONDS,
+        fallback_db: float = -35.0,
+        calibration_seconds: float = CALIBRATION_SECONDS,
+        margin_db: float = FLOOR_MARGIN_DB,
+        armed: bool = True,
+    ):
+        self.sample_rate = max(1, int(sample_rate))
+        self.min_silence_seconds = max(0.0, min_silence_seconds)
+        self.fallback_db = fallback_db
+        self.margin_db = margin_db
+        self.window = max(1, int(self.sample_rate * LEVEL_WINDOW_SECONDS))
+        self.window_seconds = self.window / self.sample_rate
+        self.block = max(1, round(max(0.0, calibration_seconds) / self.window_seconds))
+        self.active_windows = max(1, round(MIN_ACTIVE_SECONDS / self.window_seconds))
+        self.armed = armed
+        self.floor_db: float | None = None
+        self.threshold_db = fallback_db
+        self.spoke = False
+        self.cut_off = False
+        self.quiet_seconds = 0.0
+        self._levels: list[float] = []
+        self._tail = b""
+        self._calibrated = 0
+
+    @property
+    def seconds(self) -> float:
+        """How much audio has been through the gate, in the take's own time."""
+        return len(self._levels) * self.window_seconds
+
+    def arm(self) -> None:
+        """Everything so far was our own voice. The room starts here."""
+        if self.armed:
+            return
+        self.armed = True
+        self._levels.clear()
+        self._tail = b""
+        self._calibrated = 0
+        self.floor_db = None
+        self.threshold_db = self.fallback_db
+        self.spoke = False
+        self.cut_off = False
+        self.quiet_seconds = 0.0
+
+    def feed(self, chunk: bytes) -> None:
+        """Take in raw 16-bit mono PCM, straight off ffmpeg's second output."""
+        if not self.armed or not chunk:
+            return
+        data = self._tail + chunk
+        frame = self.window * 2
+        whole = len(data) - len(data) % frame
+        self._tail = data[whole:]
+        if not whole:
+            return
+        for start in range(0, whole, frame):
+            samples = array.array("h")
+            samples.frombytes(data[start : start + frame])
+            if sys.byteorder == "big":
+                # The pipe is little-endian; `array` is native.
+                samples.byteswap()
+            squares = sum(value * value for value in samples)
+            self._levels.append(dbfs(math.sqrt(squares / len(samples))))
+        self._calibrate()
+        self._evaluate()
+
+    def _calibrate(self) -> None:
+        """The floor is the quietest block of the take so far.
+
+        Only until you speak: after that the room is whatever it was when you
+        started, and re-reading it off your own voice would raise the bar past
+        your next word. Blocks keep going in until then, so a take that opened
+        under a cough still finds the room once the cough is over — and finds
+        it retroactively, since the whole take is re-read at the new threshold.
+        """
+        if self.spoke:
+            return
+        while len(self._levels) - self._calibrated >= self.block:
+            block = sorted(self._levels[self._calibrated : self._calibrated + self.block])
+            self._calibrated += self.block
+            quiet = block[min(len(block) - 1, int(len(block) * QUIET_PERCENTILE))]
+            if self.floor_db is None or quiet < self.floor_db:
+                self.floor_db = quiet
+        if self.floor_db is None:
+            return
+        if FLOOR_MIN_DB <= self.floor_db <= FLOOR_MAX_DB:
+            self.threshold_db = self.floor_db + self.margin_db
+        else:
+            self.threshold_db = self.fallback_db
+
+    def _evaluate(self) -> None:
+        """Re-read the whole take at the current threshold.
+
+        Nothing is a voice until there is a room to compare it to — the first
+        block of the take is the room, and jumping the gun with the fallback
+        threshold would lock the floor in before it was ever measured.
+
+        Cheap (a 30 ms window per entry, a minute is two thousand floats) and it
+        is what makes the floor moving underneath harmless: the answer never
+        depends on what the threshold happened to be when a window arrived. The
+        floor only ever goes down, so a window that counts once counts forever.
+        """
+        if self.floor_db is None:
+            return
+        active = 0
+        last_active: int | None = None
+        for index, level in enumerate(self._levels):
+            if level >= self.threshold_db:
+                active += 1
+                if active >= self.active_windows:
+                    last_active = index + 1
+            else:
+                active = 0
+        if last_active is None:
+            self.quiet_seconds = 0.0
+            return
+        self.spoke = True
+        self.quiet_seconds = (len(self._levels) - last_active) * self.window_seconds
+        if self.quiet_seconds >= self.min_silence_seconds:
+            self.cut_off = True
+
+
 def split_stream(buffer: str) -> tuple[list[str], str]:
     """ffmpeg separates progress with CR and messages with LF. Split on both."""
     parts = re.split(r"[\r\n]", buffer)
@@ -288,9 +474,16 @@ def ffmpeg_argv(
     sample_rate: int = SAMPLE_RATE,
     max_seconds: float = 60.0,
     noise_db: float = -35.0,
-    min_silence_seconds: float = 1.2,
+    min_silence_seconds: float = DEFAULT_MIN_SILENCE_SECONDS,
     silence_detect: bool = True,
 ) -> list[str]:
+    """The capture, and — when the cutoff is on — the same audio over a pipe.
+
+    Two outputs off one device: the WAV that goes to the recognizer, and raw
+    PCM on stdout for `VoiceGate`, which is how the cutoff gets to compare you
+    against your room instead of against a constant. `-t` goes on both, or the
+    pipe outlives the file it was opened alongside.
+    """
     argv = [
         binary,
         "-hide_banner",
@@ -309,6 +502,18 @@ def ffmpeg_argv(
     if silence_detect:
         argv += ["-af", f"silencedetect=noise={noise_db}dB:d={min_silence_seconds}"]
     argv += ["-t", f"{max_seconds:g}", "-y", str(destination)]
+    if silence_detect:
+        argv += [
+            "-ac",
+            "1",
+            "-ar",
+            str(int(sample_rate)),
+            "-t",
+            f"{max_seconds:g}",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ]
     return argv
 
 
@@ -316,7 +521,10 @@ async def _default_spawn(argv: Sequence[str]):
     return await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
+        # The monitoring output. Nothing is written here unless `ffmpeg_argv`
+        # added `pipe:1`, but a pipe nobody drains is a capture that stalls, so
+        # `record` reads it for as long as the process lives either way.
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
@@ -330,24 +538,33 @@ class Recorder:
     open_timeout: float = 8.0
     speech_timeout: float = 8.0
     noise_db: float = -35.0
-    min_silence_seconds: float = 1.2
+    min_silence_seconds: float = DEFAULT_MIN_SILENCE_SECONDS
     min_speech_seconds: float = 0.6
+    calibration_seconds: float = CALIBRATION_SECONDS
+    margin_db: float = FLOOR_MARGIN_DB
     silence_detect: bool = True
     spawn: Spawn = _default_spawn
 
     @classmethod
     def from_config(cls, config, *, spawn: Spawn | None = None) -> "Recorder":
         speech_timeout = config.get("announce.mic_timeout_seconds", 8)
+        silence = "microphone.silence"
         return cls(
             binary=str(config.get("microphone.ffmpeg", DEFAULT_BINARY)),
             device=str(config.get("microphone.device", DEFAULT_DEVICE)),
             max_seconds=float(config.get("microphone.max_seconds", 60)),
             open_timeout=float(config.get("microphone.open_timeout_seconds", 8)),
             speech_timeout=float(speech_timeout),
-            noise_db=float(config.get("microphone.silence.noise_db", -35)),
-            min_silence_seconds=float(config.get("microphone.silence.min_seconds", 1.2)),
-            min_speech_seconds=float(config.get("microphone.silence.min_speech_seconds", 0.6)),
-            silence_detect=bool(config.get("microphone.silence.enabled", True)),
+            noise_db=float(config.get(f"{silence}.noise_db", -35)),
+            min_silence_seconds=float(
+                config.get(f"{silence}.min_seconds", DEFAULT_MIN_SILENCE_SECONDS)
+            ),
+            min_speech_seconds=float(config.get(f"{silence}.min_speech_seconds", 0.6)),
+            calibration_seconds=float(
+                config.get(f"{silence}.calibration_seconds", CALIBRATION_SECONDS)
+            ),
+            margin_db=float(config.get(f"{silence}.margin_db", FLOOR_MARGIN_DB)),
+            silence_detect=bool(config.get(f"{silence}.enabled", True)),
             spawn=spawn or _default_spawn,
         )
 
@@ -377,11 +594,14 @@ class Recorder:
         speech: asyncio.Event | None = None,
         arm_after_open: bool = False,
     ) -> Recording:
-        """Capture until silence, the toggle, the timeout, or `max_seconds`.
+        """Capture until you stop talking, the toggle, the timeout, or `max_seconds`.
 
         `speech_timeout` overrides how long this one take waits for you to
-        start — and, since `on_open` is awaited before the clock starts, it is
-        also how long the mic stays open *after* whatever `on_open` said.
+        *start* — and, since `on_open` is awaited before the clock starts, it is
+        also how long the mic stays open *after* whatever `on_open` said. Once
+        you have started it stops applying: what ends the take from there is the
+        cutoff, `min_silence_seconds` after your last word, with `max_seconds`
+        behind it as the net.
 
         `speech` is set the first time the recorder hears a voice, which is
         what barge-in waits on: on headphones the first syllable stops the
@@ -398,6 +618,14 @@ class Recorder:
         tracker = SilenceTracker(
             min_speech_seconds=self.min_speech_seconds, armed=not arm_after_open
         )
+        gate = VoiceGate(
+            sample_rate=self.sample_rate,
+            min_silence_seconds=self.min_silence_seconds,
+            fallback_db=self.noise_db,
+            calibration_seconds=self.calibration_seconds,
+            margin_db=self.margin_db,
+            armed=not arm_after_open,
+        )
 
         try:
             process = await self.spawn(self.argv(path))
@@ -406,6 +634,13 @@ class Recorder:
 
         opened = asyncio.Event()
         cut = asyncio.Event()
+        heard = asyncio.Event()
+
+        def started_talking() -> None:
+            """Only once armed: before that the voice on the mic is ours."""
+            heard.set()
+            if speech is not None and not speech.is_set():
+                speech.set()
 
         async def pump() -> None:
             buffer = ""
@@ -424,30 +659,71 @@ class Recorder:
                     tracker.feed(line)
                     if tracker.opened and not opened.is_set():
                         opened.set()
-                    if speech is not None and tracker.heard_speech and not speech.is_set():
-                        speech.set()
+                    if tracker.armed and tracker.heard_speech:
+                        started_talking()
                     if tracker.cut_off:
                         cut.set()
                         return
                 if not chunk:
                     break
 
-        pumping = asyncio.create_task(pump())
+        async def listen() -> None:
+            """The same capture, as samples: the cutoff that knows the room."""
+            stream = getattr(process, "stdout", None)
+            if stream is None:
+                return
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    return
+                gate.feed(chunk)
+                if gate.spoke:
+                    started_talking()
+                if gate.cut_off:
+                    cut.set()
+                    return
+
+        pumping = [asyncio.create_task(pump()), asyncio.create_task(listen())]
         try:
             reason = await self._wait_for_end(
-                process, opened, cut, stop, on_open, speech_timeout, tracker
+                process,
+                opened,
+                cut,
+                stop,
+                on_open,
+                speech_timeout,
+                tracker,
+                gate=gate,
+                heard=heard,
+                started=started,
             )
         finally:
-            pumping.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pumping
+            for task in pumping:
+                task.cancel()
+            for task in pumping:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await self._terminate(process)
 
         seconds = time.monotonic() - started
-        spoke = tracker.ever_heard if self.silence_detect else reason != REASON_TIMEOUT
+        if reason == REASON_EXITED and seconds >= self.max_seconds * CAP_REACHED_FRACTION:
+            # ffmpeg stopping on its own that late is its own `-t`, not a
+            # failure: the take is what the cap allowed, and it holds a voice.
+            reason = REASON_MAX
+        if self.silence_detect:
+            spoke = tracker.ever_heard or gate.spoke
+        else:
+            spoke = reason != REASON_TIMEOUT
         if reason == REASON_TOGGLE:
             # You pressed the key to stop: assume you meant to say something.
             spoke = True
+        if gate.floor_db is not None:
+            log.debug(
+                "room floor %.1f dB, voice over %.1f dB, %.1fs of audio",
+                gate.floor_db,
+                gate.threshold_db,
+                gate.seconds,
+            )
         # Always, whatever ffmpeg thought it heard: the measurement is what
         # rescues a take the filter never noticed, and what the log needs to
         # make a discarded one explainable instead of just "nothing".
@@ -465,6 +741,10 @@ class Recorder:
         on_open: Callable[[], Awaitable[None]] | None,
         speech_timeout: float | None = None,
         tracker: SilenceTracker | None = None,
+        *,
+        gate: "VoiceGate | None" = None,
+        heard: asyncio.Event | None = None,
+        started: float | None = None,
     ) -> str:
         try:
             await asyncio.wait_for(opened.wait(), timeout=self.open_timeout)
@@ -474,10 +754,12 @@ class Recorder:
             ) from None
         if on_open is not None:
             await on_open()
+        # Whatever `on_open` said is behind us; from here it is you. Nothing to
+        # do when the take was armed from the start.
         if tracker is not None:
-            # Whatever `on_open` said is behind us; from here it is you. Nothing
-            # to do when the take was armed from the start.
             tracker.arm()
+        if gate is not None:
+            gate.arm()
 
         waits = {
             asyncio.ensure_future(cut.wait()): REASON_SILENCE,
@@ -485,8 +767,13 @@ class Recorder:
         }
         if stop is not None:
             waits[asyncio.ensure_future(stop.wait())] = REASON_TOGGLE
+        if heard is not None:
+            # Not an ending. The one thing here that lifts the deadline.
+            waits[asyncio.ensure_future(heard.wait())] = None
 
-        # No speech at all closes the mic early; speech extends it to the cap.
+        # Time to *start* talking. Once you have, the deadline stops being a
+        # window and becomes the backstop for a capture that outlived its own
+        # `-t` — normally ffmpeg gets there first and exits by itself.
         deadline = self.speech_timeout if speech_timeout is None else max(0.1, speech_timeout)
         reason = REASON_TIMEOUT
         try:
@@ -496,7 +783,15 @@ class Recorder:
                 )
                 if not done:
                     break
-                reason = waits[next(iter(done))]
+                ending = waits[next(iter(done))]
+                if ending is None:
+                    for task in [t for t, r in waits.items() if r is None]:
+                        del waits[task]
+                    elapsed = 0.0 if started is None else time.monotonic() - started
+                    deadline = max(0.1, self.max_seconds - elapsed + MAX_DURATION_SLACK)
+                    reason = REASON_MAX
+                    continue
+                reason = ending
                 break
         finally:
             for task in waits:

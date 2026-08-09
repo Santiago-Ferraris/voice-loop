@@ -164,9 +164,15 @@ end run
 # after it (may be empty). A tab in the window you already have, never a new
 # window: a new window is somewhere else on the desktop, which is exactly what
 # you were trying not to go looking for.
+#
+# `startupCmd`, not `startup`: `startup` is *startup items folder* to
+# AppleScript, so `set startup to …` is not a variable assignment, it is an
+# attempt to move a system folder — "Access not allowed (-10003)", at compile
+# time, every time. The script never ran once. A mocked runner cannot see that,
+# which is why `test_iterm` compiles every script in this module for real.
 OPEN_TAB = """
 on run argv
-  set startup to item 1 of argv
+  set startupCmd to item 1 of argv
   set followUp to item 2 of argv
   tell application "iTerm2"
     if (count of windows) is 0 then
@@ -175,7 +181,7 @@ on run argv
       tell current window to create tab with default profile
     end if
     tell current session of current tab of current window
-      if startup is not "" then write text startup
+      if startupCmd is not "" then write text startupCmd
       if followUp is not "" then write text followUp
     end tell
   end tell

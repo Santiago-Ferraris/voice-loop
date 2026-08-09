@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import subprocess
+
+import pytest
 
 from voiceloop import iterm
 
@@ -206,3 +211,84 @@ def test_scripting_status_is_happy_when_iterm_answers():
 
     assert ok is True
     assert "3" in detail
+
+
+# --- the scripts have to compile, not just look right ----------------------
+#
+# `open_tab` shipped with `set startup to item 1 of argv`, which is not a
+# variable assignment: `startup` is *startup items folder*, so the script
+# failed to compile — "Access not allowed (-10003)" — every single time it was
+# asked to open a window. Every test it had ran against a fake runner, which
+# never sees the difference between a script that works and one AppleScript
+# refuses to read.
+
+
+def applescripts() -> dict:
+    """Every script in the module, by name. New ones are covered for free."""
+    return {
+        name: value
+        for name, value in vars(iterm).items()
+        if name.isupper() and isinstance(value, str) and "on run argv" in value
+    }
+
+
+# Terms AppleScript or System Events already owns, that read like the obvious
+# name for a local. `startup` is the one that shipped; the rest are the ones
+# most likely to be reached for next.
+RESERVED_TERMS = frozenset(
+    """
+    application character class color contents count data date day desktop disk
+    document file folder front home hours id index item length line list menu
+    minutes month name number page paragraph path point process properties
+    quote record reference result return row script second seconds selection
+    service size space startup string tab text time trash user value version
+    volume weekday window word year
+    """.split()
+)
+
+ASSIGNMENT = re.compile(r"^\s*set\s+([A-Za-z_][A-Za-z0-9_]*)\s+to\b", re.MULTILINE)
+
+
+@pytest.mark.parametrize("name", sorted(applescripts()))
+def test_no_script_names_a_local_after_a_term_applescript_owns(name):
+    assert not set(ASSIGNMENT.findall(applescripts()[name])) & RESERVED_TERMS
+
+
+def test_the_locals_of_a_script_are_the_ones_it_actually_names():
+    """The guard above is only worth having if it reads the scripts correctly."""
+    assert set(ASSIGNMENT.findall(iterm.OPEN_TAB)) == {"startupCmd", "followUp"}
+    # The line that shipped, which is what the term list has to catch.
+    assert ASSIGNMENT.findall("  set startup to item 1 of argv") == ["startup"]
+
+
+@pytest.mark.skipif(
+    shutil.which("osacompile") is None, reason="the AppleScript compiler is macOS-only"
+)
+@pytest.mark.parametrize("name", sorted(applescripts()))
+def test_every_script_in_the_module_compiles(name):
+    """The check no mocked runner can make. Compiling runs nothing."""
+    completed = subprocess.run(
+        ["osacompile", "-o", os.devnull, "-"],
+        input=applescripts()[name],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.strip()
+
+
+def test_open_tab_passes_the_command_and_the_text_as_arguments():
+    runner = FakeOsascript("opened")
+
+    assert iterm.open_tab("claude", "arreglá el build", runner) is True
+    assert runner.calls == [["osascript", "-", "claude", "arreglá el build"]]
+
+
+def test_open_tab_takes_neither_a_command_nor_a_text():
+    """"abrí una ventana nueva" on its own: a tab, and nothing typed into it."""
+    runner = FakeOsascript("opened")
+
+    assert iterm.open_tab(runner=runner) is True
+    assert runner.calls == [["osascript", "-", "", ""]]

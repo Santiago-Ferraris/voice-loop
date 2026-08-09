@@ -25,6 +25,7 @@ from voiceloop.audio import (
     Recorder,
     Recording,
     SilenceTracker,
+    VoiceGate,
 )
 
 OPEN_LINE = "Output #0, wav, to 'reply.wav':"
@@ -115,12 +116,45 @@ class FakeStderr:
         return b""
 
 
+class FakePcm:
+    """The monitoring pipe: raw samples, when they arrive, then live silence.
+
+    Each read hands over one whole chunk whatever size was asked for — the size
+    is ffmpeg's business, and what these tests are about is *when* a chunk
+    lands, which is what tells a lifted deadline from a window that never was.
+    `on_empty` is ffmpeg reaching its own `-t`: the pipe closes and it exits.
+    """
+
+    def __init__(self, chunks, on_empty=None):
+        self.chunks = list(chunks)
+        self.on_empty = on_empty
+
+    async def read(self, size: int = 4096) -> bytes:
+        if self.chunks:
+            delay, data = self.chunks.pop(0)
+            if delay:
+                await asyncio.sleep(delay)
+            return data
+        if self.on_empty is not None:
+            self.on_empty()
+            self.on_empty = None
+            return b""
+        await asyncio.sleep(30)
+        return b""
+
+
 class FakeProcess:
-    def __init__(self, lines, separator: str = "\n"):
+    def __init__(self, lines, separator: str = "\n", pcm=None, reaches_cap: bool = False):
         self.stderr = FakeStderr(lines, separator)
         self.returncode = None
         self.terminated = False
         self._exit = asyncio.Event()
+        self.stdout = FakePcm(pcm or [], self._reach_the_cap if reaches_cap else None)
+
+    def _reach_the_cap(self) -> None:
+        """`-t` came up: ffmpeg finalizes and exits without being asked."""
+        self.returncode = 0
+        self._exit.set()
 
     def terminate(self) -> None:
         self.terminated = True
@@ -132,14 +166,34 @@ class FakeProcess:
         return self.returncode or 0
 
 
-def recorder(lines, *, separator: str = "\n", take=None, **kwargs) -> tuple[Recorder, list]:
-    """`take`, when given, is the audio this fake ffmpeg leaves on disk."""
+def piped(samples, *, delay: float = 0.0, seconds: float = 0.1) -> list:
+    """Samples as the pipe delivers them: `seconds` per chunk, `delay` apart."""
+    raw = samples.tobytes()
+    step = max(2, int(audio.SAMPLE_RATE * seconds) * 2)
+    return [(delay, raw[at : at + step]) for at in range(0, len(raw), step)]
+
+
+def destination_of(argv) -> Path:
+    """The WAV output, which is no longer the last thing on the command line."""
+    return Path(argv[argv.index("-y") + 1])
+
+
+def recorder(
+    lines,
+    *,
+    separator: str = "\n",
+    take=None,
+    pcm=None,
+    reaches_cap: bool = False,
+    **kwargs,
+) -> tuple[Recorder, list]:
+    """`take` is the audio this fake ffmpeg leaves on disk, `pcm` what it pipes."""
     spawned: list = []
 
     async def spawn(argv):
         if take is not None:
-            write_wav(Path(argv[-1]), take)
-        process = FakeProcess(lines, separator)
+            write_wav(destination_of(argv), take)
+        process = FakeProcess(lines, separator, pcm=pcm, reaches_cap=reaches_cap)
         spawned.append((list(argv), process))
         return process
 
@@ -161,7 +215,17 @@ def test_the_capture_is_sixteen_kilohertz_mono_wav(tmp_path):
     assert "-f" in argv and argv[argv.index("-f") + 1] == "avfoundation"
     assert argv[argv.index("-ac") + 1] == "1"
     assert argv[argv.index("-ar") + 1] == "16000"
-    assert argv[-1] == str(tmp_path / "r.wav")
+    assert argv[argv.index("-y") + 1] == str(tmp_path / "r.wav")
+
+
+def test_the_same_audio_is_piped_out_for_the_cutoff_to_read(tmp_path):
+    """The take goes two places: the recognizer's WAV, and `VoiceGate`."""
+    argv = audio.ffmpeg_argv(tmp_path / "r.wav", max_seconds=30)
+
+    assert argv[-1] == "pipe:1"
+    assert argv[argv.index("pipe:1") - 2 :] == ["-f", "s16le", "pipe:1"]
+    # The cap belongs to both outputs, or the pipe outlives the file.
+    assert [argv[at + 1] for at, item in enumerate(argv) if item == "-t"] == ["30", "30"]
 
 
 def test_silence_detection_is_a_filter_on_the_capture(tmp_path):
@@ -171,7 +235,11 @@ def test_silence_detection_is_a_filter_on_the_capture(tmp_path):
 
 
 def test_silence_detection_can_be_turned_off(tmp_path):
-    assert "-af" not in audio.ffmpeg_argv(tmp_path / "r.wav", silence_detect=False)
+    argv = audio.ffmpeg_argv(tmp_path / "r.wav", silence_detect=False)
+
+    assert "-af" not in argv
+    # No cutoff, nothing to monitor: the second output goes with it.
+    assert "pipe:1" not in argv
 
 
 def test_ffmpeg_never_reads_our_stdin(tmp_path):
@@ -187,6 +255,15 @@ def test_the_device_and_the_hard_cap_come_from_config(tmp_path, config):
     assert argv[argv.index("-t") + 1] == "60"
     # `announce.mic_timeout_seconds` is how long it waits for you to start.
     assert subject.speech_timeout == 8
+
+
+def test_the_cutoff_is_configured_by_the_shipped_defaults(config):
+    subject = Recorder.from_config(config)
+
+    assert subject.min_silence_seconds == 3
+    assert subject.calibration_seconds == 0.5
+    assert subject.margin_db == 10
+    assert subject.noise_db == -35
 
 
 # --- the silence tracker ---------------------------------------------------
@@ -246,6 +323,169 @@ def test_progress_and_messages_are_split_on_both_separators():
 
     assert lines == ["size=1", "size=2", "silence_start: 1.0"]
     assert rest == "partial"
+
+
+# --- the cutoff that knows the room -----------------------------------------
+#
+# Levels are the ones measured on the desk this was written at: input gain
+# 75/100, room -49 dB, voice -29 dB. Twenty dB apart, which is the number the
+# gate lives on — not the two absolute values, which move with the room.
+
+
+def gate(**kwargs) -> VoiceGate:
+    defaults = dict(min_silence_seconds=3.0, fallback_db=-35.0)
+    defaults.update(kwargs)
+    return VoiceGate(**defaults)
+
+
+def feed(subject: VoiceGate, *parts, seconds: float = 0.1) -> float | None:
+    """Push audio through in chunks, and report where the cutoff landed.
+
+    The answer is in the take's own time — how much audio had gone through when
+    it fired — which is the whole point: it does not depend on the test's clock.
+    """
+    cut_at = None
+    for part in parts:
+        for _, chunk in piped(part, seconds=seconds):
+            subject.feed(chunk)
+            if subject.cut_off and cut_at is None:
+                cut_at = subject.seconds
+    return cut_at
+
+
+def test_the_room_is_measured_and_a_voice_is_what_clears_it():
+    subject = gate()
+
+    feed(subject, hiss(1.0, rms_db=-49))
+
+    assert subject.floor_db == pytest.approx(-49, abs=1.5)
+    assert subject.threshold_db == pytest.approx(-39, abs=1.5)
+    assert subject.spoke is False
+
+    feed(subject, tone(1.0, rms_db=-29))
+
+    assert subject.spoke is True
+
+
+def test_the_take_lasts_as_long_as_you_talked_plus_the_silence():
+    """The complaint, in one test: fifteen seconds of answer, and time to give it.
+
+    A fixed ceiling of ten made this take end at ten — mid-sentence, with five
+    seconds of it still unsaid.
+    """
+    subject = gate()
+
+    cut_at = feed(subject, hiss(0.6, rms_db=-49), tone(15, rms_db=-29), hiss(5, rms_db=-49))
+
+    assert cut_at == pytest.approx(0.6 + 15 + 3, abs=0.25)
+    assert cut_at > 10
+
+
+def test_a_loud_room_does_not_hide_the_end_of_your_sentence():
+    """The absolute threshold's failure: a floor above it is silence that never comes."""
+    subject = gate()
+
+    cut_at = feed(subject, hiss(0.6, rms_db=-35), tone(2, rms_db=-20), hiss(4, rms_db=-35))
+
+    assert subject.threshold_db == pytest.approx(-25, abs=1.5)
+    assert cut_at == pytest.approx(0.6 + 2 + 3, abs=0.25)
+
+
+def test_a_quiet_room_works_the_same_way():
+    subject = gate()
+
+    cut_at = feed(subject, hiss(0.6, rms_db=-60), tone(2, rms_db=-20), hiss(4, rms_db=-60))
+
+    assert subject.threshold_db == pytest.approx(-50, abs=1.5)
+    assert cut_at == pytest.approx(0.6 + 2 + 3, abs=0.25)
+
+
+def test_digital_silence_is_not_a_room_and_falls_back_to_the_configured_threshold():
+    """floor + margin off a floor of -120 dB would make dither into speech."""
+    subject = gate(fallback_db=-35)
+
+    cut_at = feed(subject, silence(0.6), tone(2, rms_db=-20), silence(4))
+
+    assert subject.floor_db == audio.SILENCE_FLOOR_DB
+    assert subject.threshold_db == -35
+    assert cut_at == pytest.approx(0.6 + 2 + 3, abs=0.25)
+
+
+def test_a_room_nothing_could_clear_falls_back_too():
+    subject = gate(fallback_db=-35)
+
+    feed(subject, hiss(1.0, rms_db=-10))
+
+    assert subject.floor_db > audio.FLOOR_MAX_DB
+    assert subject.threshold_db == -35
+
+
+def test_a_take_nobody_talked_into_never_cuts():
+    subject = gate()
+
+    cut_at = feed(subject, hiss(20, rms_db=-49))
+
+    assert (subject.spoke, subject.cut_off, cut_at) == (False, False, None)
+
+
+def test_one_thump_is_not_a_word():
+    """A chair, a keystroke: over the threshold, and over in 60 ms."""
+    subject = gate()
+
+    feed(subject, hiss(1.0, rms_db=-49), tone(0.06, rms_db=-20), hiss(1.0, rms_db=-49))
+
+    assert subject.spoke is False
+
+
+def test_a_pause_shorter_than_the_cutoff_is_not_the_end_of_your_sentence():
+    subject = gate()
+
+    cut_at = feed(
+        subject,
+        hiss(0.6, rms_db=-49),
+        tone(2, rms_db=-29),
+        hiss(2, rms_db=-49),
+        tone(2, rms_db=-29),
+        hiss(4, rms_db=-49),
+    )
+
+    assert cut_at == pytest.approx(0.6 + 2 + 2 + 2 + 3, abs=0.25)
+
+
+def test_the_room_is_found_even_when_the_take_opens_on_a_voice():
+    """Nothing is locked in until you have spoken, so a bad first half second
+    is re-read: the floor only ever goes down, and the whole take is re-judged
+    against it."""
+    subject = gate()
+
+    cut_at = feed(subject, tone(1.0, rms_db=-29), hiss(4, rms_db=-49))
+
+    assert subject.floor_db == pytest.approx(-49, abs=1.5)
+    assert subject.spoke is True
+    assert cut_at == pytest.approx(1.0 + 3, abs=0.3)
+
+
+def test_our_own_voice_is_not_the_room_and_not_you():
+    """The speakers case: the gate is armed when the announcement ends."""
+    subject = gate(armed=False)
+
+    feed(subject, tone(2.0, rms_db=-29))
+
+    assert (subject.spoke, subject.seconds) == (False, 0.0)
+
+    subject.arm()
+    cut_at = feed(subject, hiss(0.6, rms_db=-49), tone(1, rms_db=-29), hiss(4, rms_db=-49))
+
+    assert subject.floor_db == pytest.approx(-49, abs=1.5)
+    assert cut_at == pytest.approx(0.6 + 1 + 3, abs=0.25)
+
+
+def test_a_cutoff_of_zero_is_not_a_division_by_anything():
+    subject = gate(min_silence_seconds=0, calibration_seconds=0)
+
+    feed(subject, hiss(0.6, rms_db=-49), tone(0.5, rms_db=-29))
+
+    assert subject.spoke is True
 
 
 # --- recording -------------------------------------------------------------
@@ -654,3 +894,108 @@ def test_a_tracker_armed_from_the_start_is_what_it_always_was():
     assert tracker.cut_off is True
     tracker.arm()  # idempotent: nothing to forget
     assert tracker.cut_off is True
+
+
+# --- the window is time to start, not time to finish ------------------------
+#
+# End to end through the recorder, with a fake ffmpeg that reports nothing at
+# all on stderr — the room this was found in, where `silencedetect` never sees
+# a floor low enough to call silence, so the pipe is the only thing listening.
+
+
+def room_then_voice(seconds: float):
+    """Half a second of room to measure, then somebody talking into it."""
+    return hiss(0.6, rms_db=-49) + tone(seconds, rms_db=-29)
+
+
+def test_a_long_answer_is_not_cut_off_by_the_window(tmp_path):
+    """The complaint: "siento que me quedé sin tiempo".
+
+    Fifteen seconds of answer against a ten-second window used to end at ten,
+    mid-sentence. The window is time to *start* — the take ends three seconds
+    after the last word, and here that lands well past the window.
+    """
+    subject, _ = recorder(
+        [OPEN_LINE],
+        speech_timeout=0.3,
+        pcm=[(0.05, room_then_voice(15).tobytes()), (0.5, hiss(4, rms_db=-49).tobytes())],
+    )
+
+    recording = run(subject, tmp_path / "r.wav")
+
+    assert recording.reason == audio.REASON_SILENCE
+    assert recording.spoke is True
+    assert recording.seconds > 0.3
+
+
+def test_a_take_nobody_talked_into_still_closes_on_the_window(tmp_path):
+    """Unchanged, and the reason the window is still there at all."""
+    subject, _ = recorder(
+        [OPEN_LINE], speech_timeout=0.3, pcm=[(0.0, hiss(3, rms_db=-49).tobytes())]
+    )
+
+    recording = run(subject, tmp_path / "r.wav")
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    assert recording.spoke is False
+    assert recording.seconds < 2
+
+
+def test_talking_past_the_hard_cap_ends_the_take_there(tmp_path):
+    """`max_seconds` is the net, and a take that hits it still gets transcribed."""
+    subject, _ = recorder(
+        [OPEN_LINE],
+        speech_timeout=0.3,
+        max_seconds=0.6,
+        take=speech(2.0),
+        reaches_cap=True,
+        pcm=[
+            (0.05, room_then_voice(15).tobytes()),
+            (0.6, hiss(0.1, rms_db=-49).tobytes()),
+        ],
+    )
+
+    recording = run(subject, tmp_path / "r.wav")
+
+    assert recording.reason == audio.REASON_MAX
+    assert recording.spoke is True
+    assert recording.usable is True
+
+
+def test_the_first_syllable_over_the_pipe_is_reported(tmp_path):
+    """Barge-in, in the room where `silencedetect` has nothing to say."""
+    heard = asyncio.Event()
+    subject, _ = recorder(
+        [OPEN_LINE],
+        speech_timeout=0.5,
+        pcm=[(0.0, room_then_voice(1).tobytes()), (0.05, hiss(4, rms_db=-49).tobytes())],
+    )
+
+    recording = asyncio.run(subject.record(tmp_path / "r.wav", speech=heard))
+
+    assert heard.is_set() is True
+    assert recording.reason == audio.REASON_SILENCE
+
+
+def test_our_own_voice_on_the_pipe_is_not_you_starting_to_talk(tmp_path):
+    """The speakers case again, this time through the samples.
+
+    Everything piped out while `on_open` is still talking is the announcement.
+    Counting it would lift the deadline before you had said a word, and leave
+    the mic open for the whole of `max_seconds` every single time.
+    """
+    subject, _ = recorder(
+        [OPEN_LINE],
+        speech_timeout=0.3,
+        pcm=[(0.0, room_then_voice(15).tobytes()), (0.1, hiss(4, rms_db=-49).tobytes())],
+    )
+
+    async def on_open():
+        await asyncio.sleep(0.05)
+
+    recording = asyncio.run(
+        subject.record(tmp_path / "r.wav", on_open=on_open, arm_after_open=True)
+    )
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    assert recording.spoke is False
