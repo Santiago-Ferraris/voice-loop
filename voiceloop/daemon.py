@@ -604,7 +604,15 @@ class Daemon:
         return terms
 
     async def listen(self) -> Transcript | None:
-        """One take: chime, record, transcribe. `None` means the mic itself failed."""
+        """One take: chime, record, transcribe. `None` means the mic itself failed.
+
+        The take starts by taking the floor, so the whole sequence is exactly
+        this and nothing may interleave with it: **announcement finished ->
+        floor -> mic open -> "speak now" chime -> floor released -> record**.
+        Opening under a voice recorded the announcement and left the cue queued
+        behind it, and the `mic_timeout_seconds` window — which only starts once
+        `on_open` has returned — was spent on audio nobody could answer into.
+        """
         if not self.can_listen():
             return None
         mic_dir = self.state_dir / "mic"
@@ -612,9 +620,12 @@ class Daemon:
         stop = asyncio.Event()
         self._mic_stop = stop
         try:
-            recording = await self.recorder.record(
-                path, stop=stop, on_open=lambda: self.speaker.chime(self.mic_open_chime)
-            )
+            # `__aexit__` runs before any handler below, so the floor is long
+            # gone by the time one of them tries to speak.
+            async with self.speaker.floor() as floor:
+                recording = await self.recorder.record(
+                    path, stop=stop, on_open=lambda: floor.cue(self.mic_open_chime)
+                )
         except MicConsentPending as exc:
             # The one mic failure with a fix only the user can perform — and
             # they are not looking at a terminal, which is the whole premise.

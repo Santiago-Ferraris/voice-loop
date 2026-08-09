@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -80,6 +83,53 @@ def store(tmp_path):
         yield opened
 
 
+class TimedRunner:
+    """Records when each process started and finished, so overlap is measurable."""
+
+    def __init__(self, durations: dict[str, float] | None = None):
+        self.durations = durations or {}
+        self.spans: list[list] = []
+
+    async def __call__(self, argv):
+        index = len(self.spans)
+        self.spans.append([argv[0], time.monotonic(), None])
+        await asyncio.sleep(self.durations.get(argv[0], 0.0))
+        self.spans[index][2] = time.monotonic()
+        return 0
+
+    def spans_of(self, binary: str) -> list[list]:
+        """Every run of that binary, in the order they started."""
+        return [span for span in self.spans if span[0] == binary]
+
+
+def chime_file(tmp_path, name: str = "ping") -> str:
+    sound = tmp_path / f"{name}.aiff"
+    sound.write_bytes(b"fake audio")
+    return str(sound)
+
+
+class FakeFloor:
+    """The mic's hold on a `FakeSpeaker`, with the same cue-then-release shape."""
+
+    def __init__(self, speaker: "FakeSpeaker"):
+        self._speaker = speaker
+        self._held = True
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    async def cue(self, name) -> bool:
+        try:
+            self._speaker.chimes.append(name)
+            return True
+        finally:
+            self.release()
+
+    def release(self) -> None:
+        self._held = False
+
+
 class FakeSpeaker:
     """Records what would have been said, in order, chimes included."""
 
@@ -89,6 +139,7 @@ class FakeSpeaker:
         self.said: list = []
         self.spoken: list[str] = []
         self.chimes: list = []
+        self.floors = 0
 
     async def announce(self, announcement):
         self.said.append(announcement)
@@ -100,6 +151,15 @@ class FakeSpeaker:
     async def chime(self, name) -> bool:
         self.chimes.append(name)
         return True
+
+    @contextlib.asynccontextmanager
+    async def floor(self):
+        self.floors += 1
+        floor = FakeFloor(self)
+        try:
+            yield floor
+        finally:
+            floor.release()
 
     @property
     def texts(self) -> list[str]:

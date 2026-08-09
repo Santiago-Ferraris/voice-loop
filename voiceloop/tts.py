@@ -10,6 +10,9 @@ project exists to avoid.
 
 Within a single announcement, though, the chime and the voice deliberately
 overlap. See `CHIME_HEAD_SECONDS`.
+
+The microphone takes that same lock, from the outside, through `floor()`. See
+`Floor` for why "wait your turn" is not enough there.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
-from typing import Awaitable, Callable, Sequence
+from typing import AsyncIterator, Awaitable, Callable, Sequence
 
 SYSTEM_VOICE = "system"
 
@@ -61,6 +64,60 @@ def resolve_sound(name: str | None) -> Path | None:
             if path.is_file():
                 return path
     return None
+
+
+class Floor:
+    """The speaker held silent while the microphone opens.
+
+    Two things the mic needs that a plain `chime()` cannot give it:
+
+    * **Nothing may be talking when capture starts.** `say` is spoken through
+      the same speakers the mic listens to, so a recording that opens under an
+      announcement records the announcement — and then answers it.
+    * **The "speak now" chime must not queue behind that announcement.**
+      `chime()` asks for the lock; an announcement holds it across its voice
+      *and* its own chime's ring-out. So the cue that says the mic is live
+      arrived after the mic had already been live for seconds, which read as a
+      chime that had stopped working.
+
+    So the mic takes the floor *before* it spawns anything, plays its cue on
+    the lock it is already holding, and hands the floor back the moment capture
+    is under way. Held across the open, never across the take: a recording runs
+    up to a minute and the busy-mode hotkey must not sit behind it.
+    """
+
+    def __init__(self, speaker: "Speaker"):
+        self._speaker = speaker
+        self._held = True
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    async def cue(self, name: str | None) -> bool:
+        """Play the mic-open chime and step aside — in that order.
+
+        Releasing first would put the cue back in the queue it was taken out
+        of, which is the bug this exists for.
+        """
+        try:
+            return await self._chime(name)
+        finally:
+            self.release()
+
+    async def _chime(self, name: str | None) -> bool:
+        sound = resolve_sound(name)
+        if sound is None:
+            return False
+        if not self._held:
+            return await self._speaker.chime(name)
+        return await self._speaker._play_sound(sound)
+
+    def release(self) -> None:
+        """Idempotent: `floor()` releases whatever `cue()` did not."""
+        if self._held:
+            self._held = False
+            self._speaker._lock.release()
 
 
 class Speaker:
@@ -122,6 +179,23 @@ class Speaker:
             return False
         async with self._lock:
             return await self._play_sound(sound)
+
+    @contextlib.asynccontextmanager
+    async def floor(self) -> AsyncIterator[Floor]:
+        """Wait out whatever is being said, then hold the room for the caller.
+
+        The microphone's entry point: by the time this yields, no `say` and no
+        `afplay` of ours is running, and none can start until the floor is
+        released. Which is what "the mic does not open while the announcement
+        is still talking" means, on every path — including the hotkey, which
+        opens a mic from a task of its own while `_announce` is mid-sentence.
+        """
+        await self._lock.acquire()
+        floor = Floor(self)
+        try:
+            yield floor
+        finally:
+            floor.release()
 
     async def speak(self, text: str) -> bool:
         if not (text or "").strip():

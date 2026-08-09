@@ -199,6 +199,18 @@ def test_the_chime_waits_until_the_device_is_actually_capturing(tmp_path):
     assert order == ["chime"]
 
 
+def test_the_window_only_starts_once_the_chime_is_out_of_the_way(tmp_path):
+    """`mic_timeout_seconds` is time to answer in, not time the cue spent ringing."""
+    async def on_open():
+        await asyncio.sleep(0.3)
+
+    subject, _ = recorder([OPEN_LINE], speech_timeout=0.4)
+    recording = run(subject, tmp_path / "r.wav", on_open=on_open)
+
+    assert recording.reason == audio.REASON_TIMEOUT
+    assert recording.seconds >= 0.7
+
+
 def test_silence_ends_the_take(tmp_path):
     subject, _ = recorder([OPEN_LINE, silence_end(1.0), silence_start(2.5)])
 
