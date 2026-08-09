@@ -271,15 +271,30 @@ editing it is another reason to re-run the installer.
 
 ## Answering out loud
 
-The mic opens by itself after every announcement, and by hotkey whenever you want it. It is a
-**toggle**, not push-to-talk: it closes on its own after a beat of silence, or when you press
-the key again. Say nothing and the item simply stays in `pendings` — the queue moves on.
+**The mic is not a window you have to catch.** It opens *with* the chime, stays open under
+every word of whatever is being said, and keeps listening for `announce.mic_grace_seconds`
+(ten) after the last one. Start talking late and it waits for you to finish; start talking
+early and you are talking over it, which is allowed. Say nothing and the item simply stays in
+`pendings` — the queue moves on. It closes with a chime of its own (`mic_close_chime`), which
+is the only way to know it is no longer listening.
 
-**The heads-up mic is shorter** (`announce.alert_mic_timeout_seconds`, four seconds) because it
-is asking a question with two words for an answer. Everything below works in it — it is a
-microphone, not a menu — with one difference: a **sentence** is read back rather than delivered.
-Nothing has been said about that window yet, so a sentence there is as likely to be a word to
-somebody in the room as an answer for a window you have not heard about.
+So the announcement chime no longer means "your turn now". It means *"I am about to say
+something, and you can talk to me"*.
+
+**Talking over it** depends on where the sound is coming out, which voice-loop reads off the
+system rather than asking you to configure:
+
+- **Headphones** (bluetooth, the jack, anything whose name says headset) — the mic cannot hear
+  `say` at all, so your first syllable kills the sentence mid-word and it listens instead.
+- **Speakers** — the mic *does* hear `say`, so nothing is interrupted (it would shut itself up
+  every time it opened its mouth) and our own words are subtracted from the transcript instead.
+  We know exactly what `say` was given, so recognising it coming back is a string comparison.
+  See `voiceloop/echo.py` for the three rules that keep it from eating what you actually said.
+
+Everything below works in the heads-up mic — it is a microphone, not a menu — with one
+difference: a **sentence** is read back rather than delivered. Nothing has been said about that
+window yet, so a sentence there is as likely to be a word to somebody in the room as an answer
+for a window you have not heard about.
 
 | You say | What happens |
 |---|---|

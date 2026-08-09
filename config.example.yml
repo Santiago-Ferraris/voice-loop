@@ -98,19 +98,22 @@ announce:
   # Blocking events speak and open the mic; milestones only chime.
   milestone_chime: Glass
   blocking_chime: Ping
-  # Played when the mic is actually capturing, and again when it closes.
+  # Played when a mic opens with nothing to say first, and — always, and always
+  # a different sound — when any mic closes. A mic that shuts in silence is a
+  # mic you cannot tell is still open, which is the whole "when do I talk?"
+  # problem. When there *is* something to say, the chime of the announcement is
+  # the open cue: it now means "I am about to talk, and you can talk to me".
   mic_open_chime: Tink
   mic_close_chime: Pop
   # Played when the busy-mode hotkey flips, in either direction.
   busy_chime: Submarine
-  # How long the mic waits for you to start talking when you are answering a
-  # window. Say nothing and the item stays pending; the queue moves on.
+  # How long a mic that opened on its own waits for you to start talking.
   mic_timeout_seconds: 8
-  # The same, for the mic that opens on the heads-up ("Nuevo evento de X"). It
-  # is asking a question with two words for an answer — "dámelo" or "después" —
-  # so it is deliberately short: if you have not started by then, you are not
-  # there, and the item quietly stays in the queue.
-  alert_mic_timeout_seconds: 4
+  # How long a mic that opened *under a sentence* stays open once that sentence
+  # ends. It is not a window you have to catch: capture starts before the
+  # chime, runs under every word, and only then does this start counting. Start
+  # talking inside it and it waits for you to finish.
+  mic_grace_seconds: 10
   # Claude's own Notification events. Two different things arrive through this
   # one hook and the payload says which: a permission prompt ("Claude needs your
   # permission to use Bash") is a window that cannot move until you answer, and
@@ -120,6 +123,21 @@ announce:
   # no entry in the queue. Permission prompts still speak, and so does any
   # wording this does not recognise.
   notification_events: true
+
+# Talking over the assistant while it is talking.
+#
+# The mic is open the whole time a sentence is being spoken, which only works
+# if we can tell your voice from ours. On headphones there is nothing to tell
+# apart — the microphone cannot hear `say` at all — so the first syllable you
+# speak kills the sentence mid-word. On speakers the microphone hears us, so
+# barge-in is off and the echo is subtracted from the transcript instead: we
+# know exactly what `say` was given, so recognising it coming back is a string
+# comparison. Which of the two is in use is read from the system, not from
+# here, because headphones come and go through the day.
+barge_in:
+  enabled: true
+  # How long the detected audio output is trusted before it is looked up again.
+  refresh_seconds: 30
 
 delivery:
   auto_enter: true

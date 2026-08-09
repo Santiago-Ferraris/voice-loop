@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Sequence
 
@@ -39,16 +40,36 @@ CHIME_HEAD_SECONDS = 0.25
 SOUNDS_DIRS = ("/System/Library/Sounds", "/Library/Sounds")
 SOUND_SUFFIXES = (".aiff", ".aif", ".wav", ".m4a")
 
-Runner = Callable[[Sequence[str]], Awaitable[int]]
+Runner = Callable[..., Awaitable[int]]
 
 
-async def run_process(argv: Sequence[str]) -> int:
+async def run_process(argv: Sequence[str], *, register=None) -> int:
+    """Run a child to completion, handing it to `register` while it lives.
+
+    `register` is what makes a sentence interruptible: `say` only stops when
+    the process is killed, and nothing above this line has the handle. Runners
+    that do not take it — every fake in the suite — simply cannot be cut off,
+    which is the truth about them rather than a silent no-op.
+    """
     process = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    return await process.wait()
+    if register is not None:
+        register(process)
+    try:
+        return await process.wait()
+    finally:
+        if register is not None:
+            register(None)
+
+
+def accepts_register(runner) -> bool:
+    try:
+        return "register" in inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def resolve_sound(name: str | None) -> Path | None:
@@ -101,17 +122,36 @@ class Floor:
         of, which is the bug this exists for.
         """
         try:
-            return await self._chime(name)
+            return await self.play(name)
         finally:
             self.release()
 
-    async def _chime(self, name: str | None) -> bool:
+    async def play(self, name: str | None) -> bool:
+        """The same chime, without stepping aside — for a mic that keeps talking."""
         sound = resolve_sound(name)
         if sound is None:
             return False
         if not self._held:
             return await self._speaker.chime(name)
         return await self._speaker._play_sound(sound)
+
+    async def say(self, text: str) -> bool:
+        """Speak on the floor already held, so the mic stays open under it."""
+        if not self._held:
+            return await self._speaker.speak(text)
+        return await self._speaker._speak(text)
+
+    async def announce(self, announcement) -> None:
+        """The chime and the voice, on the floor already held.
+
+        This is the announcement that *opens* the microphone rather than
+        preceding it: the take is already running, the chime is its cue, and
+        the voice rings under an open mic from the first syllable.
+        """
+        if not self._held:
+            await self._speaker.announce(announcement)
+            return
+        await self._speaker._announce(announcement)
 
     def release(self) -> None:
         """Idempotent: `floor()` releases whatever `cue()` did not."""
@@ -135,9 +175,12 @@ class Speaker:
         self.rate = rate
         self.chime_head = max(0.0, float(chime_head))
         self._runner = runner or run_process
+        self._registers = accepts_register(self._runner)
         self._say = say_binary
         self._play = play_binary
         self._lock = asyncio.Lock()
+        self._talking = None
+        self.interruptions = 0
 
     @classmethod
     def from_config(cls, config, *, runner: Runner | None = None) -> "Speaker":
@@ -161,11 +204,33 @@ class Speaker:
 
     async def _run(self, argv: Sequence[str]) -> int:
         try:
+            if self._registers:
+                return await self._runner(argv, register=self._register)
             return await self._runner(argv)
         except (OSError, asyncio.CancelledError):
             raise
         except Exception:  # noqa: BLE001 - a dead speaker must not stall the queue
             return -1
+
+    def _register(self, process) -> None:
+        self._talking = process
+
+    async def interrupt(self) -> bool:
+        """Stop the sentence being spoken right now. Barge-in's only mechanic.
+
+        `say` reads its argument to the end and takes no signal to stop short
+        of being killed, so this is a `terminate()` on the child — which is
+        also why it can only work through a runner that hands the process over
+        (see `run_process`). Returns whether there was anything to cut off.
+        """
+        process = self._talking
+        self._talking = None
+        if process is None:
+            return False
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.terminate()
+        self.interruptions += 1
+        return True
 
     async def _play_sound(self, sound: Path) -> bool:
         try:
@@ -201,10 +266,16 @@ class Speaker:
         if not (text or "").strip():
             return False
         async with self._lock:
-            try:
-                return await self._run(self.say_argv(text)) == 0
-            except OSError:
-                return False
+            return await self._speak(text)
+
+    async def _speak(self, text: str) -> bool:
+        """The voice itself, on a lock the caller already holds."""
+        if not (text or "").strip():
+            return False
+        try:
+            return await self._run(self.say_argv(text)) == 0
+        except OSError:
+            return False
 
     async def announce(self, announcement) -> None:
         """Chime, then speak over the end of it — never overlapping another item.
@@ -220,16 +291,25 @@ class Speaker:
         if announcement.silent:
             await self.chime(announcement.chime)
             return
-        sound = resolve_sound(announcement.chime)
         async with self._lock:
-            ringing = (
-                asyncio.ensure_future(self._play_sound(sound)) if sound is not None else None
-            )
-            try:
-                if ringing is not None:
-                    await asyncio.sleep(self.chime_head)
-                await self._run(self.say_argv(announcement.text))
-            finally:
-                if ringing is not None:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await ringing
+            await self._announce(announcement)
+
+    async def _announce(self, announcement) -> None:
+        """The chime and the voice, on a lock the caller already holds."""
+        if announcement.silent:
+            sound = resolve_sound(announcement.chime)
+            if sound is not None:
+                await self._play_sound(sound)
+            return
+        sound = resolve_sound(announcement.chime)
+        ringing = (
+            asyncio.ensure_future(self._play_sound(sound)) if sound is not None else None
+        )
+        try:
+            if ringing is not None:
+                await asyncio.sleep(self.chime_head)
+            await self._run(self.say_argv(announcement.text))
+        finally:
+            if ringing is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await ringing

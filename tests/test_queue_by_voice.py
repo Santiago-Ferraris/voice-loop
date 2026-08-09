@@ -20,8 +20,7 @@ from voiceloop.store import STATE_PENDING, Store
 from voiceloop.stt.mock import MockStt
 from voiceloop.summarize import Summarizer
 
-from conftest import FakeSpeaker, write_roster
-from test_reply_cycle import TTY, RecordingDelivery, StubRecorder
+from conftest import TTY, FakeSpeaker, RecordingDelivery, StubRecorder, write_roster
 
 
 class StubSummarizer(Summarizer):

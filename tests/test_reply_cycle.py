@@ -9,30 +9,28 @@ gate and the real keystroke builders — with nothing but the two ends faked.
 from __future__ import annotations
 
 import asyncio
-import time
-from pathlib import Path
 
-import pytest
-
-from voiceloop import iterm
 from voiceloop.announce import Announcement
-from voiceloop.audio import AudioUnavailable, MicConsentPending, Recording
+from voiceloop.audio import AudioUnavailable, MicConsentPending
 from voiceloop.daemon import REPLY_DELIVERED, REPLY_FAILED, REPLY_PENDING, Daemon
 from voiceloop.events import Event
-from voiceloop.milestones import MilestoneWatcher
 from voiceloop.store import (
     STATE_DELIVERED,
     STATE_PENDING,
     STATE_QUEUED,
     STATE_RESOLVED,
-    Store,
 )
-from voiceloop.stt.mock import MockStt
 from voiceloop.tts import Speaker
 
-from conftest import FakeSpeaker, TimedRunner, chime_file, write_roster
-
-TTY = "/dev/ttys012"
+from conftest import (
+    TTY,
+    RecordingDelivery,
+    StubRecorder,
+    TimedRecorder,
+    TimedRunner,
+    chime_file,
+    write_roster,
+)
 
 QUESTION = {
     "tool": "AskUserQuestion",
@@ -108,115 +106,6 @@ EXPRESSION = {
         ]
     },
 }
-
-
-class StubRecorder:
-    """A mic that always captures something, unless told otherwise."""
-
-    binary = "ffmpeg"
-    device = ":0"
-    available = True
-
-    def __init__(self, *, spoke: bool = True, error: Exception | None = None):
-        self.spoke = spoke
-        self.error = error
-        self.takes = 0
-        # How long each take was given, in order — the heads-up mic gets less.
-        self.windows: list = []
-
-    async def record(self, destination, *, stop=None, on_open=None, speech_timeout=None):
-        self.takes += 1
-        self.windows.append(speech_timeout)
-        if self.error is not None:
-            raise self.error
-        path = Path(destination)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"\0" * 200_000)
-        if on_open is not None:
-            await on_open()
-        return Recording(path=path, seconds=1.0, spoke=self.spoke, reason="silence")
-
-
-class TimedRecorder(StubRecorder):
-    """A mic that remembers when it was actually spawned."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.started_at: float | None = None
-
-    async def record(self, destination, *, stop=None, on_open=None, speech_timeout=None):
-        self.started_at = time.monotonic()
-        return await super().record(
-            destination, stop=stop, on_open=on_open, speech_timeout=speech_timeout
-        )
-
-
-class RecordingDelivery:
-    """Everything that would have gone into someone else's window."""
-
-    def __init__(self, *, alive: bool = True):
-        self._alive = alive
-        self.sent: list[tuple] = []
-        self.focused: list[str] = []
-
-    def alive(self, tty: str) -> bool:
-        return self._alive
-
-    def _guard(self, tty: str) -> None:
-        if not self._alive:
-            raise iterm.SessionGone(f"no iTerm2 session on {tty}")
-
-    def send_text(self, tty, text):
-        self._guard(tty)
-        self.sent.append(("text", tty, text))
-
-    def send_choice(self, tty, index):
-        self._guard(tty)
-        self.sent.append(("choice", tty, index))
-
-    def send_choices(self, tty, indexes):
-        self._guard(tty)
-        self.sent.append(("choices", tty, tuple(indexes)))
-
-    def send_menu_text(self, tty, index, text):
-        self._guard(tty)
-        self.sent.append(("menu_text", tty, index, text))
-
-    def focus(self, tty):
-        self.focused.append(tty)
-        return True
-
-
-@pytest.fixture
-def build(config, tmp_path):
-    roster = tmp_path / "sessions"
-    roster.mkdir()
-    write_roster(roster, sessionId="session-1", name="indice", kind="interactive")
-    made: list[Daemon] = []
-
-    def factory(
-        replies, *, recorder=None, delivery=None, speaker=None, confidence=0.99, **kwargs
-    ):
-        engine = MockStt(replies=list(replies), confidence=confidence)
-        subject = Daemon(
-            config,
-            store=Store(tmp_path / f"queue{len(made)}.db"),
-            speaker=speaker or FakeSpeaker(),
-            watcher=MilestoneWatcher(),
-            roster_dir=roster,
-            recorder=recorder or StubRecorder(),
-            stt=engine,
-            delivery=delivery or RecordingDelivery(),
-            **kwargs,
-        )
-        made.append(subject)
-        return subject
-
-    try:
-        yield factory
-    finally:
-        for subject in made:
-            subject.store.close()
 
 
 def queue(daemon: Daemon, payload=None, *, kind="menu", session="session-1", ts=None) -> str:
@@ -651,14 +540,24 @@ def test_the_heads_up_says_which_window_and_not_what_it_wants(build):
     assert daemon.delivery.sent == []
 
 
-def test_the_heads_up_mic_is_shorter_than_the_one_you_answer_in(build):
+def test_the_heads_up_mic_opens_with_the_chime_and_outlives_the_sentence(build):
+    """The v3 microphone: no window to catch, a grace period to finish in.
+
+    The old shape opened four seconds *after* the announcement, which is how a
+    morning produced three "mic heard nothing" in a row — the mic had opened
+    and shut again before anyone got a word out.
+    """
     daemon = build(["dámelo", "la dos"])
     queue(daemon, QUESTION)
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.recorder.windows == [daemon.alert_mic_timeout, None]
-    assert daemon.alert_mic_timeout == 4
+    # Both takes ran under a voice, so both get the grace and not the timeout.
+    assert daemon.recorder.windows == [daemon.mic_grace, daemon.mic_grace]
+    assert daemon.mic_grace == 10
+    # And both ignored what they heard until the voice stopped: on speakers
+    # every syllable of it comes back down the microphone.
+    assert daemon.recorder.armings == [True, True]
 
 
 def test_three_windows_blocking_at_once_get_three_heads_ups(build):
@@ -770,13 +669,22 @@ def test_nothing_is_counted_down_when_nobody_answered(build):
     assert not any("Queda" in said for said in daemon.speaker.spoken)
 
 
-def test_the_mic_chimes_open_and_closed_around_the_take(build):
+def test_the_heads_up_chime_is_the_mic_opening_and_the_close_has_its_own(build):
+    """One chime opens the take; a different one says it is over.
+
+    The announcement's chime no longer means "your turn now" — the take is
+    already running when it rings — so the only cue left that the mic has shut
+    is the closing one, and it has to be a sound of its own. Closing in
+    silence is the "no sé cuándo tengo que hablar" complaint, verbatim.
+    """
     daemon = build([], recorder=StubRecorder(spoke=False))
     queue(daemon, QUESTION)
 
     asyncio.run(daemon.announce_next())
 
-    assert daemon.speaker.chimes == ["Tink", "Pop"]
+    assert daemon.speaker.chimes == ["Pop"]
+    assert [item.chime for item in daemon.speaker.said] == ["Ping"]
+    assert daemon.mic_open_chime != daemon.mic_close_chime
 
 
 def test_the_mic_does_not_open_under_a_voice_that_is_still_talking(build, tmp_path):
