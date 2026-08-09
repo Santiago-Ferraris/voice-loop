@@ -28,7 +28,18 @@ from voiceloop.runtime import fingerprint, is_tcc_protected, plist_paths
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL = REPO_ROOT / "install.sh"
 UNINSTALL = REPO_ROOT / "uninstall.sh"
-PLIST_RELATIVE = Path("Library") / "LaunchAgents" / "com.voiceloop.daemon.plist"
+# The suite installs an agent of its own, under a label nothing else answers
+# to. `launchctl` addresses agents in `gui/$UID` — a domain that does **not**
+# follow $HOME — so a throwaway HOME is not isolation: without this, every run
+# of this file booted out the agent of whoever was using the machine, which is
+# a service stopping under somebody mid-sentence. Belt and braces: the label is
+# ours *and* `launchctl` itself is stubbed out by default.
+TEST_LABEL = "com.voiceloop.daemon.test"
+PLIST_RELATIVE = Path("Library") / "LaunchAgents" / f"{TEST_LABEL}.plist"
+
+# Answers to everything, does nothing, and touches no domain at all. Tests that
+# care what launchctl was asked pass their own stub through `extra_env`.
+INERT_LAUNCHCTL = "#!/bin/sh\nexit 0\n"
 
 # Everything install.sh reads out of a clone. Copied, rather than pointed at,
 # so a test can put a clone where macOS would hide it.
@@ -77,6 +88,16 @@ def short_state_dir(clone):
         yield directory
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def never_the_real_launchctl(tmp_path_factory, monkeypatch):
+    """No test in this file may reach the user's own launchd domain."""
+    stub = tmp_path_factory.mktemp("launchctl") / "launchctl"
+    stub.write_text(INERT_LAUNCHCTL, encoding="utf-8")
+    stub.chmod(0o755)
+    monkeypatch.setenv("VOICE_LOOP_LAUNCHCTL", str(stub))
+    monkeypatch.setenv("VOICE_LOOP_LABEL", TEST_LABEL)
 
 
 def run_script(script: Path, home: Path, *args, extra_env=None) -> subprocess.CompletedProcess:
@@ -555,7 +576,7 @@ def test_install_reports_the_pid_when_the_agent_answers(home, clone, short_state
     result = install_clone(clone, home, "--no-venv", extra_env=launchctl)
 
     assert result.returncode == 0, result.stderr
-    assert "com.voiceloop.daemon up (pid" in result.stdout
+    assert f"{TEST_LABEL} up (pid" in result.stdout
     assert "voice-loop installed." in result.stdout
 
 
@@ -672,3 +693,37 @@ def test_uninstall_removes_the_runtime(home, clone):
     assert result.returncode == 0, result.stderr
     assert not runtime.exists()
     assert f"removed {runtime}" in result.stdout
+
+
+# --- the label, and why it is a variable -----------------------------------
+
+
+def test_the_agent_this_suite_installs_is_not_the_one_you_are_running():
+    """`launchctl` addresses `gui/$UID`, which does not follow $HOME.
+
+    So installing into a throwaway HOME is not isolation: `bootout` reached the
+    real user's agent and stopped it, three times, on a machine somebody was
+    using at the time. The label has to be ours.
+    """
+    from voiceloop.runtime import DEFAULT_LABEL
+
+    assert TEST_LABEL != DEFAULT_LABEL
+
+
+def test_the_label_is_what_install_writes_into_the_plist(home, clone):
+    install_clone(clone, home, "--no-venv", "--no-launchd")
+
+    body = plist_body(home)
+
+    assert f"<string>{TEST_LABEL}</string>" in body
+    assert "<string>com.voiceloop.daemon</string>" not in body
+
+
+def test_the_renderer_defaults_to_the_real_label(repo_root):
+    from voiceloop.runtime import DEFAULT_LABEL, render_plist
+
+    template = (repo_root / "launchd" / "com.voiceloop.daemon.plist.template").read_text()
+    body = render_plist(template, runtime="/r", home="/h", state_dir="/s")
+
+    assert f"<string>{DEFAULT_LABEL}</string>" in body
+    assert "__LABEL__" not in body

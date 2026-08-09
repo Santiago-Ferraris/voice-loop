@@ -125,12 +125,23 @@ def plist_paths(body: str) -> list[str]:
     return found
 
 
-def render_plist(template: str, *, runtime: Path | str, home: Path | str, state_dir: Path | str) -> str:
+DEFAULT_LABEL = "com.voiceloop.daemon"
+
+
+def render_plist(
+    template: str,
+    *,
+    runtime: Path | str,
+    home: Path | str,
+    state_dir: Path | str,
+    label: str = DEFAULT_LABEL,
+) -> str:
     """Substitute the launchd template and refuse to hand launchd a path it cannot use."""
     body = (
         template.replace("__RUNTIME__", str(runtime))
         .replace("__HOME__", str(home))
         .replace("__STATE_DIR__", str(state_dir))
+        .replace("__LABEL__", str(label or DEFAULT_LABEL))
     )
     offenders = sorted({path for path in plist_paths(body) if is_tcc_protected(path, home)})
     if offenders:
@@ -284,7 +295,11 @@ def stop_daemon(socket_path: Path | str, timeout: float = 5.0) -> bool:
 def _cmd_render_plist(options: argparse.Namespace) -> int:
     template = Path(options.template).read_text(encoding="utf-8")
     body = render_plist(
-        template, runtime=options.runtime, home=options.home, state_dir=options.state_dir
+        template,
+        runtime=options.runtime,
+        home=options.home,
+        state_dir=options.state_dir,
+        label=options.label,
     )
     if options.output == "-":
         sys.stdout.write(body)
@@ -326,6 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--runtime", required=True)
     render.add_argument("--home", required=True)
     render.add_argument("--state-dir", required=True)
+    render.add_argument("--label", default=DEFAULT_LABEL)
     render.set_defaults(func=_cmd_render_plist)
 
     manifest = sub.add_parser("write-manifest")

@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Rendered by install.sh: __RUNTIME__, __HOME__ and __STATE_DIR__ are
-  substituted and the result is written to ~/Library/LaunchAgents/.
+  Rendered by install.sh: __LABEL__, __RUNTIME__, __HOME__ and __STATE_DIR__
+  are substituted and the result is written to ~/Library/LaunchAgents/.
+
+  __LABEL__ is `com.voiceloop.daemon` unless VOICE_LOOP_LABEL says otherwise.
+  It is a variable for one reason: `launchctl` addresses agents by label in
+  `gui/$UID`, a domain that does **not** follow $HOME. A test suite that
+  installs into a throwaway HOME therefore still boots the *real* agent out —
+  which is exactly what happened, three times, to a machine somebody was
+  using. Tests set their own label so a stray `bootout` cannot reach it.
 
   __RUNTIME__ is the installed copy under ~/.local/share/voice-loop, never the
   git clone: macOS TCC keeps LaunchAgents out of ~/Documents, ~/Desktop and
@@ -13,7 +20,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.voiceloop.daemon</string>
+  <string>__LABEL__</string>
 
   <key>ProgramArguments</key>
   <array>

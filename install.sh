@@ -57,7 +57,11 @@ ENV_FILE="${VOICE_LOOP_ENV_FILE:-$CONFIG_DIR/env}"
 RUNTIME="${VOICE_LOOP_RUNTIME_DIR:-$HOME/.local/share/voice-loop}"
 LAUNCHCTL="${VOICE_LOOP_LAUNCHCTL:-launchctl}"
 STARTUP_TIMEOUT="${VOICE_LOOP_STARTUP_TIMEOUT:-25}"
-PLIST_LABEL=com.voiceloop.daemon
+# `launchctl` addresses agents in `gui/$UID`, a domain that does not follow
+# $HOME. So a test suite installing into a throwaway HOME would still boot the
+# real user's agent out — which is what it did. The label is a variable so a
+# test can own one that nothing else answers to.
+PLIST_LABEL="${VOICE_LOOP_LABEL:-com.voiceloop.daemon}"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST="$PLIST_DIR/$PLIST_LABEL.plist"
 
@@ -157,11 +161,12 @@ fi
 # any path in it sits somewhere launchd would be denied.
 mkdir -p "$PLIST_DIR"
 "$PY" -m voiceloop.runtime render-plist \
-  --template "$REPO/launchd/$PLIST_LABEL.plist.template" \
+  --template "$REPO/launchd/com.voiceloop.daemon.plist.template" \
   --output "$PLIST" \
   --runtime "$RUNTIME" \
   --home "$HOME" \
-  --state-dir "$STATE_DIR"
+  --state-dir "$STATE_DIR" \
+  --label "$PLIST_LABEL"
 chmod 644 "$PLIST"
 
 "$PY" -m voiceloop.runtime write-manifest \
