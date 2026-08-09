@@ -37,10 +37,22 @@ NUMBER_WORDS = (
 MAX_OPTIONS = 8
 MAX_LABEL_CHARS = 70
 MAX_MESSAGE_CHARS = 160
+MAX_SPOKEN_LABEL_WORDS = 5
+
+# A label ending on one of these was cut mid-phrase, and they say nothing alone.
+DANGLING_WORDS = frozenset({
+    "de", "del", "la", "el", "los", "las", "un", "una", "unos", "unas", "y", "o",
+    "u", "a", "al", "en", "con", "para", "por", "que", "sin", "su", "sus", "lo",
+    "como", "desde", "sobre", "entre",
+})
 
 _INNER_HYPHEN = re.compile(r"(?<=\w)-(?=\w)")
 _WHITESPACE = re.compile(r"\s+")
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+# Written for the eye, not the ear: "(Recomendado)", "[beta]", and everything
+# hanging off a dash — "Postgres — ya corre en staging".
+_ASIDE = re.compile(r"\s*[\(\[\{][^)\]\}]*[\)\]\}]")
+_TRAILING_CLAUSE = re.compile(r"\s*(?:[;—–]|\s-\s).*$")
 
 
 @dataclass(frozen=True)
@@ -155,12 +167,29 @@ def _menu_options(options: Any) -> list[str]:
     return labels
 
 
+def short_label(label: str) -> str:
+    """A menu option the way four of them in a row have to sound.
+
+    Read whole, four options are twenty-five seconds of audio for a decision
+    that takes five, and "(Recomendado)" is pure noise spoken. So asides go,
+    what hangs off a dash goes, and what is left is cut to its first few words.
+
+    Nothing is lost by it: the *full* label is still what a spoken keyword is
+    matched against, and "explicame la dos" still reads the whole thing out.
+    """
+    core = normalize(_TRAILING_CLAUSE.sub("", normalize(_ASIDE.sub(" ", str(label or "")))))
+    words = core.split(" ")[:MAX_SPOKEN_LABEL_WORDS]
+    while words and words[-1].lower().strip(".,;:") in DANGLING_WORDS:
+        words.pop()
+    return " ".join(words) or normalize(str(label or ""))
+
+
 def enumerate_options(labels: Sequence[str], *, multi_select: bool = False) -> str:
     """'Opciones: uno: …, dos: …' — numbered out loud, because that is the answer."""
     if not labels:
         return ""
     enumerated = ", ".join(
-        f"{number_word(index)}: {_clip(str(label), MAX_LABEL_CHARS)}"
+        f"{number_word(index)}: {_clip(short_label(label), MAX_LABEL_CHARS)}"
         for index, label in enumerate(labels[:MAX_OPTIONS], start=1)
     )
     lead = "Podés elegir varias" if multi_select else "Opciones"

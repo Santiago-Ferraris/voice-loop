@@ -70,6 +70,25 @@ TWO_QUESTIONS = {
 
 PLAN = {"tool": "ExitPlanMode", "tool_input": {"plan": "## Migrar el índice\n\n1. Nada\n"}}
 
+# The live one, verbatim: four labels read whole are twenty-five seconds.
+HOTKEYS = {
+    "tool": "AskUserQuestion",
+    "tool_input": {
+        "questions": [
+            {
+                "question": "¿Cómo seguimos con las hotkeys?",
+                "options": [
+                    {
+                        "label": "Probalo sin hotkeys primero (Recomendado)",
+                        "description": "No hace falta tocar las Command Line Tools.",
+                    },
+                    {"label": "Actualizar Command Line Tools"},
+                ],
+            }
+        ]
+    },
+}
+
 
 class StubRecorder:
     """A mic that always captures something, unless told otherwise."""
@@ -236,6 +255,26 @@ def test_free_text_on_a_question_goes_to_the_row_past_the_options(build):
     answer(daemon, item)
 
     assert daemon.delivery.sent == [("menu_text", TTY, 3, "ninguna de las dos, usá duckdb")]
+
+
+def test_an_option_is_read_short_and_answered_by_what_was_heard(build):
+    """Shortening the labels must not put the answer out of reach."""
+    daemon = build(["probalo sin hotkeys primero"])
+    queue(daemon, HOTKEYS)
+
+    asyncio.run(daemon.announce_next())
+
+    assert "Recomendado" not in daemon.speaker.texts[0]
+    assert daemon.delivery.sent == [("choice", TTY, 1)]
+
+
+def test_the_full_label_is_still_there_for_anyone_who_asks(build):
+    daemon = build(["explicame la uno", "uno"])
+    item = queue(daemon, HOTKEYS)
+
+    answer(daemon, item)
+
+    assert "No hace falta tocar las Command Line Tools." in daemon.speaker.spoken
 
 
 def test_each_question_of_a_multi_question_menu_is_asked_in_turn(build):

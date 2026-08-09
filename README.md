@@ -270,6 +270,13 @@ the key again. Say nothing and the item simply stays in `pendings` — the queue
 | "dame los pendientes" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
 | "estado" / "cómo venimos" | Windows open, how many are working, how many are waiting on you |
 
+**Menus are read short.** A question plus its labels, and the labels only as far as they say
+something: "(Recomendado)", "[beta]" and anything hanging off a dash are dropped, and what is
+left is cut to its first few words. Four labels read whole are twenty-five seconds of audio for a
+decision that takes five. Nothing goes out of reach — "explicame la dos" reads the option in
+full, and a spoken keyword is still matched against the *whole* label, whichever part of it you
+say back.
+
 **Read-backs.** A transcript the recognizer was unsure about, or one matching
 `delivery.confirm_if_matches`, is read back to you before it is sent. Say "dale" to send it, "no"
 to drop it, or just say something else — that replaces it.

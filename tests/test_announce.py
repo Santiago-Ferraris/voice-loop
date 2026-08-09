@@ -96,6 +96,41 @@ def test_menu_options_are_enumerated_as_words():
     )
 
 
+@pytest.mark.parametrize(
+    "label, spoken",
+    [
+        ("Probalo sin hotkeys primero (Recomendado)", "Probalo sin hotkeys primero"),
+        ("Actualizar Command Line Tools", "Actualizar Command Line Tools"),
+        ("Postgres — ya corre en staging", "Postgres"),
+        ("Migrar [beta] ahora", "Migrar ahora"),
+        ("Adaptar a Hammerspoon; es lo más rápido", "Adaptar a Hammerspoon"),
+        ("Migrar la base de datos vieja a Postgres", "Migrar la base de datos"),
+        ("(Recomendado)", "(Recomendado)"),
+        ("", ""),
+    ],
+)
+def test_a_label_is_shortened_before_it_is_spoken(label, spoken):
+    assert announce.short_label(label) == spoken
+
+
+def test_four_options_are_read_short_not_whole():
+    """The live case: twenty-five seconds of audio for a five-second decision."""
+    labels = [
+        "Probalo sin hotkeys primero (Recomendado)",
+        "Actualizar Command Line Tools",
+        "Adaptar a Hammerspoon",
+        "Adaptar a Shortcuts de macOS",
+    ]
+
+    spoken = announce.enumerate_options(labels)
+
+    assert spoken == (
+        "Opciones: uno: Probalo sin hotkeys primero, dos: Actualizar Command Line Tools, "
+        "tres: Adaptar a Hammerspoon, cuatro: Adaptar a Shortcuts de macOS"
+    )
+    assert "Recomendado" not in spoken
+
+
 def test_option_numbers_beyond_ten_fall_back_to_digits():
     assert [announce.number_word(n) for n in (1, 5, 10)] == ["uno", "cinco", "diez"]
     assert announce.number_word(11) == "11"

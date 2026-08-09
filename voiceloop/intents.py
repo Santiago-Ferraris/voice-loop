@@ -177,7 +177,16 @@ def as_number(token: str) -> int | None:
 
 
 def option_keys(labels: Sequence[str]) -> dict[str, int]:
-    """Folded label -> index, plus a distinctive first word when it is unique."""
+    """Folded label -> index: the whole label, any leading part, any distinct word.
+
+    Three shapes, because there are three ways to name an option out loud. The
+    whole label is what you say reading it off the screen. A **leading part** is
+    what you say repeating what you *heard*, since options are spoken short —
+    "Probalo sin hotkeys primero (Recomendado)" is read out without the aside.
+    A single word is what you say when only one option had that word in it.
+
+    Anything two options could both mean is dropped rather than guessed.
+    """
     keys: dict[str, int] = {}
     collisions: set[str] = set()
 
@@ -194,10 +203,15 @@ def option_keys(labels: Sequence[str]) -> dict[str, int]:
         folded = fold(str(label))
         if not folded:
             continue
+        words = folded.split(" ")
         offer(folded, index)
-        first = folded.split(" ")[0]
-        if len(first) >= MIN_KEYWORD_CHARS:
-            offer(first, index)
+        for count in range(1, len(words)):
+            # A one-word prefix has to be distinctive; two words already are.
+            if count > 1 or len(words[0]) >= MIN_KEYWORD_CHARS:
+                offer(" ".join(words[:count]), index)
+        for word in words[1:]:
+            if len(word) >= MIN_KEYWORD_CHARS:
+                offer(word, index)
     return keys
 
 

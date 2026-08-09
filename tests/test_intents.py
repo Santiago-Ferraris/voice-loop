@@ -99,6 +99,32 @@ def test_a_label_inside_a_longer_sentence_stays_dictation():
     assert parse("usá postgres pero con el índice viejo", OPTIONS).kind == KIND_TEXT
 
 
+HOTKEYS = [
+    "Probalo sin hotkeys primero (Recomendado)",
+    "Actualizar Command Line Tools",
+    "Adaptar a Hammerspoon",
+]
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "probalo sin hotkeys primero recomendado",  # read off the screen
+        "probalo sin hotkeys primero",  # repeated back from what was spoken
+        "probalo",
+        "hotkeys",
+        "el recomendado",
+    ],
+)
+def test_a_shortened_label_still_matches_the_whole_one(said):
+    """Options are spoken short; every way of naming this one picks it."""
+    assert parse(said, HOTKEYS).index == 1
+
+
+def test_a_word_two_options_share_is_still_not_a_selection():
+    assert parse("adaptar", ["Adaptar a Hammerspoon", "Adaptar a Shortcuts"]).kind == KIND_TEXT
+
+
 # --- multi-select ----------------------------------------------------------
 
 
