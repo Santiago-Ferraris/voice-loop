@@ -415,6 +415,8 @@ for a window you have not heard about.
 | "salteá" | Leaves it where it is and moves on |
 | "dale" / "no" | Confirms or cancels a read-back. On a heads-up, "dale" means "dámelo". Anywhere else it is just a word, and gets typed |
 | "dame los pendientes" / "cuál queda" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
+| "la dos" / "darwin e4" / "la última" | Off that list: that window is served at once, no read-back |
+| "decile a la última que lo deje fijo en el alias" | Off that list too, but it is a whole instruction: read back first, and a yes types it into darwin e4 |
 | "abrí una ventana nueva y hacé X" | New tab in the window you already have, running `windows.new_tab_command`, then X typed into it — and sent once the command has started and the text is on the screen |
 | "decile a inbox realtime que espere" | Types into the window with that name, whichever one you are on |
 | "dámelo, y también abrí una ventana y hacé X" | Several things in one breath, in the order you said them. One that fails does not cancel the rest |
@@ -445,6 +447,17 @@ no heads-up and no second "dámelo": you just said which one you wanted. The one
 pending, reachable, and in its place in line. Any item whose summary is missing is summarised as
 the list is read, so no entry is ever just a name — and windows that have closed since are
 dropped before the list is read at all.
+
+**And what you say over the list is usually not a pick.** "decile a la última que lo deje fijo en
+cuatro punto ocho en el alias con `--model`" names a window *inside* an instruction, which no
+lexicon resolves, and it used to fall through to "no te entendí" with the instruction going
+nowhere. So a sentence that is not a pick goes to the classifier **with the list under it** —
+position, name and summary of each item, as they were just read — and "la última" is the third
+one. Everything it comes back with is read back before anything is written: *"Entendí: decile a
+darwin e4 que lo deje fijo en 4.8. ¿Lo mando?"* A yes sends it; anything else, silence included,
+drops all of it. And a window it cannot pin down is asked about rather than guessed — *"¿A
+cuál?"* — including a compound, where one reference it could not aim cancels the whole sentence
+rather than doing the half it understood.
 
 ## Naming windows out loud
 

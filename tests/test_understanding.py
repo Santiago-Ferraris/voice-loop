@@ -39,9 +39,14 @@ class FakeModel:
     def __init__(self, answers):
         self.answers = dict(answers)
         self.asked: list[str] = []
+        # The whole user message, context and all — `asked` is only its last
+        # line, which is the phrase, and the context is the rest of it.
+        self.prompts: list[str] = []
 
     def __call__(self, url, headers, body, timeout):
-        said = json.loads(body)["messages"][-1]["content"].split("\n")[-1]
+        content = json.loads(body)["messages"][-1]["content"]
+        said = content.split("\n")[-1]
+        self.prompts.append(content)
         self.asked.append(said)
         return json.dumps(
             {

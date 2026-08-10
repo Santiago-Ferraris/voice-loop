@@ -117,6 +117,11 @@ MIC_CONSENT_SPOKEN = (
 # understand that" and a daemon that has stopped answering.
 NO_PICK_SPOKEN = "No te entendí. Decime el número o el nombre."
 
+# The other half of not understanding: the instruction was plain, the window it
+# was about was not. Guessing right seven times out of ten is ten sentences
+# typed into the wrong session a day, and one question costs a second.
+WHICH_WINDOW_SPOKEN = "¿A cuál?"
+
 # How many windows one "dame los pendientes" chain may hop through before the
 # daemon stops following it. Not a limit on you — the hotkey starts a new chain.
 MAX_SWITCHES = 5
@@ -1215,7 +1220,13 @@ class Daemon:
             return None, transcript, None
         return intent, transcript, None
 
-    async def classify(self, transcript: Transcript, *, menu=None) -> classify_mod.Plan:
+    async def classify(
+        self,
+        transcript: Transcript,
+        *,
+        menu=None,
+        pendings: Sequence[tuple[str, str]] = (),
+    ) -> classify_mod.Plan:
         """What one utterance asked for — lexicon first, model only if it missed.
 
         The order is the whole design. Anything the phrase lists resolve is
@@ -1223,6 +1234,9 @@ class Daemon:
         of costs a round trip. And a phrase that is *nearly* a control word
         never reaches the model at all: a transcript we already distrust is not
         made trustworthy by a second opinion on its wording — it is asked about.
+
+        `pendings` is the list that was just read out, passed only by the one
+        caller that just read one: "la última" means nothing without it.
         """
         labels = menu.labels if menu else ()
         intent = intents.parse(
@@ -1240,7 +1254,7 @@ class Daemon:
             )
 
         actions = await asyncio.to_thread(
-            self.classifier.classify, transcript.text, self.window_names()
+            self.classifier.classify, transcript.text, self.window_names(), pendings
         )
         if actions is None:
             # No key, no network, or nothing usable came back. Exactly what the
@@ -1387,6 +1401,18 @@ class Daemon:
             await self.speaker.speak(
                 f"No encontré la ventana {spoken}." if spoken else "No sé a qué ventana."
             )
+            return False
+        return await self._write_to(tty, text)
+
+    async def _write_to(self, tty: str, text: str) -> bool:
+        """Type a phrase into a window that is already known — and say if it failed.
+
+        Split out because the window is not always found by name: one picked off
+        the list carries its own tty, and looking that name up again in the
+        roster is one alias rename away from writing somewhere else.
+        """
+        if not tty:
+            await self.speaker.speak("No pude escribir en esa ventana.")
             return False
         if await self._safely(self.delivery.send_text, tty, text) is None:
             await self.speaker.speak("No pude escribir en esa ventana.")
@@ -1729,10 +1755,18 @@ class Daemon:
         return await self._say_then(text, listening=listening)
 
     async def speak_pendings(self) -> Item | None:
-        """Read the queue out in order, then take a pick — by number or by name.
+        """Read the queue out in order, then take what was said over the top of it.
 
-        The pick is what makes this more than a report: the window you choose is
-        re-announced and gets the microphone, exactly as if it had just blocked.
+        A **pick** — by number, by name, by "la última" — is what makes this more
+        than a report: the window you choose is returned, re-announced and given
+        the microphone, exactly as if it had just blocked. Resolved by the
+        lexicon alone: instant, offline, and never read back.
+
+        Anything longer is an **instruction about** one of them, and that is the
+        other half of the same sentence — "decile a la última que…". It goes to
+        `_instruct_over_pendings`, which is the only path here that writes
+        anywhere, and the only one that asks first.
+
         Summaries missing from superseded items are filled in here (issue #3) —
         a list of names with nothing after them answers nothing. Windows that
         have closed since are dropped first: a list you cannot act on any more
@@ -1764,19 +1798,171 @@ class Daemon:
         if transcript is None:
             return None
         intent = intents.parse(transcript.text, names)
-        if intent.kind != intents.KIND_SELECT or not 1 <= (intent.index or 0) <= len(items):
-            if intent.kind == intents.KIND_TEXT:
-                # A sentence, not a pick. Nothing downstream will act on it and
-                # nothing downstream will say so either, which is the silence
-                # that is indistinguishable from a daemon that stopped
-                # listening — the twenty-five seconds spent reading the list
-                # are exactly when you cannot tell the difference.
-                log.info("nothing picked off the pendings list: %r", transcript.text)
-                await self.speaker.speak(NO_PICK_SPOKEN)
+        if intent.kind == intents.KIND_SELECT and 1 <= (intent.index or 0) <= len(items):
+            chosen = items[intent.index - 1]
+            log.info(
+                "picked %s [%s] off the pendings list", chosen.id[:8], names[intent.index - 1]
+            )
+            return chosen
+        if intent.kind == intents.KIND_TEXT:
+            # A sentence, not a pick — and the sentence is usually the point.
+            await self._instruct_over_pendings(transcript, items, entries)
+        return None
+
+    async def _instruct_over_pendings(
+        self,
+        transcript: Transcript,
+        items: Sequence[Item],
+        entries: Sequence[tuple[str, str, str]],
+    ) -> None:
+        """A whole instruction said over the list, instead of a pick off it.
+
+        "decile a la última que lo deje fijo en cuatro punto ocho" is the flow
+        the list exists for, and it is the one thing the list could not do: the
+        pick is resolved by `intents.parse` alone, which knows a number and a
+        name and nothing else, so a reference *inside* a sentence fell through
+        to "no te entendí" and the instruction went nowhere.
+
+        The list is the context that reference needs — position, name and
+        summary of each item, exactly as they were just read out — so it goes
+        to the classifier with the phrase. Two rules hold the risk down:
+
+        * **Nothing is written without a read-back.** This is the most
+          ambiguous input the system takes: a long sentence dictated over
+          twenty-five seconds of our own voice, about windows that were named
+          out loud a moment ago. "Entendí: … ¿Lo mando?", and a yes is the only
+          thing that sends it.
+        * **A window we cannot pin down is asked about, never guessed.** The
+          model is told to leave `target` empty rather than invent one, and
+          anything that does not resolve against the list gets "¿A cuál?".
+        """
+        plan = await self.classify(
+            transcript, pendings=[(name, summary) for name, summary, _ in entries]
+        )
+        if plan.source != classify_mod.SOURCE_LLM:
+            # The model was never reached, or the transcript is one we already
+            # distrust. Either way there is nothing here the lexicon has not
+            # already failed to resolve, and this is what it says.
+            log.info("nothing picked off the pendings list: %r", transcript.text)
+            await self.speaker.speak(NO_PICK_SPOKEN)
+            return
+        names = [name for name, _, _ in entries]
+        aimed, adrift = self._aim_over_pendings(plan.actions, names)
+        if adrift or not aimed:
+            log.info(
+                "nothing to do off the pendings list: %r (%s)",
+                transcript.text,
+                "no window" if adrift else "no action",
+            )
+            await self.speaker.speak(WHICH_WINDOW_SPOKEN if adrift else NO_PICK_SPOKEN)
+            return
+        if not await self._confirm_over_pendings(aimed, names):
+            return
+        for action in aimed:
+            await self._perform_aimed(action, items)
+
+    def _aim_over_pendings(
+        self, actions: Sequence[classify_mod.Action], names: Sequence[str]
+    ) -> tuple[list[classify_mod.Action], bool]:
+        """(what to do, whether something was about a window we could not find).
+
+        Everything that needs a window carries the position it landed on; the
+        rest — opening a tab, reading the board back — needs none and passes
+        through. A second flag rather than a shorter list, because half a
+        sentence acted on is worse than none of it: "decile a la última que X y
+        abrí una ventana" with an unresolvable "la última" asks, it does not
+        quietly do the half it understood.
+        """
+        aimed: list[classify_mod.Action] = []
+        adrift = False
+        for action in actions:
+            if action.kind == intents.KIND_TELL and not action.text:
+                continue
+            if action.kind in (intents.KIND_TELL, intents.KIND_SHOW):
+                index = self._listed_index(action.target, names)
+                if index is None:
+                    adrift = True
+                    continue
+                aimed.append(dataclasses.replace(action, index=index))
+            elif action.kind in (intents.KIND_OPEN, intents.KIND_STATUS):
+                # Both end where they start. Reading the *list* back is not
+                # here on purpose: it is the function we are already inside,
+                # and a queue that can ask itself for the queue is a loop with
+                # a microphone in it.
+                aimed.append(action)
+            elif action.kind == intents.KIND_TEXT:
+                # Dictation, said over a list of windows. It is work for one of
+                # them and the model could not tell which — which is a question,
+                # not a reason to hand it to whoever spoke last.
+                adrift = True
+        return aimed, adrift
+
+    @staticmethod
+    def _listed_index(target: str, names: Sequence[str]) -> int | None:
+        """Which of the windows just read out that names, or `None` — which asks.
+
+        The model is told to answer with the exact name off the list, and mostly
+        does; "la última" and "3" come back often enough to be worth resolving
+        here too. A partial has to be *unique* — two windows it could equally
+        mean is exactly the case where guessing is the whole failure.
+        """
+        wanted = intents.fold(target)
+        if not wanted or not names:
             return None
-        chosen = items[intent.index - 1]
-        log.info("picked %s [%s] off the pendings list", chosen.id[:8], names[intent.index - 1])
-        return chosen
+        intent = intents.parse(target, names)
+        if intent.kind == intents.KIND_SELECT and 1 <= (intent.index or 0) <= len(names):
+            return intent.index
+        found = []
+        for index, name in enumerate(names, start=1):
+            folded = intents.fold(name)
+            if folded and (wanted in folded or folded in wanted):
+                found.append(index)
+        return found[0] if len(found) == 1 else None
+
+    async def _confirm_over_pendings(
+        self, aimed: Sequence[classify_mod.Action], names: Sequence[str]
+    ) -> bool:
+        """Read the plan back and wait for a yes. Anything else drops all of it.
+
+        Only what *writes* is asked about. Focusing a window or reading the
+        board back changes nothing and undoes itself, and a read-back on those
+        is the nagging that got read-backs rationed in the first place.
+        """
+        if not any(
+            action.kind in (intents.KIND_TELL, intents.KIND_OPEN) for action in aimed
+        ):
+            return True
+        question = announce_mod.plan_question(
+            [
+                announce_mod.describe_action(
+                    action.kind,
+                    names[action.index - 1] if action.index else action.target,
+                    action.text,
+                )
+                for action in aimed
+            ]
+        )
+        if not question:
+            await self.speaker.speak(NO_PICK_SPOKEN)
+            return False
+        answer = await self.say_and_listen(
+            text=announce_mod.speakable(question, self.phonetic)
+        )
+        if answer is not None and intents.parse(answer.text).kind == intents.KIND_CONFIRM:
+            return True
+        log.info("dropped what was said over the pendings list: %s", question)
+        if answer is not None:
+            await self.speaker.speak("Listo, no mando nada.")
+        return False
+
+    async def _perform_aimed(self, action: classify_mod.Action, items: Sequence[Item]) -> bool:
+        """One confirmed action, sent to the window it was aimed at by position."""
+        if action.index is None:
+            return await self._perform_side(action)
+        item = items[action.index - 1]
+        if action.kind == intents.KIND_SHOW:
+            return bool(item.tty) and bool(await self._safely(self.delivery.focus, item.tty))
+        return await self._write_to(item.tty, action.text)
 
     async def _follow_switch(self, depth: int) -> None:
         """Serve the window that was picked off the list mid-conversation.

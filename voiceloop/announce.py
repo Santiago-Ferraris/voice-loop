@@ -416,6 +416,38 @@ def near_miss_question(heard: str, kind: str) -> str:
     return f"Entendí: {said}. ¿Querés {wish}?"
 
 
+def describe_action(kind: str, target: str = "", text: str = "") -> str:
+    """One thing a plan is about to do, said the way you would have asked for it.
+
+    Only the handful a sentence said over the pendings list can turn into.
+    `""` for anything else, and for anything too incomplete to describe — an
+    action nobody can be read back is an action nobody can confirm.
+    """
+    said = normalize(text)
+    if kind == "tell":
+        return f"decile a {target} que {said}" if target and said else ""
+    if kind == "open":
+        return f"abrir una ventana nueva y {said}" if said else "abrir una ventana nueva"
+    if kind == "show":
+        return f"mostrarte {target}" if target else ""
+    if kind == "status":
+        return "leerte el estado"
+    if kind == "pendings":
+        return "leerte los pendientes"
+    return ""
+
+
+def plan_question(descriptions: Sequence[str]) -> str:
+    """"Entendí: decile a darwin e4 que lo deje fijo en 4.8. ¿Lo mando?"
+
+    The last thing between a phrase dictated over a list and somebody's window.
+    `near_miss_question` asks about a *word* we distrust; this asks about a
+    whole sentence we understood — and understood is not the same as meant.
+    """
+    said = ", y ".join(clause for clause in descriptions if clause)
+    return f"Entendí: {said}. ¿Lo mando?" if said else ""
+
+
 def name_question(slug: str, phonetic: Mapping[str, Any] | None = None) -> str:
     """The offer to christen a window Claude called `darwin-21`."""
     spoken = speakable(slug, phonetic)
