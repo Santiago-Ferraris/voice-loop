@@ -78,6 +78,26 @@ def test_a_sentence_that_happens_to_start_with_a_number_is_dictation():
     assert intent.text == "dos cosas: arreglá el índice y corré los tests"
 
 
+@pytest.mark.parametrize("said", ["la última", "dame la última", "el último"])
+def test_the_last_one_is_a_position_too(said):
+    """The one you cannot say as a number: it depends on how long the list is."""
+    assert parse(said, OPTIONS).index == 3
+
+
+def test_the_last_one_with_nothing_to_choose_from_is_not_a_selection():
+    assert parse("la última").kind == KIND_TEXT
+
+
+def test_last_on_its_own_is_still_the_back_of_the_queue():
+    """"último" answers a heads-up — "mandalo al fondo" — and always has."""
+    assert parse("último").kind == KIND_LATER
+
+
+def test_naming_one_off_a_list_the_way_you_say_it_out_loud():
+    """"la de postgres" is how you point at something you were just read."""
+    assert parse("la de postgres", OPTIONS).index == 2
+
+
 # --- keywords --------------------------------------------------------------
 
 

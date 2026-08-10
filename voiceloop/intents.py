@@ -57,6 +57,12 @@ NUMBERS: Mapping[str, int] = {
     "diez": 10, "decimo": 10, "decima": 10,
 }
 
+# The one position you cannot say as a number, because it depends on how long
+# the list turned out to be. Only ever resolved against options that were just
+# read out: with nothing to choose from there is nothing to be the last of, and
+# a bare "último" is still "mandalo al fondo" — that set is matched first.
+LAST_WORDS = frozenset({"ultimo", "ultima"})
+
 CONFIRM_PHRASES = frozenset({
     "si", "si si", "sisi", "dale", "dale si", "si dale", "ok", "oka", "okey", "okay",
     "correcto", "confirmo", "confirma", "confirmalo", "confirmado", "exacto",
@@ -212,6 +218,9 @@ EXPLAIN_VERBS = (
 LEADING_FILLER = frozenset({
     "la", "el", "lo", "las", "los", "opcion", "opciones", "numero", "respuesta",
     "elijo", "elegi", "elegimos", "quiero", "dame", "poneme", "andale", "esa", "ese",
+    # "la de darwin e4" is how you name one off a list you were just read, and
+    # without these it is a sentence rather than a pick.
+    "de", "del",
 })
 TRAILING_FILLER = frozenset({"por", "favor", "porfa", "gracias", "nomas", "dale", "obvio"})
 
@@ -329,6 +338,8 @@ def _resolve_one(phrase: str, labels: Sequence[str], keys: Mapping[str, int]) ->
         number = as_number(core[0])
         if number is not None and 1 <= number <= len(labels):
             return number
+        if labels and core[0] in LAST_WORDS:
+            return len(labels)
     return keys.get(_phrase(core))
 
 

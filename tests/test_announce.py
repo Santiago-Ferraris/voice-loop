@@ -565,3 +565,62 @@ def test_the_offered_name_goes_through_the_phonetic_dictionary():
 )
 def test_the_count_on_its_own_is_what_busy_mode_owes_you(count, expected):
     assert announce.pendings_count(count) == expected
+
+
+# --- reading a whole plan back before any of it happens ---------------------
+
+
+def test_an_instruction_for_a_window_is_read_back_the_way_you_said_it():
+    said = announce.describe_action(
+        "tell", "darwin e4", "lo deje fijo en 4.8 en el alias con --model"
+    )
+
+    assert announce.plan_question([said]) == (
+        "Entendí: decile a darwin e4 que lo deje fijo en 4.8 en el alias con "
+        "--model. ¿Lo mando?"
+    )
+
+
+def test_everything_one_breath_asked_for_is_in_the_same_question():
+    question = announce.plan_question(
+        [
+            announce.describe_action("tell", "darwin e4", "dejá el modelo fijo"),
+            announce.describe_action("open", text="corré los tests"),
+        ]
+    )
+
+    assert question == (
+        "Entendí: decile a darwin e4 que dejá el modelo fijo, y abrir una "
+        "ventana nueva y corré los tests. ¿Lo mando?"
+    )
+
+
+@pytest.mark.parametrize(
+    "kind, target, text, expected",
+    [
+        ("open", "", "", "abrir una ventana nueva"),
+        ("show", "darwin e4", "", "mostrarte darwin e4"),
+        ("status", "", "", "leerte el estado"),
+        ("pendings", "", "", "leerte los pendientes"),
+    ],
+)
+def test_the_other_things_a_plan_can_ask_for_are_said_too(kind, target, text, expected):
+    assert announce.describe_action(kind, target, text) == expected
+
+
+@pytest.mark.parametrize(
+    "kind, target, text",
+    [
+        ("tell", "", "dejá el modelo fijo"),  # nobody to tell
+        ("tell", "darwin e4", ""),            # nothing to say
+        ("give", "", ""),                     # not something a plan does here
+    ],
+)
+def test_an_action_that_cannot_be_read_back_is_not_described(kind, target, text):
+    """A read-back nobody can hear is a confirmation nobody can give."""
+    assert announce.describe_action(kind, target, text) == ""
+
+
+def test_a_plan_with_nothing_describable_in_it_asks_nothing():
+    assert announce.plan_question([]) == ""
+    assert announce.plan_question([""]) == ""

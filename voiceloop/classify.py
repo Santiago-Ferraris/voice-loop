@@ -109,11 +109,34 @@ Ejemplos:
 "mergealo cuando pasen los tests" -> {{"actions": []}}\
 """
 
+# The list that was just read out loud, handed over with the phrase that was
+# said on top of it. Without it "la última" names nothing: the model has no idea
+# what was said one sentence ago, and a target it invents is a turn typed into
+# somebody else's window.
+PENDINGS_HEADER = "Ventanas pendientes, en el orden en que se las acabo de leer:"
+
+PENDINGS_RULE = (
+    "Si la frase se refiere a una de esas ventanas por posición (\"la última\", "
+    "\"la tercera\") o por lo que dice de ella (\"la de darwin e4\", \"la del "
+    "alias\"), poné el NOMBRE EXACTO de la lista en `target`. Si no podés saber "
+    "a cuál se refiere, dejá `target` vacío: no adivines."
+)
+
 Transport = Callable[[str, dict, bytes, float], bytes]
 
 # Past this it is dictation, not a command, and paying a round trip to be told
 # so is a second of silence on every long sentence.
 MAX_WORDS = 40
+
+
+def pendings_block(pendings: Sequence[tuple[str, str]]) -> str:
+    """The queue, numbered the way it was spoken, plus how to point at one."""
+    lines = [PENDINGS_HEADER]
+    for index, entry in enumerate(pendings, start=1):
+        name, summary = entry[0], entry[1]
+        lines.append(f"{index}. {name} — {summary}" if summary else f"{index}. {name}")
+    lines.append(PENDINGS_RULE)
+    return "\n".join(lines)
 
 
 def _urllib_transport(url: str, headers: dict, body: bytes, timeout: float) -> bytes:
@@ -235,13 +258,22 @@ class Classifier:
     def catalogue(self) -> str:
         return "\n".join(f"- {name}: {help}" for name, help in INTENT_HELP.items())
 
-    def build_body(self, text: str, windows: Sequence[str] = ()) -> bytes:
-        content = text
+    def build_body(
+        self,
+        text: str,
+        windows: Sequence[str] = (),
+        pendings: Sequence[tuple[str, str]] = (),
+    ) -> bytes:
+        blocks = []
+        if pendings:
+            blocks.append(pendings_block(pendings))
         if windows:
             # The names are what "decile a inbox realtime que…" is matched
             # against, and a model that has not been told they exist will
             # cheerfully invent a target that names nothing.
-            content = f"Ventanas abiertas: {', '.join(windows)}\n\n{text}"
+            blocks.append(f"Ventanas abiertas: {', '.join(windows)}")
+        blocks.append(text)
+        content = "\n\n".join(blocks)
         payload = {
             "model": self.model,
             "max_tokens": 200,
@@ -257,13 +289,21 @@ class Classifier:
         }
         return json.dumps(payload).encode("utf-8")
 
-    def classify(self, text: str, windows: Sequence[str] = ()) -> list[Action] | None:
+    def classify(
+        self,
+        text: str,
+        windows: Sequence[str] = (),
+        pendings: Sequence[tuple[str, str]] = (),
+    ) -> list[Action] | None:
         """The actions this phrase asks for. `None` means "could not tell".
 
         `None` and `[]` are different answers and the caller treats them
         differently: `[]` is the model saying this is dictation, `None` is the
         model not having been reachable, which degrades to the lexicon's own
         verdict.
+
+        `pendings` is the list that was just read out loud, in order, and it is
+        only ever passed when one was: it is the whole context "la última" has.
         """
         if not self.available:
             return None
@@ -287,7 +327,9 @@ class Classifier:
             "Content-Type": "application/json",
         }
         try:
-            raw = self.transport(API_URL, headers, self.build_body(text, windows), self.timeout)
+            raw = self.transport(
+                API_URL, headers, self.build_body(text, windows, pendings), self.timeout
+            )
             data = json.loads(raw)
             content = data["choices"][0]["message"]["content"]
         except (

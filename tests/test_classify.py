@@ -225,6 +225,41 @@ def test_the_windows_that_exist_are_named_in_the_prompt():
     assert "kb guard" in fake.asked[0]
 
 
+# --- pointing at one of the windows that were just read out ----------------
+
+
+def test_the_list_that_was_just_read_is_numbered_in_the_prompt():
+    """"la última" is a position, and only the list says what it is a position in."""
+    fake = FakeOpenAi()
+
+    classifier(fake).classify(
+        "decile a la última que lo deje fijo",
+        ["darwin e5", "darwin e4"],
+        [("darwin e5", "espera que resuelvas los conflictos"), ("darwin e4", "")],
+    )
+
+    asked = fake.asked[0]
+    assert "1. darwin e5 — espera que resuelvas los conflictos" in asked
+    assert "2. darwin e4" in asked
+    assert asked.endswith("decile a la última que lo deje fijo")
+
+
+def test_the_prompt_says_to_leave_the_target_empty_rather_than_invent_one():
+    fake = FakeOpenAi()
+
+    classifier(fake).classify("decile que espere", (), [("darwin e4", "")])
+
+    assert "no adivines" in fake.asked[0]
+
+
+def test_a_phrase_with_no_list_behind_it_carries_no_list():
+    fake = FakeOpenAi()
+
+    classifier(fake).classify("decile a inbox que espere", ["inbox realtime"])
+
+    assert "pendientes" not in fake.asked[0]
+
+
 # --- parsing what came back ------------------------------------------------
 
 
