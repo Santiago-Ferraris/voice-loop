@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -256,7 +259,7 @@ def test_no_script_names_a_local_after_a_term_applescript_owns(name):
 
 def test_the_locals_of_a_script_are_the_ones_it_actually_names():
     """The guard above is only worth having if it reads the scripts correctly."""
-    assert set(ASSIGNMENT.findall(iterm.OPEN_TAB)) == {"startupCmd", "followUp"}
+    assert set(ASSIGNMENT.findall(iterm.OPEN_TAB)) == {"startupCmd", "jobText"}
     # The line that shipped, which is what the term list has to catch.
     assert ASSIGNMENT.findall("  set startup to item 1 of argv") == ["startup"]
 
@@ -279,16 +282,236 @@ def test_every_script_in_the_module_compiles(name):
     assert completed.returncode == 0, completed.stderr.strip()
 
 
-def test_open_tab_passes_the_command_and_the_text_as_arguments():
-    runner = FakeOsascript("opened")
+# --- opening a tab and typing into it --------------------------------------
+#
+# The second bug this file exists for. `open_tab` handed the follow-up text to
+# `write text` with its own newline, which is precisely the thing the rest of
+# the module knows does not submit a long prompt: a 150-character sentence was
+# typed into a brand new Claude and left sitting in the input box, unsent, and
+# every test of it passed because a fake runner cannot tell a typed prompt from
+# a submitted one.
 
-    assert iterm.open_tab("claude", "arreglá el build", runner) is True
-    assert runner.calls == [["osascript", "-", "claude", "arreglá el build"]]
+
+class FakeTab:
+    """A new tab, as a runner sees it — and a runner only sees argv.
+
+    So the calls are told apart by shape: the first one is the open, one
+    argument is a state poll, two where the second is digits is a keystroke,
+    and anything else is a write. The screen grows as text is typed into it,
+    which is what makes the "did it show up" wait testable at all.
+    """
+
+    KEYSTROKE = re.compile(r"[\d,]+\Z")
+
+    def __init__(self, *, tty="/dev/ttys077", shell="zsh", job="node", starts_after=0, echoes=True):
+        self.tty, self.shell, self.job = tty, shell, job
+        self.starts_after, self.echoes = starts_after, echoes
+        self.calls: list[list[str]] = []
+        self.typed: list[str] = []
+        self.keys: list[str] = []
+        self.screen = ""
+        self.polls = 0
+        self.polls_when_typed: int | None = None
+        self._opened = False
+
+    def __call__(self, argv):
+        self.calls.append(list(argv))
+        args = list(argv[2:])
+        if not self._opened:
+            self._opened = True
+            return self._done(f"{self.tty}\n{self.shell}")
+        if len(args) == 1:
+            self.polls += 1
+            running = self.job if self.polls > self.starts_after else self.shell
+            return self._done(f"{running}\n{self.screen}")
+        if self.KEYSTROKE.match(args[1]):
+            self.keys.append(args[1])
+            return self._done("sent")
+        self.typed.append(args[1])
+        self.polls_when_typed = self.polls
+        if self.echoes:
+            self.screen += args[1]
+        return self._done("sent")
+
+    def _done(self, stdout):
+        return subprocess.CompletedProcess([], 0, stdout, "")
 
 
-def test_open_tab_takes_neither_a_command_nor_a_text():
+def never_sleep(_seconds):
+    return None
+
+
+LONG = (
+    "modifique el alias que tengo de claude e inicie las sesiones con opus 4.8 "
+    "por default no saques ninguno de los parametros que tiene"
+)
+
+
+def test_the_text_is_typed_without_a_newline_and_submitted_with_a_separate_cr():
+    """The bug: `write text followUp` left a 150-character prompt unsent."""
+    tab = FakeTab()
+
+    assert iterm.open_tab("claude", LONG, tab, sleep=never_sleep) is True
+
+    assert tab.typed == [LONG]
+    assert tab.keys == [str(ord(iterm.ENTER))]
+    assert "followUp" not in iterm.OPEN_TAB
+
+
+def test_the_command_travels_as_the_only_argument_of_the_open():
+    tab = FakeTab()
+
+    iterm.open_tab("claude", LONG, tab, sleep=never_sleep)
+
+    assert tab.calls[0] == ["osascript", "-", "claude"]
+    assert ["osascript", "-", tab.tty, LONG] in tab.calls
+
+
+def test_the_startup_command_keeps_the_newline_the_text_does_not():
+    """It is a shell command line, and a shell submits what it is handed."""
+    assert "write text startupCmd" in iterm.OPEN_TAB
+    assert "newline no" not in iterm.OPEN_TAB
+
+
+def test_nothing_is_typed_until_the_command_has_taken_the_shell_over():
+    """Typed too early it goes to a shell, or into a TUI still taking over."""
+    tab = FakeTab(starts_after=3)
+
+    iterm.open_tab("claude", LONG, tab, sleep=never_sleep)
+
+    assert tab.polls_when_typed == 4
+    assert tab.keys == [str(ord(iterm.ENTER))]
+
+
+def test_a_command_that_never_starts_leaves_the_text_typed_but_unsent():
+    """A dictated sentence is never handed to a shell to run."""
+    tab = FakeTab(job="zsh")
+
+    assert iterm.open_tab("claude", LONG, tab, launch_timeout=0, sleep=never_sleep) is True
+
+    assert tab.typed == [LONG]
+    assert tab.keys == []
+
+
+def test_text_that_never_reaches_the_screen_is_not_submitted():
+    """Half a sentence submitted is worse than a whole one sitting there."""
+    tab = FakeTab(echoes=False)
+
+    assert iterm.open_tab("claude", LONG, tab, echo_timeout=0, sleep=never_sleep) is True
+
+    assert tab.typed == [LONG]
+    assert tab.keys == []
+
+
+def test_the_wait_ends_the_moment_the_text_shows_up():
+    tab = FakeTab()
+
+    iterm.open_tab("claude", LONG, tab, sleep=never_sleep)
+
+    # One poll to see the command start, one to see the text land.
+    assert tab.polls == 2
+
+
+def test_a_tab_with_nothing_to_type_is_opened_and_left_alone():
     """"abrí una ventana nueva" on its own: a tab, and nothing typed into it."""
-    runner = FakeOsascript("opened")
+    tab = FakeTab()
 
-    assert iterm.open_tab(runner=runner) is True
-    assert runner.calls == [["osascript", "-", "", ""]]
+    assert iterm.open_tab(runner=tab, sleep=never_sleep) is True
+    assert tab.calls == [["osascript", "-", ""]]
+
+    blank = FakeTab()
+    assert iterm.open_tab("claude", "   ", blank, sleep=never_sleep) is True
+    assert blank.typed == []
+
+
+def test_a_tab_with_no_command_types_into_whatever_is_there():
+    """Nothing was launched, so there is nothing to wait for — only the echo."""
+    tab = FakeTab()
+
+    assert iterm.open_tab("", "hola", tab, sleep=never_sleep) is True
+
+    assert tab.typed == ["hola"]
+    assert tab.keys == [str(ord(iterm.ENTER))]
+
+
+def test_an_iterm_that_names_no_tty_is_still_a_tab():
+    """Nothing to type into, but the window did open. Say so and stop."""
+    assert iterm.open_tab("claude", LONG, FakeOsascript(""), sleep=never_sleep) is False
+
+
+def test_session_state_splits_the_job_from_the_screen():
+    job, screen = iterm.session_state("/dev/ttys012", FakeOsascript("node\n❯ hola"))
+
+    assert (job, screen) == ("node", "❯ hola")
+
+
+def test_session_state_of_a_window_that_is_gone_is_empty():
+    assert iterm.session_state("/dev/ttys999", FakeOsascript(returncode=1)) == ("", "")
+    assert iterm.session_state("", FakeOsascript("node\nhola")) == ("", "")
+
+
+def test_reading_the_state_of_a_session_never_moves_focus():
+    assert "activate" not in iterm.SESSION_STATE
+    assert "select" not in iterm.SESSION_STATE
+
+
+# --- the check no mocked runner can make -----------------------------------
+
+LIVE_ITERM = (
+    sys.platform == "darwin"
+    and shutil.which("osascript") is not None
+    and iterm.scripting_status()[0]
+)
+
+
+# A stand-in for the TUI, because the TUI is what the fakes cannot be. Three
+# things about it are not decoration — they are the three the bug turned on:
+# it reads the terminal **raw**, so it is submitted by CR and not by the LF
+# `write text` appends; it **paints what it is typed**, which is the only
+# reason "is it on the screen yet" is answerable at all; and it writes a file
+# only once it has a whole line, so the file existing *is* the assertion.
+TUI_ENOUGH = """
+import os, pathlib, signal, sys, tty
+
+signal.alarm(30)
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+typed = b""
+while b"\\r" not in typed:
+    chunk = os.read(fd, 1024)
+    if not chunk:
+        break
+    os.write(1, chunk)
+    typed += chunk
+pathlib.Path(sys.argv[1]).write_text(typed.split(b"\\r")[0].decode())
+"""
+
+
+@pytest.mark.skipif(not LIVE_ITERM, reason="needs macOS, iTerm2 and Automation permission")
+def test_a_real_tab_receives_the_text_submitted_not_left_in_the_input(tmp_path):
+    """A real tab, a real program, and a file that only exists if Enter landed.
+
+    Every test above this one runs against a fake, and a fake said "opened" for
+    the whole life of the bug. This one opens an actual tab and types into an
+    actual program that behaves like the thing that broke: the file appears
+    only if a CR arrived after the text, which is exactly what the shipped
+    `write text followUp` never sent.
+
+    `exec` is what cleans up: the reader replaces the shell, so when it returns
+    the session has nothing left to run and iTerm2 closes the tab. The alarm is
+    the same thing for the case where nothing is ever typed.
+    """
+    sink = tmp_path / "sink.py"
+    sink.write_text(TUI_ENOUGH)
+    landed = tmp_path / "landed.txt"
+    command = " ".join(
+        ["exec", shlex.quote(sys.executable), shlex.quote(str(sink)), shlex.quote(str(landed))]
+    )
+
+    assert iterm.open_tab(command, LONG) is True
+
+    deadline = time.monotonic() + 20
+    while not landed.exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert landed.exists(), "the tab never got a submitted line — the text sat in the input"
+    assert landed.read_text().strip() == LONG

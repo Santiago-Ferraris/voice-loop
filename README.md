@@ -143,6 +143,11 @@ and counting the words in **your own** messages, minus ordinary Spanish, produce
 every `vocabulary.refresh_hours`, and merged with your `keyterms` and the names of the windows
 open right now.
 
+One kind of word a frequency list can never give you: the ones you *say* but never type.
+`opus` appears five times in the whole history against a cutoff of nine hundred — rank 6735 of
+a list that keeps eighty — so *"opus 4.8"* came back as `opu cuatro punto ocho`. The model names
+are pinned into the vocabulary instead of left to earn their place.
+
 ### Getting spanglish right
 
 The design target is code-switched speech — Spanish sentences with English technical terms —
@@ -153,6 +158,10 @@ both baked into `config.example.yml`:
   comes back as *"MGalo"*. With Deepgram's `keyterm` params (or OpenAI's prompt), it's exact.
 - **Turn off smart formatting.** Deepgram's `smart_format` rewrites spoken ordinals, so
   *"fijate primero"* arrives as *"fijate 1º"* — and that's what Claude would receive.
+- **Which leaves version numbers in words**, and *"opus cuatro punto ocho"* is unreadable. So
+  they are converted back afterwards, and only where a number is a name: behind a model name or
+  the word *"versión"*. Never anywhere else — *"la dos"* answers a menu and *"esperá cinco
+  minutos"* is not a version of anything.
 
 With both applied, Deepgram and OpenAI tied on accuracy across the test phrases. Deepgram is
 the default for its free credit, real streaming, and server-side endpointing, which supplies
@@ -402,7 +411,7 @@ for a window you have not heard about.
 | "salteá" | Leaves it where it is and moves on |
 | "dale" / "no" | Confirms or cancels a read-back. On a heads-up, "dale" means "dámelo". Anywhere else it is just a word, and gets typed |
 | "dame los pendientes" / "cuál queda" | Reads the queue out — name, what it wants, how long it has waited — then takes a pick |
-| "abrí una ventana nueva y hacé X" | New tab in the window you already have, running `windows.new_tab_command`, then X typed into it |
+| "abrí una ventana nueva y hacé X" | New tab in the window you already have, running `windows.new_tab_command`, then X typed into it — and sent once the command has started and the text is on the screen |
 | "decile a inbox realtime que espere" | Types into the window with that name, whichever one you are on |
 | "dámelo, y también abrí una ventana y hacé X" | Several things in one breath, in the order you said them. One that fails does not cancel the rest |
 | "estado" / "cómo venimos" | Windows open, how many are working, how many are waiting on you |

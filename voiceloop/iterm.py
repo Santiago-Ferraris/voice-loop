@@ -15,7 +15,7 @@ each keystroke is passed as a comma-separated list of decimal code points
 (`27,91,66` for ESC `[` `B`) and rebuilt inside AppleScript with `character
 id`. Only digits and commas ever cross the boundary.
 
-Three mechanics, all verified against Claude Code 2.1.220 in a fullscreen TUI:
+Four mechanics, all verified against Claude Code 2.1.220 in a fullscreen TUI:
 
 * **Free text** goes in with `newline no`, and the Enter is a *separate*
   keystroke. `write text`'s own trailing newline submits a short prompt but not
@@ -23,14 +23,21 @@ Three mechanics, all verified against Claude Code 2.1.220 in a fullscreen TUI:
   there. A separate CR submits both.
 * **Menus** ignore typed text entirely; the selector is driven with arrow keys.
   The cursor starts on option 1, so option N takes N-1 `ESC [ B` then CR.
-* **Focus** is never touched by either. `focus()` exists for "mostrame" and is
-  the only function here that moves anything.
+* **A new tab** types into a program that is not running yet, so it waits for
+  two things before pressing Enter: the startup command has to have taken the
+  shell over, and the text has to be *on the screen*. See `open_tab`.
+* **Focus** is never touched by any of them. `focus()` exists for "mostrame"
+  and is the only function here that moves anything.
 """
 
 from __future__ import annotations
 
+import logging
 import subprocess
+import time
 from typing import Callable, Sequence
+
+log = logging.getLogger("voiceloop.iterm")
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
@@ -42,6 +49,18 @@ ARROW_LEFT = "\x1b[D"
 ENTER = "\r"
 SPACE = " "
 ESCAPE = "\x1b"
+
+# How long a new tab is given to become the thing it was told to run, and how
+# long the text then gets to appear on its screen. Both are ceilings, not
+# waits: the poll returns the moment the state it wants is true.
+LAUNCH_TIMEOUT = 20.0
+ECHO_TIMEOUT = 10.0
+POLL_SECONDS = 0.25
+# What the TUI needs after its process exists to have an input box to type in.
+SETTLE_SECONDS = 0.5
+# Enough of the text to recognise it on screen, short enough that a line wrap
+# cannot fall inside it.
+ECHO_PREFIX_CHARS = 16
 
 # Walks every session of every tab of every window until the tty matches.
 FIND_SESSION = """
@@ -88,6 +107,38 @@ on run argv
     end repeat
   end tell
   return "missing"
+end run
+"""
+
+# item 1 = tty. Returns the foreground job on the first line and whatever is on
+# the screen after it — the two things that say whether a tab we just opened is
+# ready to be typed into, in one round trip instead of two.
+#
+# `jobName` is an iTerm2 session variable, not shell integration: it is read
+# from the process group of the tty, so it works in a tab that has never
+# sourced anything. Missing on an old iTerm2, hence the `try`: an empty job
+# degrades the wait to a fixed delay rather than breaking delivery.
+SESSION_STATE = """
+on run argv
+  set targetTty to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is targetTty then
+            tell s
+              set jobText to ""
+              try
+                set jobText to (variable named "jobName") as text
+              end try
+              return jobText & linefeed & (contents of it)
+            end tell
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
 end run
 """
 
@@ -160,10 +211,16 @@ end run
 """
 
 
-# item 1 = what to run in the new tab (may be empty), item 2 = what to type
-# after it (may be empty). A tab in the window you already have, never a new
-# window: a new window is somewhere else on the desktop, which is exactly what
-# you were trying not to go looking for.
+# item 1 = what to run in the new tab (may be empty). A tab in the window you
+# already have, never a new window: a new window is somewhere else on the
+# desktop, which is exactly what you were trying not to go looking for.
+#
+# The startup command keeps `write text`'s own newline — it is a shell command
+# line, and a shell submits whatever it is handed. The text that goes *after*
+# it does not come in here at all: it is typed over the tty this returns, by
+# the same `newline no` + separate CR that every other write in this module
+# uses. It also returns the job that was running before the command, which is
+# the shell, so `open_tab` can tell when the command has taken over.
 #
 # `startupCmd`, not `startup`: `startup` is *startup items folder* to
 # AppleScript, so `set startup to …` is not a variable assignment, it is an
@@ -173,7 +230,6 @@ end run
 OPEN_TAB = """
 on run argv
   set startupCmd to item 1 of argv
-  set followUp to item 2 of argv
   tell application "iTerm2"
     if (count of windows) is 0 then
       create window with default profile
@@ -181,11 +237,14 @@ on run argv
       tell current window to create tab with default profile
     end if
     tell current session of current tab of current window
+      set jobText to ""
+      try
+        set jobText to (variable named "jobName") as text
+      end try
       if startupCmd is not "" then write text startupCmd
-      if followUp is not "" then write text followUp
+      return (tty of it) & linefeed & jobText
     end tell
   end tell
-  return "opened"
 end run
 """
 
@@ -287,14 +346,99 @@ def write_text(tty: str, text: str, *, newline: bool = True, runner: Runner | No
         send_keys(tty, [ENTER], runner)
 
 
-def open_tab(command: str = "", text: str = "", runner: Runner | None = None) -> bool:
+def session_state(tty: str, runner: Runner | None = None) -> tuple[str, str]:
+    """(foreground job, visible screen). `("", "")` when there is no such session."""
+    if not tty:
+        return "", ""
+    try:
+        raw = run_script(SESSION_STATE, [tty], runner)
+    except AppleScriptError:
+        return "", ""
+    job, _, screen = raw.partition("\n")
+    return job.strip(), screen
+
+
+def _poll_until(predicate, *, timeout: float, poll: float, sleep, clock) -> bool:
+    """Run `predicate` until it is true or the deadline passes. Always runs once."""
+    deadline = clock() + timeout
+    while True:
+        if predicate():
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(poll)
+
+
+def open_tab(
+    command: str = "",
+    text: str = "",
+    runner: Runner | None = None,
+    *,
+    launch_timeout: float = LAUNCH_TIMEOUT,
+    echo_timeout: float = ECHO_TIMEOUT,
+    poll: float = POLL_SECONDS,
+    settle: float = SETTLE_SECONDS,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> bool:
     """A new tab in the window you already have, optionally running something.
 
     `command` is what starts there (`windows.new_tab_command` — normally the
     thing that launches Claude); `text` is what gets typed into it afterwards,
     which is the "y hacé X" half of "abrí una ventana nueva y hacé X".
+
+    The text is the awkward half, because it is typed into a program that is
+    not running yet. It goes in the way every other write in this module does —
+    `newline no`, and the Enter as a separate keystroke — with two waits in
+    front of the Enter, both about what is *true* rather than about how long to
+    guess:
+
+    * the foreground job has to stop being the shell the tab started in, so a
+      dictated sentence is never handed to a shell to run;
+    * the text has to appear on the screen, which is the only proof the TUI
+      read it instead of dropping it while it was still taking the terminal
+      over.
+
+    A wait that runs out leaves the text typed and unsent — where it used to
+    end up anyway — and says so in the log. Half a sentence submitted is worse
+    than a whole one sitting in the box.
     """
-    return run_script(OPEN_TAB, [command or "", text or ""], runner) == "opened"
+    opened = run_script(OPEN_TAB, [command or ""], runner)
+    tty, _, launcher = opened.partition("\n")
+    tty, launcher = tty.strip(), launcher.strip()
+    if not tty:
+        log.warning("opened a tab but iTerm2 named no tty for it")
+        return bool(opened)
+    if not (text or "").strip():
+        return True
+
+    if command and launcher:
+        started = _poll_until(
+            lambda: session_state(tty, runner)[0] not in ("", launcher),
+            timeout=launch_timeout,
+            poll=poll,
+            sleep=sleep,
+            clock=clock,
+        )
+        if not started:
+            log.warning("%r never started in %s; typing %r without sending it", command, tty, text)
+            write_text(tty, text, newline=False, runner=runner)
+            return True
+    sleep(settle)
+
+    write_text(tty, text, newline=False, runner=runner)
+    needle = text.strip()[:ECHO_PREFIX_CHARS]
+    if not _poll_until(
+        lambda: needle in session_state(tty, runner)[1],
+        timeout=echo_timeout,
+        poll=poll,
+        sleep=sleep,
+        clock=clock,
+    ):
+        log.warning("%s never showed %r on screen; leaving it unsent", tty, needle)
+        return True
+    send_keys(tty, [ENTER], runner)
+    return True
 
 
 def focus(tty: str, runner: Runner | None = None) -> bool:
