@@ -112,6 +112,11 @@ MIC_CONSENT_SPOKEN = (
     "Corré voice loop control doctor en una terminal."
 )
 
+# Short on purpose: it is said after a list that already took twenty-five
+# seconds, and its whole job is to be the difference between "I did not
+# understand that" and a daemon that has stopped answering.
+NO_PICK_SPOKEN = "No te entendí. Decime el número o el nombre."
+
 # How many windows one "dame los pendientes" chain may hop through before the
 # daemon stops following it. Not a limit on you — the hotkey starts a new chain.
 MAX_SWITCHES = 5
@@ -1760,6 +1765,14 @@ class Daemon:
             return None
         intent = intents.parse(transcript.text, names)
         if intent.kind != intents.KIND_SELECT or not 1 <= (intent.index or 0) <= len(items):
+            if intent.kind == intents.KIND_TEXT:
+                # A sentence, not a pick. Nothing downstream will act on it and
+                # nothing downstream will say so either, which is the silence
+                # that is indistinguishable from a daemon that stopped
+                # listening — the twenty-five seconds spent reading the list
+                # are exactly when you cannot tell the difference.
+                log.info("nothing picked off the pendings list: %r", transcript.text)
+                await self.speaker.speak(NO_PICK_SPOKEN)
             return None
         chosen = items[intent.index - 1]
         log.info("picked %s [%s] off the pendings list", chosen.id[:8], names[intent.index - 1])

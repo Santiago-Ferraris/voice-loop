@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from voiceloop.daemon import Daemon
+from voiceloop.daemon import NO_PICK_SPOKEN, Daemon
 from voiceloop.events import Event
 from voiceloop.milestones import MilestoneWatcher
 from voiceloop.store import STATE_PENDING, Store
@@ -190,6 +190,33 @@ def test_picking_nothing_leaves_the_queue_alone(build):
 
     assert daemon.delivery.sent == []
     assert daemon.store.get(item).state == STATE_PENDING
+
+
+def test_a_sentence_instead_of_a_pick_is_said_out_loud_not_swallowed(build):
+    """The list takes twenty-five seconds; the silence after it reads as dead.
+
+    A phrase that picks nothing goes nowhere — nothing downstream acts on it
+    and nothing downstream says so — which is exactly when "I did not
+    understand you" is indistinguishable from a daemon that stopped listening.
+    """
+    daemon = build(["dame los pendientes", "decile que lo deje fijo en el alias"])
+    item = waiting(daemon, "s1", "alpha", ts=1000, summary="espera tu aprobación")
+
+    hotkey(daemon)
+
+    assert daemon.speaker.spoken[-1] == NO_PICK_SPOKEN
+    assert daemon.delivery.sent == []
+    assert daemon.store.get(item).state == STATE_PENDING
+
+
+def test_saying_no_to_the_list_is_an_answer_and_is_not_argued_with(build):
+    """"no" picked nothing on purpose. Telling you so is nagging, not feedback."""
+    daemon = build(["dame los pendientes", "no"])
+    waiting(daemon, "s1", "alpha", ts=1000, summary="espera tu aprobación")
+
+    hotkey(daemon)
+
+    assert NO_PICK_SPOKEN not in daemon.speaker.spoken
 
 
 def test_the_list_can_be_asked_for_in_the_middle_of_answering(build):

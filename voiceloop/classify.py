@@ -268,7 +268,18 @@ class Classifier:
         if not self.available:
             return None
         words = (text or "").split()
-        if not words or len(words) > self.max_words:
+        if not words:
+            return None
+        if len(words) > self.max_words:
+            # Said out loud, because a take this long is nearly always our own
+            # voice that the echo filter failed to subtract, and a silent
+            # `return None` is what made that impossible to see in the log.
+            log.info(
+                "too long to classify (%d words, limit %d): %r",
+                len(words),
+                self.max_words,
+                text,
+            )
             return None
         self.calls += 1
         headers = {
