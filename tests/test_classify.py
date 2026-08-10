@@ -13,6 +13,7 @@ tries to reach OpenAI at all.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -158,6 +159,17 @@ def test_dictation_long_enough_to_be_dictation_is_never_asked_about():
 
     assert subject.classify("uno dos tres cuatro cinco seis") is None
     assert subject.calls == 0
+
+
+def test_a_take_dropped_for_its_length_says_so_in_the_log(caplog):
+    """It used to vanish without a line, and a ninety-word take is nearly
+    always our own voice that the echo filter failed to subtract."""
+    subject = classifier(NoNetwork(), max_words=5)
+
+    with caplog.at_level(logging.INFO, logger="voiceloop.classify"):
+        assert subject.classify("uno dos tres cuatro cinco seis") is None
+
+    assert "too long to classify (6 words, limit 5)" in caplog.text
 
 
 def test_silence_is_never_asked_about():

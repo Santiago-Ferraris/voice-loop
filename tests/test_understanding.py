@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from voiceloop import intents
 from voiceloop.classify import (
@@ -23,6 +24,7 @@ from voiceloop.classify import (
 from voiceloop.daemon import REPLY_DELIVERED, REPLY_PENDING
 
 from conftest import TTY, RecordingDelivery
+from test_echo import INSTRUCTION, PENDINGS, PENDINGS_HEARD
 from test_reply_cycle import answer, queue
 
 
@@ -376,3 +378,55 @@ def test_what_already_worked_still_works_and_still_offline(build):
     asyncio.run(daemon.announce_next())
 
     assert any("pendiente" in spoken.lower() for spoken in daemon.speaker.spoken)
+
+
+# --- the word limit, and where the echo has to be taken out first -----------
+
+
+def test_the_word_limit_is_measured_on_what_is_left_of_the_take(build):
+    """The one that made the whole thing unusable, end to end.
+
+    Reading three pendings out loud is twenty-five seconds under an open
+    microphone, so the take that comes back is seventy-five words of our own
+    voice with the instruction on the end of it. Handed over whole it is too
+    long to classify and nothing happens at all; the limit only means anything
+    once our own sentence has been subtracted, which is why the order is this
+    way round in `listen`.
+    """
+    model = FakeModel({INSTRUCTION: [{"intent": "tell", "target": "darwin e4"}]})
+    daemon = build([PENDINGS_HEARD], classifier=understanding(transport=model))
+
+    transcript = asyncio.run(daemon.say_and_listen(text=PENDINGS))
+    plan = asyncio.run(daemon.classify(transcript))
+
+    assert transcript.text == INSTRUCTION
+    assert model.asked == [INSTRUCTION]
+    assert [action.kind for action in plan.actions] == [intents.KIND_TELL]
+
+
+def test_what_was_subtracted_and_what_was_kept_are_both_in_the_log(build, caplog):
+    """There was no line at all for the take that lost the instruction.
+
+    Both halves have to be visible: the take as it arrived says what was
+    subtracted, and the remainder says what survived. One without the other
+    leaves you guessing which half the filter got wrong.
+    """
+    daemon = build([PENDINGS_HEARD], classifier=understanding(transport=NoNetwork()))
+
+    with caplog.at_level(logging.INFO, logger="voiceloop"):
+        asyncio.run(daemon.say_and_listen(text=PENDINGS))
+
+    assert f"echo filtered: {PENDINGS_HEARD!r} -> {INSTRUCTION!r}" in caplog.text
+
+
+def test_a_take_with_no_echo_in_it_reaches_the_model_word_for_word(build):
+    said = "Nuevo evento de darwin e4."
+    heard = "decile que deje el modelo fijo y que no vuelva a tocar el alias"
+    model = FakeModel({heard: []})
+    daemon = build([heard], classifier=understanding(transport=model))
+
+    transcript = asyncio.run(daemon.say_and_listen(text=said))
+    asyncio.run(daemon.classify(transcript))
+
+    assert transcript.text == heard
+    assert model.asked == [heard]

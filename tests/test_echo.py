@@ -13,6 +13,32 @@ from voiceloop.echo import is_echo, ratio, strip_echo
 ALERT = "Nuevo evento de inbox realtime."
 DOUBT = "¿Es el nombre, o te lo mando a la ventana?"
 
+# The one that made the whole thing unusable, verbatim off the log of
+# 2026-08-09 21:42. Reading three pendings out loud takes twenty-five seconds
+# with the microphone open under all of it, so the take is our own list
+# followed by the instruction that was waiting for it to end.
+PENDINGS = (
+    "Tenés tres pendientes. uno: darwin e5, Esperan que resuelva los conflictos "
+    "y despliegue la rama en dev, hace ocho horas. dos: cl audio, Esperan que "
+    "pruebes con trabajo real y envíes el enter, hace treinta y un minutos. "
+    "tres: darwin e4, ¿Querés que lo deje fijo en Opus 4.8 o investigue más?, "
+    "hace 24 minutos"
+)
+
+PENDINGS_HEARD = (
+    "tenés tres pendientes uno darwin-e5 esperan que resuelva los conflictos y "
+    "despliegue la rama en dev hace ocho horas dos cl-audio esperan que pruebes "
+    "con trabajo real y envíes el enter hace treinta y un minutos tres darwin-e4 "
+    "querés que lo deje fijo en opus cuatro punto ocho o investigue más hace "
+    "veinticuatro minutos decile a la última que lo deje fijo en cuatro punto "
+    "ocho en el alias con guion guion model"
+)
+
+INSTRUCTION = (
+    "decile a la última que lo deje fijo en cuatro punto ocho en el alias con "
+    "guion guion model"
+)
+
 
 # --- our voice coming back -------------------------------------------------
 
@@ -33,6 +59,43 @@ def test_what_you_said_over_the_top_of_it_survives():
 
 def test_a_tail_of_nothing_but_glue_is_not_a_phrase_you_said():
     assert strip_echo("nuevo evento de inbox realtime y", ALERT) == ""
+
+
+# --- subtracting seventy-five words of us to keep twenty of you -------------
+
+
+def test_the_instruction_after_the_pendings_list_survives_the_whole_list():
+    """The bug that made this unusable: the tail is the only part you said."""
+    assert strip_echo(PENDINGS_HEARD, PENDINGS) == INSTRUCTION
+
+
+def test_a_number_read_out_in_words_is_still_the_number_we_spelled():
+    """`say` was given "Opus 4.8"; the recognizer gives back four words."""
+    said = "¿Querés que lo deje fijo en Opus 4.8?"
+
+    assert strip_echo("querés que lo deje fijo en opus cuatro punto ocho", said) == ""
+
+
+def test_a_name_the_recognizer_hyphenated_is_still_the_name_we_said():
+    assert strip_echo("nuevo evento de darwin-e4", "Nuevo evento de darwin e4.") == ""
+
+
+def test_a_sentence_of_ours_that_never_finished_is_still_subtracted():
+    """Barge in on headphones and `say` dies mid-word: we said less than we meant."""
+    assert strip_echo("nuevo evento de inbox después", ALERT) == "después"
+
+
+def test_our_sentence_is_subtracted_from_the_middle_too():
+    """Interrupt us and the sentence runs on: your words end up on both sides."""
+    heard = (
+        "decile a inbox realtime que espere "
+        "nuevo evento de inbox realtime "
+        "y mostrame el estado"
+    )
+
+    assert strip_echo(heard, ALERT) == (
+        "decile a inbox realtime que espere y mostrame el estado"
+    )
 
 
 # --- and everything that must not be mistaken for it ------------------------

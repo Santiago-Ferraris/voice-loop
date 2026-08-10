@@ -389,9 +389,13 @@ system rather than asking you to configure:
 - **Headphones** (bluetooth, the jack, anything whose name says headset) — the mic cannot hear
   `say` at all, so your first syllable kills the sentence mid-word and it listens instead.
 - **Speakers** — the mic *does* hear `say`, so nothing is interrupted (it would shut itself up
-  every time it opened its mouth) and our own words are subtracted from the transcript instead.
-  We know exactly what `say` was given, so recognising it coming back is a string comparison.
-  See `voiceloop/echo.py` for the three rules that keep it from eating what you actually said.
+  every time it opened its mouth) and our own words are **subtracted** from the transcript
+  instead. Not "is this take an echo?" but "what is left of it once our sentence is taken out":
+  reading three pendings out loud is twenty-five seconds under an open mic, and the take that
+  comes back is seventy-five words of us with your instruction on the end. The instruction is
+  what goes on, and the word limit that decides "this is dictation, not a command" is measured
+  on it — never on the take it arrived in. See `voiceloop/echo.py` for the rules that keep the
+  subtraction from eating what you actually said.
 
 Everything below works in the heads-up mic — it is a microphone, not a menu — with one
 difference: a **sentence** is read back rather than delivered. Nothing has been said about that
