@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from voiceloop import vocabulary
+from voiceloop import spoken, vocabulary
 
 MEASURED = {
     "pr": 81,
@@ -213,6 +213,23 @@ def test_the_extracted_vocabulary_reaches_the_recognizer(build, tmp_path):
     # And the hand-kept list is still there, and so are the live windows.
     assert "rate-limiter" in terms
     assert "indice" in terms
+
+
+def test_the_model_names_do_not_depend_on_the_extraction_at_all(build):
+    """They are said, not typed, so no count of typed words will ever rank them.
+
+    `opus` was said five times in the whole history against a cutoff of nine
+    hundred — rank 6735 of a list that keeps eighty — which is why `opus 4.8`
+    came back as `opu cuatro punto ocho`. Pinned, and pinned outside the
+    extraction, so turning the extraction off does not take them with it.
+    """
+    daemon = build([])
+    daemon.vocabulary_enabled = False
+
+    terms = daemon.keyterms()
+
+    for name in spoken.MODEL_NAMES:
+        assert name in terms
 
 
 def test_a_name_you_gave_a_window_is_vocabulary_too(build):

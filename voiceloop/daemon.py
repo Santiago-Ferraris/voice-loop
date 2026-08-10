@@ -64,6 +64,7 @@ from . import (
     output as output_mod,
     preflight,
     roster as roster_mod,
+    spoken,
     spool,
     vocabulary,
 )
@@ -963,16 +964,24 @@ class Daemon:
     def keyterms(self) -> list[str]:
         """Everything the recognizer should have heard of before you say it.
 
-        Three sources, and only the first is hand-kept: the `keyterms` list in
-        the config, the vocabulary extracted from your own Claude transcripts
-        (see `vocabulary.py` — this is where `mergeado` and `lambda` come
-        from), and the names of the windows that exist *right now*. The last
-        one is why this is collected per request rather than baked into the
-        engine: a session name only transcribes if the recognizer has been told
-        it exists, and the names change every time you open a tab.
+        Four sources, and only the first is hand-kept: the `keyterms` list in
+        the config, the model names, the vocabulary extracted from your own
+        Claude transcripts (see `vocabulary.py` — this is where `mergeado` and
+        `lambda` come from), and the names of the windows that exist *right
+        now*. The last one is why this is collected per request rather than
+        baked into the engine: a session name only transcribes if the
+        recognizer has been told it exists, and the names change every time you
+        open a tab.
+
+        The model names are the one thing the extraction cannot give you.
+        `opus` was said five times in the whole history against a cutoff of
+        nine hundred — rank 6735 of a list that keeps eighty — because it is a
+        word you *say* to a machine, not one you type. So "opus 4.8" came back
+        as `opu cuatro punto ocho`, and it is pinned here instead.
         """
         configured = self.config.get("keyterms") or []
         terms = [str(term) for term in configured] if isinstance(configured, (list, tuple)) else []
+        terms.extend(spoken.MODEL_NAMES)
         if self.vocabulary_enabled:
             terms.extend(vocabulary.load(self.state_dir))
         try:
@@ -1152,7 +1161,21 @@ class Daemon:
         finally:
             self._discard(path)
         log.info("heard %r (confidence=%s)", transcript.text, transcript.confidence)
-        return self._without_echo(transcript, said)
+        return self._as_written(self._without_echo(transcript, said))
+
+    def _as_written(self, transcript: Transcript) -> Transcript:
+        """Model names and version numbers, spelled the way they are written.
+
+        `numerals=false` means every number arrives in words, which is right
+        for everything except the one place a number is a *name*: `opu cuatro
+        punto ocho` is `opus 4.8`, and Claude cannot read the first one. See
+        `spoken.py` for why nothing else is touched.
+        """
+        written = spoken.normalize(transcript.text)
+        if written == transcript.text:
+            return transcript
+        log.info("spelled out: %r -> %r", transcript.text, written)
+        return dataclasses.replace(transcript, text=written)
 
     def _without_echo(self, transcript: Transcript, said: str) -> Transcript:
         """Take our own voice out of what came back.

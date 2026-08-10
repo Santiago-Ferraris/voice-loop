@@ -591,6 +591,44 @@ def test_names_you_gave_a_window_yourself_are_vocabulary_too(build):
     assert "el del índice" in daemon.stt.calls[-1][1]
 
 
+def test_the_model_names_are_vocabulary_no_frequency_list_would_give_you(build):
+    """Said out loud every day, typed five times ever — so they are pinned."""
+    daemon = build(["mergealo"])
+    item = queue(daemon, kind="stop")
+
+    answer(daemon, item)
+
+    _, keyterms = daemon.stt.calls[-1]
+    for name in ("opus", "sonnet", "haiku"):
+        assert name in keyterms
+
+
+# --- and what comes back written the way it is written ---------------------
+
+
+def test_a_dictated_model_version_is_typed_in_digits(build, caplog):
+    """`opu cuatro punto ocho` is a string Claude cannot read. `opus 4.8` is."""
+    daemon = build(["poné el alias en opu cuatro punto ocho"])
+    item = queue(daemon, kind="stop")
+
+    with caplog.at_level(logging.INFO, logger="voiceloop"):
+        assert answer(daemon, item) == REPLY_DELIVERED
+
+    assert daemon.delivery.sent == [("text", TTY, "poné el alias en opus 4.8")]
+    assert any("spelled out" in line for line in caplog.messages)
+
+
+def test_the_numbers_that_are_not_versions_are_typed_as_they_were_said(build):
+    """The menu answer this must never touch, through the whole cycle."""
+    daemon = build(["esperá cinco minutos y corré los tests dos veces"])
+    item = queue(daemon, kind="stop")
+
+    assert answer(daemon, item) == REPLY_DELIVERED
+    assert daemon.delivery.sent == [
+        ("text", TTY, "esperá cinco minutos y corré los tests dos veces")
+    ]
+
+
 # --- the loop, end to end --------------------------------------------------
 
 
