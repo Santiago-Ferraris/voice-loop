@@ -1847,7 +1847,7 @@ class Daemon:
             await self.speaker.speak(NO_PICK_SPOKEN)
             return
         names = [name for name, _, _ in entries]
-        aimed, adrift = self._aim_over_pendings(plan.actions, names)
+        aimed, adrift = self._aim_over_pendings(plan.actions, names, transcript.text)
         if adrift or not aimed:
             log.info(
                 "nothing to do off the pendings list: %r (%s)",
@@ -1862,7 +1862,10 @@ class Daemon:
             await self._perform_aimed(action, items)
 
     def _aim_over_pendings(
-        self, actions: Sequence[classify_mod.Action], names: Sequence[str]
+        self,
+        actions: Sequence[classify_mod.Action],
+        names: Sequence[str],
+        said: str = "",
     ) -> tuple[list[classify_mod.Action], bool]:
         """(what to do, whether something was about a window we could not find).
 
@@ -1872,6 +1875,10 @@ class Daemon:
         sentence acted on is worse than none of it: "decile a la última que X y
         abrí una ventana" with an unresolvable "la última" asks, it does not
         quietly do the half it understood.
+
+        `said` is the phrase itself, and it is here for the one thing the
+        actions alone cannot tell you: whether the windows were pointed at out
+        loud or picked for us. See `_fanned_out`.
         """
         aimed: list[classify_mod.Action] = []
         adrift = False
@@ -1895,7 +1902,71 @@ class Daemon:
                 # them and the model could not tell which — which is a question,
                 # not a reason to hand it to whoever spoke last.
                 adrift = True
+        if self._fanned_out(aimed, names, said):
+            log.info("a fan-out nobody asked for, off the pendings list: %r", said)
+            return [], True
         return aimed, adrift
+
+    @classmethod
+    def _fanned_out(
+        cls,
+        aimed: Sequence[classify_mod.Action],
+        names: Sequence[str],
+        said: str,
+    ) -> bool:
+        """Did one dictated sentence turn into a different message per window?
+
+        Measured, off the list of 2026-08-09: "decile que haga eso" — which
+        points at nothing — came back as three `tell`s, one per pending window,
+        each carrying *that window's summary* rewritten as an order. None of
+        those sentences was said. The prompt already says not to, and the guard
+        for an unresolvable reference never fired, because the model does not
+        answer with an empty target: it answers with three full ones. That is
+        worse than the silence this path was built to fix — silence does
+        nothing, and this does three wrong things after one distracted yes.
+
+        The signature is the *shape*, not the wording: one breath split into N
+        messages with N different texts. Two things are deliberately not that,
+        and both stay:
+
+        * **The same text repeated.** "decile a todas que paren" really is for
+          several windows, and what arrives at each of them is identical.
+        * **Windows named out loud.** "decile a e5 que X y a cl audio que Y"
+          asks for two different things and says so — the references are in the
+          phrase, not inferred from a list of summaries.
+        """
+        tells = [action for action in aimed if action.kind == intents.KIND_TELL]
+        if len(tells) < 2:
+            return False
+        if len({intents.fold(action.text) for action in tells}) == 1:
+            return False
+        return not all(cls._named_aloud(action, names, said) for action in tells)
+
+    @staticmethod
+    def _named_aloud(
+        action: classify_mod.Action, names: Sequence[str], said: str
+    ) -> bool:
+        """Was this window pointed at in the phrase, or chosen for us off the list?
+
+        The name as it was spoken, or the position — "la primera", "la tres",
+        "la última". A window recognized only by what its summary says is not
+        named aloud: that is the model reading the list, which is exactly what
+        it does when it invents a fan-out.
+        """
+        spoken = intents.fold(said)
+        if not spoken:
+            return False
+        target = intents.fold(action.target)
+        if target and target in spoken:
+            return True
+        if action.index is None:
+            return False
+        tokens = spoken.split()
+        if any(intents.as_number(token) == action.index for token in tokens):
+            return True
+        return action.index == len(names) and any(
+            token in intents.LAST_WORDS for token in tokens
+        )
 
     @staticmethod
     def _listed_index(target: str, names: Sequence[str]) -> int | None:

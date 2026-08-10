@@ -459,6 +459,16 @@ drops all of it. And a window it cannot pin down is asked about rather than gues
 cuál?"* — including a compound, where one reference it could not aim cancels the whole sentence
 rather than doing the half it understood.
 
+**A reference that points at nothing asks — it does not go to everybody.** "decile que haga eso",
+with three windows on the list and no reference to any of them, came back as three `tell`s: one
+per pending window, each carrying *that window's summary* rewritten as an order. Nothing the user
+said, and one distracted "dale" from three windows getting it. The prompt now shows that answer as
+the counterexample, and the code does not take the prompt's word for it: one dictated sentence
+that arrives as several messages with **different** texts is ambiguity, and it is asked about. The
+legitimate fan-out is the one where the text is the same — "decile a todas que paren" is one
+message repeated, and it goes through, as does "decile a e5 que X y a cl audio que Y", where both
+windows were named out loud.
+
 ## Naming windows out loud
 
 Claude names an unnamed window after its directory and two hex characters — `darwin-21`,

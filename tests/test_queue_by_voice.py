@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+from voiceloop import intents
+from voiceloop.classify import Action
 from voiceloop.daemon import NO_PICK_SPOKEN, WHICH_WINDOW_SPOKEN, Daemon
 from voiceloop.events import Event
 from voiceloop.milestones import MilestoneWatcher
@@ -473,6 +475,172 @@ def test_half_a_sentence_it_could_not_aim_does_none_of_the_sentence(build):
     assert daemon.speaker.spoken[-1] == WHICH_WINDOW_SPOKEN
     assert daemon.delivery.sent == []
     assert daemon.delivery.opened == []
+
+
+# --- a reference that points at nothing asks, it does not fan out -----------
+
+# What the model actually came back with for "decile que haga eso", verbatim:
+# one `tell` per pending window, each carrying that window's *summary* rewritten
+# as an order. Not one of those three sentences was said out loud.
+FABRICATED = [
+    {
+        "intent": "tell",
+        "target": "darwin e5",
+        "text": "resuelve los conflictos y despliega la rama en dev",
+    },
+    {
+        "intent": "tell",
+        "target": "cl audio",
+        "text": "prueba con trabajo real y envía el Enter",
+    },
+    {
+        "intent": "tell",
+        "target": "darwin e4",
+        "text": "dejalo fijo en Opus 4.8 o investiga más",
+    },
+]
+
+
+def test_a_phrase_that_points_at_no_window_asks_instead_of_telling_all_three(build):
+    """The failure this section exists for, from the log of 2026-08-09.
+
+    Worse than the silence it replaced: silence does nothing, and this proposes
+    three orders nobody dictated, one distracted "dale" away from three windows.
+    """
+    said = "decile que haga eso"
+    model = FakeModel({said: FABRICATED})
+    daemon = build(
+        ["dame los pendientes", said], classifier=understanding(transport=model)
+    )
+    the_three_pendings(daemon)
+
+    hotkey(daemon)
+
+    assert daemon.speaker.spoken[-1] == WHICH_WINDOW_SPOKEN
+    assert daemon.delivery.sent == []
+    assert not any("Entendí" in spoken for spoken in daemon.speaker.spoken)
+
+
+def test_the_same_message_to_every_window_is_a_fan_out_that_was_asked_for(build):
+    """"decile a todas que paren" is deliberate, and what arrives is identical."""
+    said = "decile a todas que paren"
+    model = FakeModel(
+        {
+            said: [
+                {"intent": "tell", "target": "darwin e5", "text": "pará"},
+                {"intent": "tell", "target": "cl audio", "text": "pará"},
+                {"intent": "tell", "target": "darwin e4", "text": "pará"},
+            ]
+        }
+    )
+    daemon = build(
+        ["dame los pendientes", said, "dale"], classifier=understanding(transport=model)
+    )
+    the_three_pendings(daemon)
+
+    hotkey(daemon)
+
+    assert daemon.delivery.sent == [
+        ("text", TTY_E5, "pará"),
+        ("text", TTY_AUDIO, "pará"),
+        ("text", TTY_E4, "pará"),
+    ]
+
+
+def test_two_windows_named_out_loud_get_the_two_things_they_were_told(build):
+    """Different texts are fine when the phrase itself says who each one is for."""
+    said = "decile a darwin e5 que corra los tests y a cl audio que espere"
+    model = FakeModel(
+        {
+            said: [
+                {"intent": "tell", "target": "darwin e5", "text": "corré los tests"},
+                {"intent": "tell", "target": "cl audio", "text": "esperá"},
+            ]
+        }
+    )
+    daemon = build(
+        ["dame los pendientes", said, "dale"], classifier=understanding(transport=model)
+    )
+    the_three_pendings(daemon)
+
+    hotkey(daemon)
+
+    assert daemon.delivery.sent == [
+        ("text", TTY_E5, "corré los tests"),
+        ("text", TTY_AUDIO, "esperá"),
+    ]
+
+
+def test_a_window_named_by_what_its_summary_says_is_the_one_written_to(build):
+    """The third way to point at one: not the position, not the name, the reason."""
+    said = "decile al de los conflictos que corra los tests"
+    model = FakeModel(
+        {said: [{"intent": "tell", "target": "darwin e5", "text": "corré los tests"}]}
+    )
+    daemon = build(
+        ["dame los pendientes", said, "dale"], classifier=understanding(transport=model)
+    )
+    the_three_pendings(daemon)
+
+    hotkey(daemon)
+
+    assert daemon.delivery.sent == [("text", TTY_E5, "corré los tests")]
+
+
+# --- and the same net, with no model in the picture at all ------------------
+
+THREE_WINDOWS = ["darwin e5", "cl audio", "darwin e4"]
+
+
+def three_tells(*texts: str) -> list[Action]:
+    return [
+        Action(kind=intents.KIND_TELL, target=name, text=text)
+        for name, text in zip(THREE_WINDOWS, texts)
+    ]
+
+
+def test_one_phrase_split_into_three_different_messages_never_reaches_a_window(build):
+    """The guard is in the code, not only in the prompt: no transport is asked."""
+    daemon = build([])
+
+    aimed, adrift = daemon._aim_over_pendings(
+        three_tells("resolvé los conflictos", "probá con trabajo real", "dejalo fijo"),
+        THREE_WINDOWS,
+        "decile que haga eso",
+    )
+
+    assert aimed == []
+    assert adrift is True
+
+
+def test_one_phrase_repeated_to_three_windows_is_left_alone(build):
+    daemon = build([])
+
+    aimed, adrift = daemon._aim_over_pendings(
+        three_tells("pará", "pará", "pará"),
+        THREE_WINDOWS,
+        "decile a todas que paren",
+    )
+
+    assert [action.index for action in aimed] == [1, 2, 3]
+    assert adrift is False
+
+
+def test_two_positions_said_out_loud_count_as_naming_them(build):
+    """"la primera" and "la última" are references too, and they are in the phrase."""
+    daemon = build([])
+
+    aimed, adrift = daemon._aim_over_pendings(
+        [
+            Action(kind=intents.KIND_TELL, target="darwin e5", text="corré los tests"),
+            Action(kind=intents.KIND_TELL, target="darwin e4", text="esperá"),
+        ],
+        THREE_WINDOWS,
+        "decile a la primera que corra los tests y a la última que espere",
+    )
+
+    assert [action.index for action in aimed] == [1, 3]
+    assert adrift is False
 
 
 def test_a_model_that_never_answers_says_exactly_what_it_always_said(build):

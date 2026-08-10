@@ -131,6 +131,20 @@ def test_the_network_being_down_degrades_to_the_lexicon():
     assert classifier(fake).classify("give it to me") is None
 
 
+def test_what_went_wrong_is_in_the_log_by_name(caplog):
+    """A bare `KeyError` prints one word, and every failure read the same.
+
+    It cost a round of diagnosis: a real bug inside a transport looked exactly
+    like a provider that had timed out, because both arrive here as `None`.
+    """
+    fake = FakeOpenAi(error=KeyError("choices"))
+
+    with caplog.at_level(logging.INFO, logger="voiceloop.classify"):
+        assert classifier(fake).classify("give it to me") is None
+
+    assert "KeyError" in caplog.text
+
+
 def test_so_does_a_reply_that_is_not_json():
     class Garbage:
         def __call__(self, url, headers, body, timeout):
@@ -250,6 +264,26 @@ def test_the_prompt_says_to_leave_the_target_empty_rather_than_invent_one():
     classifier(fake).classify("decile que espere", (), [("darwin e4", "")])
 
     assert "no adivines" in fake.asked[0]
+
+
+def test_the_prompt_spells_out_the_fan_out_it_must_not_produce():
+    """Prose alone did not hold: "no adivines" never produced an empty target,
+    it produced three full ones, each carrying a window's summary as an order.
+    """
+    fake = FakeOpenAi()
+
+    classifier(fake).classify(
+        "decile que haga eso", (), [("darwin e5", "espera que resuelvas los conflictos")]
+    )
+
+    asked = fake.asked[0]
+    assert "UNA SOLA acción con `target` vacío" in asked
+    assert "no la repartas entre todas" in asked
+    assert "el `text` es EL MISMO en todas" in asked
+
+
+def test_the_prompt_never_asks_for_a_text_the_person_did_not_say():
+    assert "no algo que completes vos" in classifier(FakeOpenAi()).build_body("hola").decode()
 
 
 def test_a_phrase_with_no_list_behind_it_carries_no_list():

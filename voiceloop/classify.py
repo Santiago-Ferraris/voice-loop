@@ -96,6 +96,9 @@ los tests"): devolvé una acción por cada una, EN EL ORDEN EN QUE LAS DIJO.
 está esperando —"mergealo cuando pasen los tests", "revisá el índice", "corré \
 los tests de nuevo"— devolvé {{"actions": []}}. La lista vacía es una respuesta \
 correcta y frecuente: preferí devolverla antes que inventar un intent.
+- El `text` de cada acción es lo que dijo la persona, no algo que completes vos. \
+Nunca repartas una sola frase en varias acciones con textos distintos que ella \
+no dijo.
 - No expliques nada, no agregues otras claves.
 
 Ejemplos:
@@ -115,11 +118,28 @@ Ejemplos:
 # somebody else's window.
 PENDINGS_HEADER = "Ventanas pendientes, en el orden en que se las acabo de leer:"
 
+# The counterexample is in the prompt on purpose, spelled out as JSON. Told
+# only in prose ("no adivines"), the model kept doing the one thing prose does
+# not name: it never answered with an empty target, it answered with *three*
+# full ones — "decile que haga eso" came back as one `tell` per pending window,
+# each carrying that window's summary rewritten as an order nobody dictated.
 PENDINGS_RULE = (
     "Si la frase se refiere a una de esas ventanas por posición (\"la última\", "
     "\"la tercera\") o por lo que dice de ella (\"la de darwin e4\", \"la del "
     "alias\"), poné el NOMBRE EXACTO de la lista en `target`. Si no podés saber "
-    "a cuál se refiere, dejá `target` vacío: no adivines."
+    "a cuál se refiere, devolvé UNA SOLA acción con `target` vacío: no adivines, "
+    "y no la repartas entre todas.\n"
+    "El `text` es siempre lo que dijo la persona, nunca el resumen de la ventana: "
+    "si lo estás sacando de la lista, la frase no era para esa ventana.\n"
+    "Contraejemplo, sobre una lista de darwin e5, cl audio y darwin e4: \"decile "
+    "que haga eso\" NO es {\"actions\": [{\"intent\": \"tell\", \"target\": \"darwin "
+    "e5\", \"text\": \"resolvé los conflictos\"}, {\"intent\": \"tell\", \"target\": "
+    "\"cl audio\", \"text\": \"probá con trabajo real\"}, {\"intent\": \"tell\", "
+    "\"target\": \"darwin e4\", \"text\": \"dejalo fijo en 4.8\"}]} — son tres "
+    "instrucciones inventadas y ninguna la dijo. Es {\"actions\": [{\"intent\": "
+    "\"tell\", \"target\": \"\", \"text\": \"hacé eso\"}]}.\n"
+    "Varias ventanas sólo cuando lo pidió (\"decile a todas que paren\"), y ahí "
+    "el `text` es EL MISMO en todas."
 )
 
 Transport = Callable[[str, dict, bytes, float], bytes]
@@ -341,7 +361,16 @@ class Classifier:
             IndexError,
             TypeError,
         ) as exc:
-            log.info("classifier unavailable, falling back to the lexicon: %s", exc)
+            # The type, not just the message: half of these say nothing on their
+            # own — a bare `KeyError` prints one word, and a real bug inside a
+            # transport reads exactly like a provider that timed out. It cost a
+            # round of diagnosis once; the traceback is one `--debug` away.
+            log.info(
+                "classifier unavailable, falling back to the lexicon: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            log.debug("classifier failure detail", exc_info=True)
             return None
         except Exception as exc:  # noqa: BLE001 - never break the microphone
             log.exception("classifier failed: %s", exc)
