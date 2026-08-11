@@ -33,12 +33,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         // hold, instead of only after the user finds Settings → Run Doctor.
         Doctor.requestMicrophone { _ in }
 
-        // start() returns false when the hotkey tap could not install — almost
-        // always a missing Input Monitoring / Accessibility grant. Surface it
-        // rather than dying silently (the old symptom: keys did nothing).
+        // The hotkeys are Carbon RegisterEventHotKey now — no TCC permission at
+        // all — so start() only fails if ⌥N/⌥M are already claimed elsewhere.
         if !engine.start() {
-            NSLog("voice-loop: hotkey tap did not install — grant Input Monitoring / Accessibility")
-            _ = Doctor.accessibilityStatus(prompt: true)
+            NSLog("voice-loop: hotkey registration failed — ⌥N/⌥M may be claimed by another app")
         }
 
         // The HUD is a socket subscriber, exactly like the menu bar: both get
