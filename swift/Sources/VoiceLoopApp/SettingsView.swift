@@ -23,9 +23,13 @@ struct SettingsView: View {
                 }
                 Button("Refresh devices") { deviceNames = Doctor.inputDeviceNames() }
             }
-            Section("Keys (stored in Keychain)") {
-                SecureField("OPENAI_API_KEY", text: $openAIKey)
-                SecureField("DEEPGRAM_API_KEY", text: $deepgramKey)
+            Section("Keys") {
+                keyStatus("OPENAI_API_KEY", present: Secrets.openAIKey != nil)
+                keyStatus("DEEPGRAM_API_KEY", present: Secrets.deepgramKey != nil)
+                Text("Existing keys load automatically from ~/.config/voice-loop/env. The fields below only override them (written to Keychain); a secret is never shown back.")
+                    .font(.caption).foregroundStyle(.secondary)
+                SecureField("Override OPENAI_API_KEY", text: $openAIKey)
+                SecureField("Override DEEPGRAM_API_KEY", text: $deepgramKey)
                 Button("Save keys") {
                     if !openAIKey.isEmpty { Keychain.write(Secrets.openAIKeyName, openAIKey) }
                     if !deepgramKey.isEmpty { Keychain.write(Secrets.deepgramKeyName, deepgramKey) }
@@ -67,6 +71,15 @@ struct SettingsView: View {
         }
         .padding(20)
         .frame(width: 460)
+    }
+
+    private func keyStatus(_ name: String, present: Bool) -> some View {
+        HStack {
+            Text(name)
+            Spacer()
+            Text(present ? "loaded ✓" : "missing")
+                .foregroundStyle(present ? Color.green : Color.red)
+        }
     }
 }
 
