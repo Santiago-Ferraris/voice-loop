@@ -37,3 +37,10 @@ dist/
 
 # macOS
 .DS_Store
+
+# Swift (v2)
+swift/.build/
+swift/build/
+swift/.swiftpm/
+DerivedData/
+*.xcuserstate
