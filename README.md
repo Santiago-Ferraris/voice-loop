@@ -1,5 +1,10 @@
 # voice-loop
 
+> **v2 rewrite in progress.** A native macOS menu-bar app in Swift is being built
+> under [`swift/`](swift/README.md). The Python daemon documented below is v1,
+> kept read-only as the source of knowledge until the Swift rewrite reaches
+> parity, then removed. New work happens in `swift/`.
+
 Hands-free voice control for parallel [Claude Code](https://claude.com/claude-code) sessions in iTerm2.
 
 If you run one Claude session, you watch it. If you run a dozen, you stop watching and start
