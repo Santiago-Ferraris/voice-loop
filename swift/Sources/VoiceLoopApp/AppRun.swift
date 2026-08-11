@@ -19,18 +19,36 @@ public func runVoiceLoopApp() {
 
 public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBar: MenuBarController?
+    private var hud: HUDPanel?
     private var eventClient: EventClient?
     private let engine = Engine()
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         let menuBar = MenuBarController()
         self.menuBar = menuBar
+        let hud = HUDPanel()
+        self.hud = hud
 
-        _ = engine.start()
+        // Fire the microphone prompt up front so recording works on the first
+        // hold, instead of only after the user finds Settings → Run Doctor.
+        Doctor.requestMicrophone { _ in }
 
+        // start() returns false when the hotkey tap could not install — almost
+        // always a missing Input Monitoring / Accessibility grant. Surface it
+        // rather than dying silently (the old symptom: keys did nothing).
+        if !engine.start() {
+            NSLog("voice-loop: hotkey tap did not install — grant Input Monitoring / Accessibility")
+            _ = Doctor.accessibilityStatus(prompt: true)
+        }
+
+        // The HUD is a socket subscriber, exactly like the menu bar: both get
+        // every event. Without this the transcript panel never appears.
         let client = EventClient(path: engine.socket.path)
-        client.onEvent = { [weak menuBar] event in
-            DispatchQueue.main.async { menuBar?.apply(event) }
+        client.onEvent = { [weak menuBar, weak hud] event in
+            DispatchQueue.main.async {
+                menuBar?.apply(event)
+                hud?.apply(event)
+            }
         }
         client.start()
         self.eventClient = client
