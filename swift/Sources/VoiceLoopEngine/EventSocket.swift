@@ -15,22 +15,36 @@ public final class EventSocket: @unchecked Sendable {
     }
 
     public let path: String
+    public let logPath: String
     public var onCommandHandler: ((EngineCommand) -> Void)?
     private let lock = NSLock()
     private var clientFDs: [Int32] = []
     private var listenFD: Int32 = -1
     private var running = false
     private var seq = 0
+    private var logHandle: FileHandle?
 
     public init(path: String = EventSocket.defaultPath(), onCommand: ((EngineCommand) -> Void)? = nil) {
         self.path = path
         self.onCommandHandler = onCommand
+        let dir = (path as NSString).deletingLastPathComponent
+        self.logPath = "\(dir)/logs/events.log"
     }
 
     public func start() throws {
         let dir = (path as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         unlink(path)
+
+        // A durable JSONL log of every event, so a bug can be read after the
+        // fact instead of only over a live socket (the v1 daemon.log lesson).
+        let logDir = (logPath as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+        }
+        logHandle = FileHandle(forWritingAtPath: logPath)
+        try? logHandle?.seekToEnd()
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw SocketError.create(errno) }
@@ -61,6 +75,8 @@ public final class EventSocket: @unchecked Sendable {
         for fd in clientFDs { close(fd) }
         clientFDs.removeAll()
         if listenFD >= 0 { close(listenFD); listenFD = -1 }
+        try? logHandle?.close()
+        logHandle = nil
         lock.unlock()
         unlink(path)
     }
@@ -71,6 +87,7 @@ public final class EventSocket: @unchecked Sendable {
         seq += 1
         let envelope = EventEnvelope(event: event, ts: ts, seq: seq)
         let line = envelope.jsonLine() + "\n"
+        if let data = line.data(using: .utf8) { try? logHandle?.write(contentsOf: data) }
         let dead = writeToAll(line)
         for fd in dead { close(fd); clientFDs.removeAll { $0 == fd } }
         lock.unlock()
